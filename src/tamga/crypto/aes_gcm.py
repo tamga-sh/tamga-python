@@ -8,7 +8,7 @@ identical either way.
 
 from __future__ import annotations
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 def decrypt(key: bytes, nonce: bytes, ciphertext_and_tag: bytes) -> bytes:
@@ -27,4 +27,5 @@ def decrypt(key: bytes, nonce: bytes, ciphertext_and_tag: bytes) -> bytes:
         cryptography.exceptions.InvalidTag: If the tag doesn't verify (wrong
             key, corrupted/tampered data, or wrong nonce).
     """
-    raise NotImplementedError
+    aesgcm = AESGCM(key)
+    return aesgcm.decrypt(nonce, ciphertext_and_tag, None)

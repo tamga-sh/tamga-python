@@ -102,3 +102,33 @@ class ProcessResource:
     machine_id: UUID
     pid: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MachineFileResource:
+    """The JSON:API ``machine-files`` resource returned by the ``POST`` checkout variant.
+
+    Mirrors ``tamga.models.license.LicenseFileResource`` field-for-field —
+    the server's ``machine_file_response`` serializer emits the identical
+    shape (``certificate``/``algorithm``/``includes``/``ttl``/``expiry``/
+    ``issued``), just wrapping a machine-file certificate instead of a
+    license-file one. Not explicitly named in the plan's model list (only
+    ``LicenseFileResource`` was) — added for parity so ``machines.check_out``
+    can return a typed structured result instead of ``Any``.
+
+    Attributes:
+        certificate: The full machine-file PEM-style wrapper string.
+        algorithm: Signing/encryption algorithm string, e.g.
+            ``"base64+ed25519"`` or an RSA/ECDSA-flavored equivalent.
+        includes: Always ``[]`` today, same caveat as license checkout.
+        ttl: TTL in seconds, as requested. Metadata only.
+        expiry: Computed expiry timestamp. Metadata only.
+        issued: Issuance timestamp.
+    """
+
+    certificate: str
+    algorithm: str
+    includes: list[Any]
+    ttl: int | None
+    expiry: str | None
+    issued: str

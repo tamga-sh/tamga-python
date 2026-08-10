@@ -118,6 +118,19 @@ class PolicyResource:
         max_cores: Core limit, subject to ``overage_strategy``.
         max_processes: Process limit, subject to ``overage_strategy``.
         max_uses: Use limit — always strict, ``overage_strategy`` does not apply.
+        max_memory: Memory limit, subject to ``overage_strategy``. **Always
+            ``None`` in practice** — the server's ``GET`` response for a
+            policy omits this field even though it's enforced during
+            validation (see docs/sdk.md section 10 and "Known Server-Side
+            Gaps" item 9's neighboring note). Modeled here anyway so parsing
+            doesn't break if/when the server starts including it, and so
+            callers have a typed field to check rather than reaching into
+            raw attributes. Do not rely on this being populated — the only
+            way to observe this limit today is a ``TOO_MUCH_MEMORY``
+            validation code.
+        max_disk: Disk limit, subject to ``overage_strategy``. Same
+            "always ``None`` in practice" caveat as ``max_memory`` — only
+            observable via a ``TOO_MUCH_DISK`` validation code.
     """
 
     id: UUID
@@ -134,13 +147,73 @@ class PolicyResource:
     max_cores: int | None = None
     max_processes: int | None = None
     max_uses: int | None = None
+    max_memory: int | None = None
+    max_disk: int | None = None
 
     @classmethod
     def from_api(cls, attributes: dict[str, Any]) -> PolicyResource:
         """Parse a raw JSON:API ``policies`` attributes dict, applying the
         ``DENY_ACCESS``/``NO_RESURRECTION`` fallback rules documented above.
         """
-        raise NotImplementedError
+        raw_overage = attributes.get("overage_strategy")
+        try:
+            overage_strategy = (
+                OverageStrategy(raw_overage)
+                if raw_overage is not None
+                else OverageStrategy.NO_OVERAGE
+            )
+        except ValueError:
+            # "DENY_ACCESS" (and any other unrecognized string) is not a
+            # real OverageStrategy variant — the server silently applies
+            # NO_OVERAGE semantics for it, so parsing must match that
+            # actual behavior rather than raising or trusting the name.
+            overage_strategy = OverageStrategy.NO_OVERAGE
+
+        raw_resurrection = attributes.get("heartbeat_resurrection_strategy")
+        try:
+            resurrection_strategy = (
+                HeartbeatResurrectionStrategy(raw_resurrection)
+                if raw_resurrection is not None
+                else HeartbeatResurrectionStrategy.NO_REVIVE
+            )
+        except ValueError:
+            # "NO_RESURRECTION" (and any other unrecognized string) is not a
+            # real variant — silently behaves as NO_REVIVE server-side.
+            resurrection_strategy = HeartbeatResurrectionStrategy.NO_REVIVE
+
+        raw_cull = attributes.get("heartbeat_cull_strategy")
+        cull_strategy = (
+            HeartbeatCullStrategy(raw_cull)
+            if raw_cull is not None
+            else HeartbeatCullStrategy.DEACTIVATE_DEAD
+        )
+
+        raw_check_in_interval = attributes.get("check_in_interval")
+        check_in_interval = (
+            CheckInInterval(raw_check_in_interval) if raw_check_in_interval is not None else None
+        )
+
+        raw_scheme = attributes.get("scheme")
+        scheme = LicenseScheme(raw_scheme) if raw_scheme is not None else None
+
+        return cls(
+            id=UUID(str(attributes["id"])) if "id" in attributes else UUID(int=0),
+            overage_strategy=overage_strategy,
+            heartbeat_cull_strategy=cull_strategy,
+            heartbeat_resurrection_strategy=resurrection_strategy,
+            check_in_interval=check_in_interval,
+            require_check_in=bool(attributes.get("require_check_in", False)),
+            scheme=scheme,
+            expiration_strategy=attributes.get("expiration_strategy", "RESTRICT_ACCESS"),
+            renewal_basis=attributes.get("renewal_basis", "FROM_EXPIRY"),
+            authentication_strategy=attributes.get("authentication_strategy", "TOKEN"),
+            max_machines=attributes.get("max_machines"),
+            max_cores=attributes.get("max_cores"),
+            max_processes=attributes.get("max_processes"),
+            max_uses=attributes.get("max_uses"),
+            max_memory=attributes.get("max_memory"),
+            max_disk=attributes.get("max_disk"),
+        )
 
 
 @dataclass(frozen=True)

@@ -8,11 +8,13 @@ machine's fingerprint as the ``info`` parameter, meaning decryption requires
 
 from __future__ import annotations
 
-from cryptography.hazmat.primitives import hashes  # noqa: F401
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF  # noqa: F401
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 MACHINE_FILE_KEY_SALT: bytes = b"tamga:machine-file-key-v1"
 """Fixed HKDF salt used by the server for machine-file encryption keys."""
+
+_AES_KEY_LENGTH = 32
 
 
 def derive_machine_file_key(license_key: str, fingerprint: str) -> bytes:
@@ -28,4 +30,10 @@ def derive_machine_file_key(license_key: str, fingerprint: str) -> bytes:
     Returns:
         A 32-byte AES key.
     """
-    raise NotImplementedError
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=_AES_KEY_LENGTH,
+        salt=MACHINE_FILE_KEY_SALT,
+        info=fingerprint.encode("utf-8"),
+    )
+    return hkdf.derive(license_key.encode("utf-8"))

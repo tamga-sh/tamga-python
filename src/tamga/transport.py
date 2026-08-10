@@ -28,16 +28,22 @@ request header (planned EE feature); ``X-RateLimit-*`` response headers /
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Union
 
-import httpx  # noqa: F401
+import httpx
+
+from tamga.errors import parse_error_envelope
 
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
 """Default connect/read timeout for the underlying httpx.Client."""
 
 MAX_TAMGA_VERSION_LENGTH: int = 32
 """Server-side max length for the sanitized ``Tamga-Version`` header value."""
+
+#: Content-Type used for every JSON:API request/response except quick-validate.
+JSON_API_CONTENT_TYPE: str = "application/vnd.api+json"
 
 
 def build_base_url(host: str, account_id: str) -> str:
@@ -51,7 +57,9 @@ def build_base_url(host: str, account_id: str) -> str:
     Returns:
         The fully-qualified base URL, with no trailing slash.
     """
-    raise NotImplementedError
+    normalized_host = host.strip().removeprefix("https://").removeprefix("http://")
+    normalized_host = normalized_host.rstrip("/")
+    return f"https://{normalized_host}/v1/accounts/{account_id}"
 
 
 def sanitize_tamga_version(version: str) -> str:
@@ -69,7 +77,14 @@ def sanitize_tamga_version(version: str) -> str:
         ValueError: If ``version`` cannot be sanitized into a valid value
             (e.g. empty after stripping disallowed characters).
     """
-    raise NotImplementedError
+    sanitized = "".join(c for c in version if c.isalnum() or c in ".-")
+    sanitized = sanitized[:MAX_TAMGA_VERSION_LENGTH]
+    if not sanitized:
+        raise ValueError(
+            f"version {version!r} sanitizes to an empty string "
+            "(no alphanumeric/./- characters present)"
+        )
+    return sanitized
 
 
 @dataclass(frozen=True)
@@ -94,6 +109,16 @@ class BasicAuth:
     password: str | None = None
     token: str | None = None
     license_key: str | None = None
+
+    def _user_pass(self) -> str:
+        """Render the ``user:pass`` string for whichever sub-form is populated."""
+        if self.email is not None:
+            return f"{self.email}:{self.password or ''}"
+        if self.token is not None:
+            return f"{self.token}:"
+        if self.license_key is not None:
+            return f"license:{self.license_key}"
+        raise ValueError("BasicAuth requires one of: email(+password), token, or license_key")
 
 
 @dataclass(frozen=True)
@@ -135,7 +160,19 @@ def apply_auth(
         request_params: Query-param dict to add the auth param to, if applicable.
         auth: The auth transport to apply.
     """
-    raise NotImplementedError
+    if isinstance(auth, BearerAuth):
+        request_headers["Authorization"] = f"Bearer {auth.token}"
+    elif isinstance(auth, BasicAuth):
+        import base64
+
+        encoded = base64.b64encode(auth._user_pass().encode("utf-8")).decode("ascii")
+        request_headers["Authorization"] = f"Basic {encoded}"
+    elif isinstance(auth, LicenseAuth):
+        request_headers["Authorization"] = f"License {auth.key}"
+    elif isinstance(auth, QueryParamAuth):
+        request_params[auth.param_name] = auth.value
+    else:  # pragma: no cover - exhaustiveness guard
+        raise TypeError(f"Unsupported auth transport: {auth!r}")
 
 
 @dataclass(frozen=True)
@@ -179,4 +216,17 @@ def parse_response(response: httpx.Response, *, is_quick_validate: bool = False)
         tamga.errors.TamgaError: If the response status indicates an error;
             see ``tamga.errors.parse_error_envelope``.
     """
-    raise NotImplementedError
+    if response.status_code >= 400:
+        raise parse_error_envelope(response.status_code, response.content)
+
+    body = json.loads(response.content) if response.content else None
+
+    data = body if is_quick_validate or body is None else body.get("data", body)
+
+    return TamgaResponse(
+        data=data,
+        tamga_version=response.headers.get("Tamga-Version"),
+        tamga_edition=response.headers.get("Tamga-Edition"),
+        tamga_mode=response.headers.get("Tamga-Mode"),
+        request_id=response.headers.get("X-Request-Id"),
+    )

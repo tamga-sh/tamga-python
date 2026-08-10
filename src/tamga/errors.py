@@ -23,6 +23,8 @@ it under the current deployment (see docs/sdk.md "Known Server-Side Gaps").
 
 from __future__ import annotations
 
+import json
+
 
 class TamgaError(Exception):
     """Base exception for all errors raised by the Tamga SDK.
@@ -44,7 +46,11 @@ class TamgaError(Exception):
         detail: str,
         pointer: str | None = None,
     ) -> None:
-        raise NotImplementedError
+        self.status = status
+        self.code = code
+        self.detail = detail
+        self.pointer = pointer
+        super().__init__(f"{code} ({status}): {detail}")
 
 
 class NotFoundError(TamgaError):
@@ -110,6 +116,27 @@ class UnknownTamgaError(TamgaError):
     """Fallback for error ``code`` values not yet modeled by this SDK version."""
 
 
+#: Dispatch table from stable JSON:API ``code`` to the typed exception class.
+#: Single lookup point — new codes only need an entry here, not a new
+#: call site at every endpoint method (mirrors tamga-rust's
+#: ``TamgaError::from_json_api_error`` match statement).
+_CODE_TO_EXCEPTION: dict[str, type[TamgaError]] = {
+    "NOT_FOUND": NotFoundError,
+    "UNAUTHORIZED": UnauthorizedError,
+    "FORBIDDEN": ForbiddenError,
+    "INTERNAL_SERVER_ERROR": InternalServerError,
+    "KEY_TAKEN": KeyTakenError,
+    "FINGERPRINT_TAKEN": FingerprintTakenError,
+    "PID_TAKEN": PidTakenError,
+    "CHECK_IN_NOT_REQUIRED": CheckInNotRequiredError,
+    "TTL_INVALID": TtlInvalidError,
+    "LICENSE_NOT_ENCRYPTED": LicenseNotEncryptedError,
+    "LICENSE_KEY_MISSING": LicenseKeyMissingError,
+    "SCHEME_NOT_SUPPORTED": SchemeNotSupportedError,
+    "DATASET_INVALID": DatasetInvalidError,
+}
+
+
 def parse_error_envelope(status: int, body: bytes) -> TamgaError:
     """Parse a JSON:API error envelope and dispatch to a typed ``TamgaError`` subclass.
 
@@ -121,4 +148,17 @@ def parse_error_envelope(status: int, body: bytes) -> TamgaError:
         The most specific ``TamgaError`` subclass matching the response's
         ``code``, falling back to ``UnknownTamgaError`` for unrecognized codes.
     """
-    raise NotImplementedError
+    try:
+        parsed = json.loads(body)
+        errors = parsed.get("errors") or []
+        first = errors[0] if errors else {}
+    except (json.JSONDecodeError, AttributeError, IndexError):
+        first = {}
+
+    code = first.get("code", "UNKNOWN")
+    detail = first.get("detail", "")
+    source = first.get("source") or {}
+    pointer = source.get("pointer")
+
+    exc_cls = _CODE_TO_EXCEPTION.get(code, UnknownTamgaError)
+    return exc_cls(status=status, code=code, detail=detail, pointer=pointer)

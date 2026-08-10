@@ -7,20 +7,44 @@ RSA-2048 PKCS#1 v1.5 / SHA-256, **regardless of the license's ``scheme``**
 (unlike checkout, there is no scheme dispatch here). Response:
 ``meta.proof = "v1x0.<base64 signature>"``.
 
-⚠️ **Byte-exact serialization gotcha**: the signature covers
-``{"account":{"id":...},"machine":{"id":...,"fingerprint":...},"dataset":<dataset>}``
-serialized **exactly** as the server produces it — field order matters, not
-just field presence/set. ``build_proof_payload`` must reproduce this via an
-explicitly key-ordered structure serialized with
-``json.dumps(..., separators=(",", ":"))`` and no key sorting — never rely on
-incidental dict-ordering behavior matching by luck.
+⚠️ **Byte-exact serialization gotcha — deviation from the plan's literal
+wording**: the plan's stub docstring said to serialize
+``{"account":..., "machine":..., "dataset":...}`` "with no key sorting",
+implying the literal source-code field order must be preserved. Ground
+truth contradicts this: the server (``tamga-api``'s
+``src/features/machines/generate_offline_proof.rs``) builds the payload via
+``serde_json::json!(...)``, and `serde_json::Map` is `BTreeMap`-backed
+(alphabetically sorted output at every nesting level) because neither
+`tamga-api` nor `tamga-rust` enables serde_json's `preserve_order` feature
+(confirmed: no `indexmap` next to `serde_json` in either `Cargo.lock`; see
+`tamga-rust/src/proof.rs`'s module doc comment and its
+`payload_json_field_order_is_alphabetical_not_source_order` test, which this
+SDK's own test suite mirrors). So despite the server's source code literally
+writing ``{"account": ..., "machine": ..., "dataset": ...}``, the actual
+signed bytes are alphabetically ordered: ``{"account":...,"dataset":...,
+"machine":{"fingerprint":...,"id":...}}`` — note `dataset` before `machine`,
+and `fingerprint` before `id`. This module therefore builds the payload with
+``json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False)``,
+which — like `serde_json::Value`'s `BTreeMap` — canonicalizes to alphabetical
+order regardless of Python's (insertion-ordered) dict construction order.
+``ensure_ascii=False`` is required too: `json.dumps`'s default would
+``\\uXXXX``-escape non-ASCII characters, which `serde_json` does not do (a
+security-review finding during Section H — see `build_proof_payload`'s
+docstring for the full explanation and the non-ASCII regression test it
+points to). See the plan checkbox note in docs/plans/tamga-python.plan.md
+Section H for both documented deviations.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
+
+from tamga.crypto.rsa import verify_pkcs1v15
 
 PROOF_VERSION_PREFIX: str = "v1x0."
 """Prefix on every ``meta.proof`` value, stripped before base64-decoding the signature."""
@@ -34,10 +58,27 @@ def build_proof_payload(
 ) -> bytes:
     """Build the exact byte sequence the server signs for an offline proof.
 
-    Must reproduce
-    ``{"account":{"id":...},"machine":{"id":...,"fingerprint":...},"dataset":<dataset>}``
-    key-for-key, in this exact order, via ``json.dumps(..., separators=(",", ":"))``
-    with no key sorting.
+    Must reproduce the server's ``serde_json::json!``-produced bytes for
+    ``{"account":{"id":...},"machine":{"id":...,"fingerprint":...},
+    "dataset":<dataset>}`` — which, because neither side enables
+    `serde_json`'s `preserve_order` feature, canonicalizes to **alphabetical
+    key order at every nesting level**, not the object's literal
+    construction order. Built here via ``json.dumps(...,
+    sort_keys=True, separators=(",", ":"), ensure_ascii=False)`` to match
+    that canonicalization regardless of Python dict insertion order — see
+    the module docstring's deviation note.
+
+    ⚠️ **``ensure_ascii=False`` is required, not optional** (security-review
+    finding, not just a style choice): ``json.dumps``'s default
+    ``ensure_ascii=True`` would ``\\uXXXX``-escape every non-ASCII code
+    point, but ``serde_json`` emits raw UTF-8 bytes for non-ASCII characters
+    (only control characters, ``"``, and ``\\`` are escaped). Since
+    ``dataset`` is arbitrary caller-supplied JSON, any dataset value
+    containing non-ASCII text would otherwise produce a byte sequence that
+    diverges from what the server actually signed, causing verification of
+    a legitimate, untampered proof to fail. See
+    ``test_build_proof_payload_matches_server_bytes_for_non_ascii_dataset``
+    in ``tests/test_offline_proof.py`` for the regression test.
 
     Args:
         account_id: Owning account UUID.
@@ -48,7 +89,14 @@ def build_proof_payload(
     Returns:
         The exact UTF-8 byte sequence that was (or must be) signed.
     """
-    raise NotImplementedError
+    payload = {
+        "account": {"id": str(account_id)},
+        "machine": {"id": str(machine_id), "fingerprint": fingerprint},
+        "dataset": dataset,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
 
 
 @dataclass(frozen=True)
@@ -97,7 +145,24 @@ class ProofResult:
             ValueError: If ``raw`` doesn't start with ``PROOF_VERSION_PREFIX``
                 or the remainder isn't valid base64.
         """
-        raise NotImplementedError
+        if not raw.startswith(PROOF_VERSION_PREFIX):
+            raise ValueError(
+                f"malformed proof: expected {PROOF_VERSION_PREFIX!r} prefix, got {raw[:10]!r}..."
+            )
+        sig_b64 = raw[len(PROOF_VERSION_PREFIX) :]
+        try:
+            signature = base64.b64decode(sig_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("malformed proof: signature is not valid base64") from exc
+
+        return cls(
+            raw=raw,
+            signature=signature,
+            account_id=account_id,
+            machine_id=machine_id,
+            fingerprint=fingerprint,
+            dataset=dataset,
+        )
 
     def verify(self, public_key_pem_or_der: bytes) -> bool:
         """Verify this proof's signature against a rebuilt byte-exact payload.
@@ -112,4 +177,7 @@ class ProofResult:
         Returns:
             Whether the signature is valid for the rebuilt payload.
         """
-        raise NotImplementedError
+        payload = build_proof_payload(
+            self.account_id, self.machine_id, self.fingerprint, self.dataset
+        )
+        return verify_pkcs1v15(public_key_pem_or_der, payload, self.signature)

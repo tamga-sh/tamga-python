@@ -33,4 +33,8 @@ def derive_license_file_key(license_key: str) -> bytes:
         Exactly 32 bytes, derived by zero-padding or truncating the UTF-8
         encoding of ``license_key``.
     """
-    raise NotImplementedError
+    key_bytes = license_key.encode("utf-8")
+    padded = bytearray(AES_KEY_LENGTH)
+    length = min(len(key_bytes), AES_KEY_LENGTH)
+    padded[:length] = key_bytes[:length]
+    return bytes(padded)

@@ -9,6 +9,7 @@ from tamga.models.license import LicenseFileResource, LicenseResource, LicenseSc
 from tamga.models.machine import (
     ComponentResource,
     HeartbeatStatus,
+    MachineFileResource,
     MachineResource,
     ProcessResource,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "LicenseResource",
     "LicenseScheme",
     "LicenseScope",
+    "MachineFileResource",
     "MachineResource",
     "OverageStrategy",
     "PolicyResource",

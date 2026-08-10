@@ -15,6 +15,8 @@ import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 
+from tamga.client import TamgaClient, TamgaConfig
+
 
 @pytest.fixture
 def mock_transport_handler() -> Callable[[httpx.Request], httpx.Response]:
@@ -77,6 +79,21 @@ def sample_fingerprint() -> str:
 def sample_account_id() -> str:
     """A fixed account UUID string used across client-config and proof-payload tests."""
     return "018f2f3a-0000-7000-8000-000000000001"
+
+
+@pytest.fixture
+def make_client() -> Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient]:
+    """Factory fixture: build a ``TamgaClient`` wired to a caller-supplied mock handler.
+
+    Used by every endpoint-method test (Sections C onward) to exercise real
+    request-building/response-parsing logic without any network I/O.
+    """
+
+    def _make(handler: Callable[[httpx.Request], httpx.Response]) -> TamgaClient:
+        config = TamgaConfig(account_id="018f2f3a-0000-7000-8000-000000000001", host="api.tamga.sh")
+        return TamgaClient(config, transport=httpx.MockTransport(handler))
+
+    return _make
 
 
 @pytest.fixture

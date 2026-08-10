@@ -106,14 +106,21 @@ class ValidationCode(str, Enum):
     VERSION_SCOPE_MISMATCH = "VERSION_SCOPE_MISMATCH"
     """Reachable: ⛔ — ``scope.version`` is parsed but not checked."""
 
+    UNKNOWN = "UNKNOWN"
+    """Sentinel fallback member for a ``code`` value this SDK version doesn't
+    recognize (e.g. a future server-side addition). See ``_missing_``.
+    """
+
     @classmethod
     def _missing_(cls, value: object) -> ValidationCode | None:
         """Lenient fallback: unknown codes from a newer server don't raise.
 
-        TODO(impl): return a sentinel/unknown member instead of ``None`` so
-        callers can still branch without a ``KeyError``/``ValueError``.
+        Rather than raising ``ValueError`` (the default ``Enum`` behavior for
+        an unrecognized value), returns ``UNKNOWN`` so deserialization never
+        crashes on a value this SDK version doesn't yet model — see the
+        module docstring and docs/sdk.md gap #4.
         """
-        raise NotImplementedError
+        return cls.UNKNOWN
 
 
 @dataclass(frozen=True)

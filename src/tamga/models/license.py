@@ -8,6 +8,7 @@ documented as deliberate pending a published OpenAPI schema, not an oversight.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -65,6 +66,10 @@ class LicenseResource:
     type: str
     attributes: dict[str, Any]
     relationships: dict[str, Any] = field(default_factory=dict)
+    _entitlements_fetcher: Callable[[], list[Entitlement]] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _entitlements_cache: list[Entitlement] | None = field(default=None, repr=False, compare=False)
 
     def has_entitlement(self, code: str) -> bool:
         """Check whether this license carries an entitlement with the given ``code``.
@@ -80,15 +85,31 @@ class LicenseResource:
         Returns:
             Whether an entitlement with this code is present.
         """
-        raise NotImplementedError
+        entitlements = self._entitlements_cache
+        if entitlements is None:
+            entitlements = self.refresh_entitlements()
+        return any(e.code == code for e in entitlements)
 
     def refresh_entitlements(self) -> list[Entitlement]:
         """Force a re-fetch of this license's cached entitlement list.
 
         Returns:
             The freshly-fetched list of entitlements.
+
+        Raises:
+            RuntimeError: If this ``LicenseResource`` wasn't constructed via
+                ``TamgaClient`` (e.g. built directly by a caller/test) and so
+                has no entitlements fetcher attached.
         """
-        raise NotImplementedError
+        if self._entitlements_fetcher is None:
+            raise RuntimeError(
+                "This LicenseResource has no entitlements fetcher attached "
+                "(it wasn't returned by TamgaClient) — call "
+                "client.entitlements.list(license.id) directly instead."
+            )
+        entitlements = self._entitlements_fetcher()
+        object.__setattr__(self, "_entitlements_cache", entitlements)
+        return entitlements
 
 
 @dataclass(frozen=True)
