@@ -1,4 +1,4 @@
-"""Machine offline proof — air-gapped verification.
+r"""Machine offline proof — air-gapped verification.
 
 A lighter-weight alternative to full machine checkout for periodic "prove
 this machine is still valid" pings in air-gapped environments.
@@ -28,7 +28,7 @@ and `fingerprint` before `id`. This module therefore builds the payload with
 which — like `serde_json::Value`'s `BTreeMap` — canonicalizes to alphabetical
 order regardless of Python's (insertion-ordered) dict construction order.
 ``ensure_ascii=False`` is required too: `json.dumps`'s default would
-``\\uXXXX``-escape non-ASCII characters, which `serde_json` does not do (a
+``\uXXXX``-escape non-ASCII characters, which `serde_json` does not do (a
 security-review finding during Section H — see `build_proof_payload`'s
 docstring for the full explanation and the non-ASCII regression test it
 points to). See the plan checkbox note in docs/plans/tamga-python.plan.md
@@ -56,7 +56,7 @@ def build_proof_payload(
     fingerprint: str,
     dataset: dict[str, Any],
 ) -> bytes:
-    """Build the exact byte sequence the server signs for an offline proof.
+    r"""Build the exact byte sequence the server signs for an offline proof.
 
     Must reproduce the server's ``serde_json::json!``-produced bytes for
     ``{"account":{"id":...},"machine":{"id":...,"fingerprint":...},
@@ -70,9 +70,9 @@ def build_proof_payload(
 
     ⚠️ **``ensure_ascii=False`` is required, not optional** (security-review
     finding, not just a style choice): ``json.dumps``'s default
-    ``ensure_ascii=True`` would ``\\uXXXX``-escape every non-ASCII code
+    ``ensure_ascii=True`` would ``\uXXXX``-escape every non-ASCII code
     point, but ``serde_json`` emits raw UTF-8 bytes for non-ASCII characters
-    (only control characters, ``"``, and ``\\`` are escaped). Since
+    (only control characters, ``"``, and ``\`` are escaped). Since
     ``dataset`` is arbitrary caller-supplied JSON, any dataset value
     containing non-ASCII text would otherwise produce a byte sequence that
     diverges from what the server actually signed, causing verification of

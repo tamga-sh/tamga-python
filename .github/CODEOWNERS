@@ -1,0 +1,15 @@
+# See https://docs.github.com/articles/about-codeowners for syntax.
+# Later matches take precedence.
+
+* @tamga-sh/sdk-maintainers
+
+# Crypto-bearing paths require a security-focused reviewer on every change —
+# mirrors the mandatory security-reviewer gate in docs/plans/tamga-python.plan.md
+# Section 4 for Sections E, F, H.
+/src/tamga/crypto/    @tamga-sh/sdk-maintainers @tamga-sh/security
+/src/tamga/checkout/  @tamga-sh/sdk-maintainers @tamga-sh/security
+/src/tamga/proof.py   @tamga-sh/sdk-maintainers @tamga-sh/security
+
+/.github/workflows/   @tamga-sh/sdk-maintainers
+/release-please-config.json          @tamga-sh/sdk-maintainers
+/.release-please-manifest.json       @tamga-sh/sdk-maintainers

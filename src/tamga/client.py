@@ -63,8 +63,10 @@ MAX_CHECKOUT_TTL_SECONDS: int = 31536000
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
-    """Parse an ISO 8601 timestamp, tolerating a trailing ``Z`` (Python 3.9
-    ``datetime.fromisoformat`` doesn't accept ``Z`` until 3.11)."""
+    """Parse an ISO 8601 timestamp, tolerating a trailing ``Z``.
+
+    Python 3.9's ``datetime.fromisoformat`` doesn't accept ``Z`` until 3.11.
+    """
     if value is None:
         return None
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -1018,7 +1020,9 @@ class TamgaClient:
         self._http.close()
 
     def __enter__(self) -> TamgaClient:
+        """Return ``self`` for use as a context manager."""
         return self
 
     def __exit__(self, *exc_info: object) -> None:
+        """Close the underlying ``httpx.Client`` on context-manager exit."""
         self.close()

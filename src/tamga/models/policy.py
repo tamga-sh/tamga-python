@@ -152,8 +152,10 @@ class PolicyResource:
 
     @classmethod
     def from_api(cls, attributes: dict[str, Any]) -> PolicyResource:
-        """Parse a raw JSON:API ``policies`` attributes dict, applying the
-        ``DENY_ACCESS``/``NO_RESURRECTION`` fallback rules documented above.
+        """Parse a raw JSON:API ``policies`` attributes dict.
+
+        Applies the ``DENY_ACCESS``/``NO_RESURRECTION`` fallback rules
+        documented above.
         """
         raw_overage = attributes.get("overage_strategy")
         try:

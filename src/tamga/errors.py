@@ -46,6 +46,7 @@ class TamgaError(Exception):
         detail: str,
         pointer: str | None = None,
     ) -> None:
+        """Build a ``TamgaError``; see the class docstring for the attribute meanings."""
         self.status = status
         self.code = code
         self.detail = detail
@@ -74,9 +75,11 @@ class KeyTakenError(TamgaError):
 
 
 class FingerprintTakenError(TamgaError):
-    """409 ``FINGERPRINT_TAKEN`` — duplicate ``(account_id, license_id, fingerprint)``
-    on machine creation, or ``(account_id, machine_id, fingerprint)`` on component
-    creation.
+    """409 ``FINGERPRINT_TAKEN`` — duplicate fingerprint.
+
+    Raised for a duplicate ``(account_id, license_id, fingerprint)`` on
+    machine creation, or ``(account_id, machine_id, fingerprint)`` on
+    component creation.
     """
 
 

@@ -69,7 +69,19 @@ line-length = 100
 target-version = "py39"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+select = ["E", "F", "I", "UP", "B", "SIM", "D"]
+# Docstrings are Google-style throughout (see CLAUDE.md) — this convention
+# preset also resolves ruff's mutually-exclusive D-rule pairs (e.g.
+# D203/D211, D212/D213) so `ruff check` doesn't flag both sides of the same
+# choice. Only test files are exempted below (D ruleset targets "public API
+# surface" per the plan — tests aren't part of the published API).
+pydocstyle.convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+# Standalone illustrative scripts, not part of the published package/API
+# surface the "D ruleset on public API surface" plan item targets.
+"examples/*" = ["D"]
 
 [tool.mypy]
 strict = true
