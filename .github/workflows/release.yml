@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Runs on every push to main: opens/updates a release PR that accumulates
+  # the changelog, or (when a release PR is merged) tags + creates the
+  # GitHub Release that the `publish` job below reacts to.
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          release-type: python
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # Runs when a GitHub Release is published (by release-please above, or
+  # manually). Builds and publishes to PyPI via Trusted Publishing (OIDC) —
+  # no long-lived API token stored as a repo secret.
+  publish:
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # required for PyPI Trusted Publishing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

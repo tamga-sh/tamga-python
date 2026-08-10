@@ -1,0 +1,97 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tamga-sdk"
+version = "0.1.0"
+description = "Official Python SDK for Tamga. Integrate license activation, offline verification, and machine management into your Python applications."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "Tamga", email = "oss@tamga.sh" },
+]
+keywords = [
+    "tamga",
+    "licensing",
+    "license-key",
+    "software-licensing",
+    "keygen",
+    "sdk",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Typing :: Typed",
+]
+dependencies = [
+    "cryptography>=42",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://tamga.sh"
+Repository = "https://github.com/tamga-sh/tamga-python"
+Issues = "https://github.com/tamga-sh/tamga-python/issues"
+Documentation = "https://github.com/tamga-sh/tamga-python/blob/main/README.md"
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    # mypy 2.0 dropped support for `python_version = "3.9"` as a check
+    # target (see [tool.mypy] below) — pin to the 1.x series until this
+    # SDK's `requires-python` floor moves past 3.9.
+    "mypy>=1.8,<2",
+    "pytest",
+    "pytest-cov",
+    "cryptography>=42",
+    "httpx>=0.27",
+]
+
+# This SDK ships no CLI in v1 — intentionally left empty.
+[project.scripts]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tamga"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+python_version = "3.9"
+packages = ["tamga"]
+mypy_path = "src"
+# Without this, mypy's default follow_imports="normal" fully re-typechecks
+# transitive dependency *source* (e.g. httpx -> anyio) against our pinned
+# python_version, and breaks on syntax those libraries only support on
+# newer Python (e.g. anyio's `match` statements need 3.10+). We only want
+# our own package checked, not third-party internals.
+follow_imports = "silent"
+
+# `follow_imports = "silent"` still *parses* an imported module (to extract
+# types) before discarding its errors — that's not enough for anyio, whose
+# installed source itself uses 3.10+ `match` syntax that fails to parse
+# under our pinned python_version. "skip" avoids parsing it at all,
+# treating it as untyped (`Any`) instead of raising a fatal syntax error.
+[[tool.mypy.overrides]]
+module = "anyio.*"
+follow_imports = "skip"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=tamga --cov-report=term-missing"
