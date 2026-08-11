@@ -50,6 +50,11 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
+          # Required when CODECOV_TOKEN is the org's shared Global Upload
+          # Token (one token for every Tamga SDK repo) rather than a
+          # per-repo token — without it Codecov can't tell which repo an
+          # upload belongs to.
+          slug: tamga-sh/tamga-python
 
   smoke:
     name: smoke (${{ matrix.os }})
