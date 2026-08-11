@@ -102,8 +102,6 @@ unusable server-side today). See [`CLAUDE.md`](CLAUDE.md) for the full gotcha li
 
 ## Documentation
 
-- [`docs/plans/tamga-python.plan.md`](docs/plans/tamga-python.plan.md) — this repo's
-  implementation plan, architecture, and task checklist.
 - [tamga-api `docs/sdk.md`](https://github.com/tamga-sh/tamga-api/blob/main/docs/sdk.md) — the
   authoritative wire-level protocol reference this SDK implements against, including the
   **Known Server-Side Gaps** section describing which documented features are not yet live
