@@ -5,4 +5,22 @@ All notable changes to this project will be documented in this file. This file i
 [Conventional Commits](https://www.conventionalcommits.org/) history — do not hand-edit entries
 below the `[Unreleased]` header.
 
+## 0.1.0 (2026-08-11)
+
+
+### Features
+
+* implement license/machine validation, checkout crypto, and error model (Sections B-K) ([d0524d8](https://github.com/tamga-sh/tamga-python/commit/d0524d822e4b323b071906e2b19a71fe1a90d069))
+
+
+### Bug Fixes
+
+* **ci:** gate PyPI publish on release-please's own job output ([b352422](https://github.com/tamga-sh/tamga-python/commit/b35242271ffb6dfb845cadd07dda9aacfc6791ae))
+
+
+### Documentation
+
+* add README, examples, CHANGELOG, CONTRIBUTING, SECURITY, GitHub templates (Sections L-M) ([6307ceb](https://github.com/tamga-sh/tamga-python/commit/6307cebc047d7ab3d90fa41b2185baac0632b6ff))
+* remove dead docs/plans references, add status badges where CI is live ([7971490](https://github.com/tamga-sh/tamga-python/commit/79714904468fc6abcf5893c53a4b491e32eca768))
+
 ## [Unreleased]
