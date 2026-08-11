@@ -1,0 +1,84 @@
+name: Bug Report
+description: Report a problem with this SDK
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the sections below as completely as possible — a minimal reproduction is the single most useful thing you can include.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal, self-contained code sample that reproduces the issue.
+      render: "python"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened, including the full error/exception/stack trace if there is one.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK Version
+      placeholder: "e.g. 1.0.3"
+    validations:
+      required: true
+  - type: input
+    id: runtime-version
+    attributes:
+      label: Python Version
+      placeholder: "e.g. 3.12.1"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "e.g. macOS 15, Ubuntu 24.04, Windows 11"
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the SDK does this affect, if known?
+      multiple: true
+      options:
+        - License validation / check-in / check-out
+        - Machine management (activation, heartbeats, components, processes)
+        - Offline license/machine file verification
+        - Offline proof generation/verification
+        - Entitlements
+        - Auth transports
+        - Other / not sure
+    validations:
+      required: false
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues to make sure this is not a duplicate.
+          required: true
+        - label: I have included a minimal reproduction and the version fields above.
+          required: true

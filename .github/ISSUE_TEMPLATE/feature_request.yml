@@ -1,0 +1,48 @@
+name: Feature Request
+description: Suggest an addition to this SDK
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement! Please fill out the sections below.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Motivation
+      description: What are you trying to do, and why doesn't the current SDK support it?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: What you want to happen — a proposed method signature or API shape if you have one in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: server-check
+    attributes:
+      label: Is this feature actually available server-side?
+      description: >-
+        Before requesting an SDK feature, please check tamga-api's docs/sdk.md
+        (https://github.com/tamga-sh/tamga-api/blob/main/docs/sdk.md), especially the
+        "Known Server-Side Gaps" section — several documented server features are not
+        actually wired up server-side yet. A feature request for one of those will be
+        tracked as blocked on server-side work rather than implemented here.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+    validations:
+      required: false
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues to make sure this is not a duplicate.
+          required: true
