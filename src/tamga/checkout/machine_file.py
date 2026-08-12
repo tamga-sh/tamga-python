@@ -214,9 +214,33 @@ class MachineFile:
         else:
             plaintext = payload_bytes
 
-        parsed = json.loads(plaintext)
-        data = parsed["data"]
+        # SECURITY/robustness: same class of gap as license_file.py's verify()
+        # -- without this wrapping, a malformed plaintext leaks a raw
+        # json.JSONDecodeError/KeyError instead of a documented ValueError.
+        # Found via audit; see tests/test_checkout_hardening.py.
+        try:
+            parsed = json.loads(plaintext)
+        except json.JSONDecodeError as exc:
+            raise ValueError("malformed machine file: decrypted payload is not valid JSON") from exc
+        try:
+            data = parsed["data"]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("malformed machine file: payload is missing the 'data' key") from exc
         attributes = data.get("attributes", {})
+
+        # SECURITY/robustness: an unrecognized heartbeat_status (a future
+        # server-side addition, or any value not yet modeled) must not crash
+        # verify() with an uncaught ValueError after the signature has
+        # already passed -- fall back the same lenient way
+        # models/policy.py's OverageStrategy/HeartbeatResurrectionStrategy
+        # already handle DENY_ACCESS/NO_RESURRECTION. Found via audit; see
+        # tests/test_checkout_hardening.py.
+        raw_heartbeat_status = attributes.get("heartbeat_status", "NOT_STARTED")
+        try:
+            heartbeat_status = HeartbeatStatus(raw_heartbeat_status)
+        except ValueError:
+            heartbeat_status = HeartbeatStatus.NOT_STARTED
+
         return MachineResource(
             id=data["id"],
             fingerprint=attributes.get("fingerprint", ""),
@@ -228,5 +252,5 @@ class MachineFile:
             memory=attributes.get("memory"),
             disk=attributes.get("disk"),
             metadata=attributes.get("metadata", {}) or {},
-            heartbeat_status=HeartbeatStatus(attributes.get("heartbeat_status", "NOT_STARTED")),
+            heartbeat_status=heartbeat_status,
         )
