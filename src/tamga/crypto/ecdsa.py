@@ -39,6 +39,17 @@ def _load_ec_public_key(public_key_pem_or_der: bytes) -> ec.EllipticCurvePublicK
         key = serialization.load_der_public_key(public_key_pem_or_der)
     if not isinstance(key, ec.EllipticCurvePublicKey):
         raise ValueError("key is not an EC public key")
+    # SECURITY: the PEM/DER SubjectPublicKeyInfo format embeds its own curve
+    # OID, so loading alone does not guarantee P-256 -- unlike the raw-point
+    # branch above, which hardcodes ec.SECP256R1() regardless of input. A
+    # validly-signed message from any other curve (e.g. P-384) would
+    # otherwise verify successfully here, since SHA-256 is just the digest
+    # algorithm and is independent of curve choice. Found via audit; see
+    # tests/test_crypto_ecdsa.py for the regression coverage.
+    if not isinstance(key.curve, ec.SECP256R1):
+        raise ValueError(
+            f"expected an EC public key on curve secp256r1 (P-256), got {key.curve.name}"
+        )
     return key
 
 
