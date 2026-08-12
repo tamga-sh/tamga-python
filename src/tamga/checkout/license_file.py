@@ -140,8 +140,20 @@ class LicenseFile:
         else:
             plaintext = payload_bytes
 
-        parsed = json.loads(plaintext)
-        data = parsed["data"]
+        # SECURITY/robustness: without this wrapping, a malformed plain (or
+        # a plaintext that ends up mis-routed via the unsigned `alg`-field
+        # corruption scenario documented in machine_file.py's module
+        # docstring) leaks a raw json.JSONDecodeError/KeyError from deep
+        # inside verify() instead of a documented, catchable ValueError.
+        # Found via audit; see tests/test_checkout_hardening.py.
+        try:
+            parsed = json.loads(plaintext)
+        except json.JSONDecodeError as exc:
+            raise ValueError("malformed license file: decrypted payload is not valid JSON") from exc
+        try:
+            data = parsed["data"]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("malformed license file: payload is missing the 'data' key") from exc
         return LicenseResource(
             id=data["id"],
             type=data["type"],
@@ -170,5 +182,14 @@ class LicenseFile:
         if self.expiry is None:
             return False
         reference = as_of if as_of is not None else datetime.now(timezone.utc)
+        # A timezone-naive as_of (e.g. the very natural datetime.now(), with
+        # no tz argument) would otherwise raise "TypeError: can't compare
+        # offset-naive and offset-aware datetimes" -- the docstring says
+        # "defaults to now (UTC)" without stating a caller-supplied as_of
+        # must also be tz-aware, so treat a naive value as already being in
+        # UTC rather than raising. Found via audit; see
+        # tests/test_checkout_hardening.py.
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
         expiry_dt = datetime.fromisoformat(self.expiry.replace("Z", "+00:00"))
         return expiry_dt < reference
