@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file. This file i
 [Conventional Commits](https://www.conventionalcommits.org/) history — do not hand-edit entries
 below the `[Unreleased]` header.
 
+## [0.1.1](https://github.com/tamga-sh/tamga-python/compare/v0.1.0...v0.1.1) (2026-08-11)
+
+
+### Documentation
+
+* add CODE_OF_CONDUCT.md and .editorconfig ([9ec6bc4](https://github.com/tamga-sh/tamga-python/commit/9ec6bc43729282decccf84018d557ce53931f8cb))
+
 ## 0.1.0 (2026-08-11)
 
 
