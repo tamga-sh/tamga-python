@@ -10,14 +10,19 @@ five independently hand-written SDKs in the Tamga family (alongside `tamga-rust`
 re-implements the full validation and cryptographic-verification surface natively in Python rather
 than binding to the Rust reference implementation via FFI.
 
-Full task-by-task build plan: [`docs/plans/tamga-python.plan.md`](docs/plans/tamga-python.plan.md).
+Full task-by-task build plan: [`../docs/plans/tamga-python.plan.md`](../docs/plans/tamga-python.plan.md) (lives one directory up, in the sibling `tamga-sdk` monorepo, not inside this repo).
 Authoritative wire-level protocol reference (endpoints, field names, enum values, and the
 **Known Server-Side Gaps** section — read that before touching anything protocol-shaped):
 [`tamga-api`'s `docs/sdk.md`](https://github.com/tamga-sh/tamga-api/blob/main/docs/sdk.md).
 
-**Repo status:** scaffold only. Every module under `src/tamga/` is a typed stub — real
-docstrings and signatures, `raise NotImplementedError`/`...` bodies. Do not assume any endpoint or
-crypto path actually works; check the plan file's checkbox state before relying on something.
+**Repo status:** fully implemented and published. Every module under `src/tamga/` has real, tested
+logic — client/transport, license validation/check-in/checkout, machine checkout/management/offline
+proof, components/processes, entitlements, error model. Published on PyPI as `tamga` (v0.1.0) via
+Trusted Publishing (OIDC). Sections E, F, H (all three crypto-bearing sections) have each passed a
+mandatory `security-reviewer` pass — see "Security-reviewer history" under Critical Dependency Notes
+below for the specific findings, since they aren't otherwise surfaced anywhere outside commit message
+bodies. Check the plan file's checkbox state for exact per-item status before assuming something is
+done.
 
 ## Architecture
 
@@ -153,7 +158,7 @@ analytics/EE items that don't touch this package at all.
   `httpx.MockTransport` is a hard requirement for HTTP tests; do not spin up a real server or mock
   at the `requests` level.
 - Sections E, F, H (all three crypto-bearing sections) require a **mandatory, non-skippable**
-  `security-reviewer` pass before merge — see `docs/plans/tamga-python.plan.md` Section 4. A
+  `security-reviewer` pass before merge — see `../docs/plans/tamga-python.plan.md` Section 4. A
   `python-reviewer`-only pass is not sufficient for those sections.
 - Golden-byte/known-answer tests matter more than structural-equality tests for the crypto paths —
   e.g. the offline-proof payload test must assert an exact expected byte string, and the HKDF
@@ -177,6 +182,14 @@ analytics/EE items that don't touch this package at all.
   Don't remove the `<2` pin without also bumping `requires-python` and the CI matrix's floor.
 - **Every issued server token is `tok-`-prefixed regardless of documented type.** Do not build
   prefix-based token type detection into `transport.py`; treat all bearer tokens as opaque strings.
+
+**Security-reviewer history (back-filled from commit messages — not previously surfaced here).**
+Sections E/F/H have each undergone an independent `security-reviewer` pass, all in commit `d0524d8`:
+Section E approved with no findings; Section F had 2 MEDIUM findings fixed (the `alg` field wasn't
+validated against a closed vocabulary); Section H had 1 HIGH finding fixed (`build_proof_payload`
+was missing `ensure_ascii=False`, which would have silently diverged from the server/`serde_json`
+UTF-8 wire output for any non-ASCII field value). All three fixes are live in the current code; this
+note exists so the review trail is discoverable without archaeology through commit history.
 
 ## Release
 
