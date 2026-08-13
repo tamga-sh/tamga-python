@@ -155,9 +155,7 @@ def test_a_file_without_an_exp_claim_never_expires(
     certificate = _make_plain_certificate(private_key, LICENSE_DATA)
     parsed = LicenseFile.parse(certificate)
 
-    _license, claims = parsed.verify_with_claims(
-        public_key.public_bytes_raw(), now=2**31 - 1
-    )
+    _license, claims = parsed.verify_with_claims(public_key.public_bytes_raw(), now=2**31 - 1)
     assert claims.exp is None
 
 
@@ -180,7 +178,7 @@ def test_a_v1_alg_string_is_refused(ed25519_keypair) -> None:  # type: ignore[no
     private_key, _public_key = ed25519_keypair
     certificate = _make_plain_certificate(private_key, LICENSE_DATA)
 
-    body = "".join(l for l in certificate.splitlines() if not l.startswith("-----"))
+    body = "".join(line for line in certificate.splitlines() if not line.startswith("-----"))
     cert = json.loads(base64.b64decode(body))
     cert["alg"] = "base64+ed25519"
     repacked = base64.b64encode(json.dumps(cert).encode()).decode("ascii")

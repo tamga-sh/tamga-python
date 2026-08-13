@@ -76,9 +76,7 @@ def test_a_throttled_validation_retries_and_then_succeeds() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
         if calls["n"] == 1:
-            return httpx.Response(
-                429, content=_rate_limited_body(), headers={"Retry-After": "0"}
-            )
+            return httpx.Response(429, content=_rate_limited_body(), headers={"Retry-After": "0"})
         return httpx.Response(200, content=_validation_body())
 
     result = _client(handler).licenses.validate_by_key("K")
@@ -90,9 +88,7 @@ def test_a_throttled_validation_retries_and_then_succeeds() -> None:
 def test_a_persistently_throttled_call_surfaces_retry_after() -> None:
     # Once the budget is spent the caller must be told why and for how long.
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            429, content=_rate_limited_body(), headers={"Retry-After": "42"}
-        )
+        return httpx.Response(429, content=_rate_limited_body(), headers={"Retry-After": "42"})
 
     with pytest.raises(RateLimitedError) as excinfo:
         _client(handler, max_retries=0).licenses.validate_by_key("K")

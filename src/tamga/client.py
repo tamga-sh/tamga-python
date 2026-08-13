@@ -372,11 +372,7 @@ def _request_with_retry(
             params=params,
             headers=headers,
         )
-        if (
-            response.status_code != 429
-            or not retryable
-            or attempt >= config.max_retries
-        ):
+        if response.status_code != 429 or not retryable or attempt >= config.max_retries:
             return response
         time.sleep(_retry_delay(attempt, parse_retry_after(response)))
         attempt += 1

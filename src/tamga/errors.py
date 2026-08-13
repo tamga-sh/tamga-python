@@ -158,14 +158,14 @@ _CODE_TO_EXCEPTION: dict[str, type[TamgaError]] = {
 }
 
 
-def parse_error_envelope(
-    status: int, body: bytes, retry_after: int | None = None
-) -> TamgaError:
+def parse_error_envelope(status: int, body: bytes, retry_after: int | None = None) -> TamgaError:
     """Parse a JSON:API error envelope and dispatch to a typed ``TamgaError`` subclass.
 
     Args:
         status: HTTP status code of the response.
         body: Raw response body bytes (JSON:API error envelope).
+        retry_after: Parsed ``Retry-After`` header value in seconds, if the
+            response carried one (typically only present on a 429).
 
     Returns:
         The most specific ``TamgaError`` subclass matching the response's

@@ -71,6 +71,7 @@ class LicenseFileExpired(ValueError):
     """
 
     def __init__(self, exp: int) -> None:
+        """Initialize with the signed ``exp`` claim (Unix timestamp) that failed the check."""
         super().__init__(f"license file expired at unix timestamp {exp}")
         self.exp = exp
 
