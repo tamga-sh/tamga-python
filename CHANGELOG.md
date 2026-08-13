@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file. This file i
 [Conventional Commits](https://www.conventionalcommits.org/) history — do not hand-edit entries
 below the `[Unreleased]` header.
 
+## [1.0.0](https://github.com/tamga-sh/tamga-python/compare/v0.1.2...v1.0.0) (2026-08-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* offline license files must be format v2 (`alg` ending in `+v2`). v1 files are rejected outright with no compatibility path. The `crypto.naive_key` module is removed, not deprecated.
+
+### Features
+
+* SDK v2 security contract — license-file HKDF, offline format v2, HTTP 429 handling ([9f3ac63](https://github.com/tamga-sh/tamga-python/commit/9f3ac63f6f36cc113eea4e85a03996f6f015b59c))
+
 ## [0.1.2](https://github.com/tamga-sh/tamga-python/compare/v0.1.1...v0.1.2) (2026-08-12)
 
 
