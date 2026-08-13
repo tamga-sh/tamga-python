@@ -22,17 +22,28 @@ from tamga.checkout.license_file import (
     PEM_FOOTER,
     PEM_HEADER,
     LicenseFile,
+    LicenseFileExpired,
 )
 from tamga.client import TamgaClient
-from tamga.crypto.naive_key import derive_license_file_key
+from tamga.crypto.hkdf import derive_license_file_key
 
 LICENSE_DATA = {
     "data": {
         "id": "018f2f3a-0000-7000-8000-000000000030",
         "type": "licenses",
         "attributes": {"key": "TEST-LICENSE-KEY-0000-1111-2222-3333", "status": "ACTIVE"},
-    }
+    },
+    # Format v2 puts the claims inside the signed bytes. A payload without
+    # them is a v1 file and no longer verifies.
+    "meta": {"iat": 1767225600, "jti": "test-jti", "kid": "test-kid"},
 }
+
+
+def _license_data_expiring_at(exp: int) -> dict:
+    """LICENSE_DATA with an ``exp`` claim, for the expiry tests."""
+    data = json.loads(json.dumps(LICENSE_DATA))
+    data["meta"]["exp"] = exp
+    return data
 
 
 def _make_plain_certificate(private_key, payload: dict) -> str:  # type: ignore[no-untyped-def]
@@ -90,11 +101,92 @@ def test_round_trip_encrypted_lic_parse_verify_and_decrypt(
     assert str(license_resource.id) == LICENSE_DATA["data"]["id"]
 
 
-def test_encrypted_lic_uses_exact_zero_pad_truncate_key_derivation(sample_license_key: str) -> None:
+def test_license_file_key_is_hkdf_derived_not_zero_padded(sample_license_key: str) -> None:
+    # v1 zero-padded the license key, so the derived key literally contained it
+    # in cleartext and everything past its length was zero — a stolen `.lic`
+    # was a dictionary attack against the key string, not a 256-bit one.
     key = derive_license_file_key(sample_license_key)
     assert len(key) == 32
-    expected = sample_license_key.encode("utf-8")[:32].ljust(32, b"\x00")
-    assert key == expected
+
+    naive = sample_license_key.encode("utf-8")[:32].ljust(32, b"\x00")
+    assert key != naive
+
+    # Deterministic, so a client can re-derive it offline.
+    assert key == derive_license_file_key(sample_license_key)
+    assert key != derive_license_file_key(sample_license_key + "x")
+
+
+def test_an_expired_file_is_refused_even_though_its_signature_is_valid(
+    ed25519_keypair,  # type: ignore[no-untyped-def]
+) -> None:
+    # The whole point of v2: in v1 the requested TTL lived only in the JSON:API
+    # envelope around the certificate, so a 24-hour trial file stayed
+    # cryptographically valid forever and the client simply kept the PEM.
+    private_key, public_key = ed25519_keypair
+    exp = 1767229200
+    certificate = _make_plain_certificate(private_key, _license_data_expiring_at(exp))
+    parsed = LicenseFile.parse(certificate)
+
+    with pytest.raises(LicenseFileExpired):
+        parsed.verify(public_key.public_bytes_raw(), now=exp + 3600)
+
+
+def test_a_file_within_its_ttl_verifies(ed25519_keypair) -> None:  # type: ignore[no-untyped-def]
+    private_key, public_key = ed25519_keypair
+    exp = 1767229200
+    certificate = _make_plain_certificate(private_key, _license_data_expiring_at(exp))
+    parsed = LicenseFile.parse(certificate)
+
+    license_resource, claims = parsed.verify_with_claims(
+        public_key.public_bytes_raw(), now=exp - 3600
+    )
+    assert claims.exp == exp
+    assert claims.jti == "test-jti"
+    assert claims.kid == "test-kid"
+    assert str(license_resource.id) == LICENSE_DATA["data"]["id"]
+
+
+def test_a_file_without_an_exp_claim_never_expires(
+    ed25519_keypair,  # type: ignore[no-untyped-def]
+) -> None:
+    # Checkout without a `ttl` produces no `exp`. That must read as perpetual,
+    # not as "expired at the epoch".
+    private_key, public_key = ed25519_keypair
+    certificate = _make_plain_certificate(private_key, LICENSE_DATA)
+    parsed = LicenseFile.parse(certificate)
+
+    _license, claims = parsed.verify_with_claims(
+        public_key.public_bytes_raw(), now=2**31 - 1
+    )
+    assert claims.exp is None
+
+
+def test_a_v1_payload_without_meta_is_refused(
+    ed25519_keypair,  # type: ignore[no-untyped-def]
+) -> None:
+    # Second line of defence behind the `alg` gate: a file must not reach the
+    # expiry check with nothing to check.
+    private_key, public_key = ed25519_keypair
+    v1_payload = {"data": LICENSE_DATA["data"]}
+    certificate = _make_plain_certificate(private_key, v1_payload)
+    parsed = LicenseFile.parse(certificate)
+
+    with pytest.raises(ValueError, match="pre-v2"):
+        parsed.verify(public_key.public_bytes_raw())
+
+
+def test_a_v1_alg_string_is_refused(ed25519_keypair) -> None:  # type: ignore[no-untyped-def]
+    # Accepting both formats would hand back the permanent-file problem.
+    private_key, _public_key = ed25519_keypair
+    certificate = _make_plain_certificate(private_key, LICENSE_DATA)
+
+    body = "".join(l for l in certificate.splitlines() if not l.startswith("-----"))
+    cert = json.loads(base64.b64decode(body))
+    cert["alg"] = "base64+ed25519"
+    repacked = base64.b64encode(json.dumps(cert).encode()).decode("ascii")
+
+    with pytest.raises(ValueError, match="unsupported license file algorithm"):
+        LicenseFile.parse(f"{PEM_HEADER}\n{repacked}\n{PEM_FOOTER}")
 
 
 def test_tamper_detection_mutated_enc_fails_verification(ed25519_keypair) -> None:  # type: ignore[no-untyped-def]
@@ -188,7 +280,7 @@ def test_client_check_out_post_variant_returns_structured_resource(
                         "certificate": (
                             "-----BEGIN LICENSE FILE-----\n...\n-----END LICENSE FILE-----"
                         ),
-                        "algorithm": "aes-256-gcm+ed25519",
+                        "algorithm": "aes-256-gcm+ed25519+v2",
                         "includes": [],
                         "ttl": 3600,
                         "expiry": "2024-01-01T01:00:00Z",
@@ -201,7 +293,7 @@ def test_client_check_out_post_variant_returns_structured_resource(
     client = make_client(handler)
     result = client.licenses.check_out(LICENSE_ID, encrypt=True, ttl=3600)
     assert not isinstance(result, bytes)
-    assert result.algorithm == "aes-256-gcm+ed25519"
+    assert result.algorithm == "aes-256-gcm+ed25519+v2"
     assert result.ttl == 3600
 
 

@@ -17,6 +17,7 @@ from tamga.errors import (
     LicenseNotEncryptedError,
     NotFoundError,
     PidTakenError,
+    RateLimitedError,
     SchemeNotSupportedError,
     TtlInvalidError,
     UnauthorizedError,
@@ -73,7 +74,11 @@ def test_each_typed_exception_raised_for_its_matching_code(
     assert error.code == code
 
 
-def test_unknown_code_falls_back_to_unknown_tamga_error() -> None:
+def test_a_429_maps_to_rate_limited_not_the_unknown_fallback() -> None:
+    # `TOO_MANY_REQUESTS` has no entry in the code table, so before this it
+    # fell through to `UnknownTamgaError` — leaving a caller unable to tell
+    # "slow down" from "your credential is wrong", and retrying the wrong one
+    # of those forever.
     body = json.dumps(
         {
             "errors": [
@@ -88,9 +93,19 @@ def test_unknown_code_falls_back_to_unknown_tamga_error() -> None:
             ]
         }
     ).encode("utf-8")
-    error = parse_error_envelope(429, body)
-    assert isinstance(error, UnknownTamgaError)
+    error = parse_error_envelope(429, body, retry_after=42)
+    assert isinstance(error, RateLimitedError)
     assert error.code == "TOO_MANY_REQUESTS"
+    assert error.retry_after == 42
+
+
+def test_an_unrecognised_code_still_falls_back_to_unknown() -> None:
+    body = json.dumps(
+        {"errors": [{"id": "e1", "status": "418", "code": "TEAPOT", "detail": "no coffee"}]}
+    ).encode("utf-8")
+    error = parse_error_envelope(418, body)
+    assert isinstance(error, UnknownTamgaError)
+    assert error.code == "TEAPOT"
 
 
 def test_error_with_source_pointer_is_parsed() -> None:

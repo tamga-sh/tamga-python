@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,7 @@ from tamga.transport import (
     apply_auth,
     build_base_url,
     parse_response,
+    parse_retry_after,
     sanitize_tamga_version,
 )
 
@@ -195,8 +197,12 @@ class TamgaConfig:
         default_auth: The default auth transport used when a per-call auth
             override isn't supplied.
         timeout_seconds: Connect/read timeout for the underlying
-            ``httpx.Client``. No retry-on-429 is configured, since the
-            server never sends 429 today.
+            ``httpx.Client``.
+        max_retries: How many times a rate-limited (``429``) request is
+            retried before giving up. ``0`` disables automatic retries — the
+            raised ``RateLimitedError`` still carries ``Retry-After`` so you
+            can schedule your own backoff. Only requests that are safe to
+            repeat are retried; see ``_is_retryable``.
         user_agent: Optional courtesy ``User-Agent`` header (e.g.
             ``"tamga-python/<version>"``). The server has no requirement or
             handling for this header.
@@ -208,6 +214,7 @@ class TamgaConfig:
     default_auth: AuthTransport | None = None
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     user_agent: str | None = None
+    max_retries: int = 3
 
 
 @dataclass(frozen=True)
@@ -287,14 +294,117 @@ def _send_request_raw(
     if auth is not None:
         apply_auth(headers, request_params, auth)
 
-    response = http.request(
+    response = _request_with_retry(
+        http,
+        config,
         method,
         path,
-        json=json_body,
+        json_body=json_body,
         params=request_params,
         headers=headers,
     )
     return parse_response(response, is_quick_validate=is_quick_validate)
+
+
+_RETRYABLE_POST_SUFFIXES = (
+    "/actions/validate",
+    "/actions/validate-key",
+    "/actions/check-in",
+    "/actions/check-out",
+    "/actions/ping",
+)
+
+
+def _is_retryable(method: str, path: str) -> bool:
+    """Is this request safe to repeat after a ``429``?
+
+    ``GET`` always is. Among the ``POST``s only the licensing *actions* are —
+    they are effectively idempotent (validate, check in/out, ping a heartbeat)
+    and they are precisely the calls a client makes on a timer, so they are the
+    ones that hit the rate limit in the first place.
+
+    Creates are deliberately excluded: retrying ``POST /machines`` risks a
+    second activation burning a second seat, and only the caller knows whether
+    that is acceptable.
+    """
+    if method.upper() == "GET":
+        return True
+    return method.upper() == "POST" and path.endswith(_RETRYABLE_POST_SUFFIXES)
+
+
+def _retry_delay(attempt: int, retry_after: int | None) -> float:
+    """Seconds to wait before retry number ``attempt`` (0-based).
+
+    Prefers the server's ``Retry-After`` — it knows when the bucket refills and
+    guessing wastes the budget — but caps it, so a misconfigured or hostile
+    proxy cannot park the caller for an hour on one header. Otherwise
+    exponential backoff with jitter, because a fleet that all retries on the
+    same schedule reconverges into the spike it was backing off from.
+    """
+    if retry_after is not None:
+        return float(min(retry_after, 60))
+    base = float(2 ** min(attempt, 5))
+    return base + random.random()
+
+
+def _request_with_retry(
+    http: httpx.Client,
+    config: TamgaConfig,
+    method: str,
+    path: str,
+    *,
+    json_body: dict[str, Any] | None,
+    params: dict[str, Any],
+    headers: dict[str, str],
+) -> httpx.Response:
+    """Send a request, transparently retrying while the server answers ``429``.
+
+    Returns the first non-429 response, or the last 429 once the retry budget
+    is spent — the caller then turns it into a ``RateLimitedError``.
+    """
+    retryable = _is_retryable(method, path)
+    attempt = 0
+    while True:
+        response = http.request(
+            method,
+            path,
+            json=json_body,
+            params=params,
+            headers=headers,
+        )
+        if (
+            response.status_code != 429
+            or not retryable
+            or attempt >= config.max_retries
+        ):
+            return response
+        time.sleep(_retry_delay(attempt, parse_retry_after(response)))
+        attempt += 1
+
+
+def _client_request(
+    sub: Any,
+    method: str,
+    path: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    """Retry-aware ``self._http.request`` for the namespaced sub-clients.
+
+    They build their own requests rather than going through
+    ``_send_request_raw`` (they need the raw response for ``meta``), so the
+    `429` handling has to be reachable from here too — otherwise the endpoints
+    most likely to be throttled, the ones a client calls on a timer, would be
+    exactly the ones without backoff.
+    """
+    return _request_with_retry(
+        sub._http,
+        sub._config,
+        method,
+        path,
+        json_body=kwargs.get("json"),
+        params=kwargs.get("params") or {},
+        headers=kwargs.get("headers") or {},
+    )
 
 
 def _raw_response_meta(response: httpx.Response) -> dict[str, Any]:
@@ -324,7 +434,8 @@ class LicensesClient:
         module docstring).
         """
         auth = self._config.default_auth or LicenseAuth(key)
-        response = self._http.request(
+        response = _client_request(
+            self,
             "POST",
             "/licenses/actions/validate-key",
             json={"key": key},
@@ -360,7 +471,8 @@ class LicensesClient:
         if meta:
             body["meta"] = meta
 
-        response = self._http.request(
+        response = _client_request(
+            self,
             "POST",
             f"/licenses/{license_id}/actions/validate",
             json=body if body else None,
@@ -443,7 +555,8 @@ class LicensesClient:
         if as_bytes:
             headers = self._headers()
             headers["Accept"] = "application/octet-stream"
-            response = self._http.request(
+            response = _client_request(
+                self,
                 "GET",
                 f"/licenses/{license_id}/actions/check-out",
                 params=params,
@@ -642,7 +755,8 @@ class MachinesClient:
             if self._config.default_auth is not None:
                 apply_auth(headers, request_params, self._config.default_auth)
 
-            response = self._http.request(
+            response = _client_request(
+                self,
                 "GET",
                 f"/machines/{machine_id}/actions/check-out",
                 params=request_params,
@@ -680,7 +794,8 @@ class MachinesClient:
         ``tamga.proof.ProofResult``.
         """
         body = {"meta": {"dataset": dataset or {}}}
-        response = self._http.request(
+        response = _client_request(
+            self,
             "POST",
             f"/machines/{machine_id}/actions/generate-offline-proof",
             json=body,

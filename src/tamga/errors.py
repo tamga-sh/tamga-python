@@ -15,10 +15,9 @@ Fixed-status codes seen across the SDK surface: ``NOT_FOUND`` (404),
 generic — never leaks DB detail). Per-endpoint conflict/validation codes are
 modeled below as typed subclasses.
 
-Known gap: ``429 TOO_MANY_REQUESTS`` is declared in the server's error enum
-but has **no constructor and is never returned by any code path today** — do
-not build client-side 429/backoff handling expecting the server to ever send
-it under the current deployment (see docs/sdk.md "Known Server-Side Gaps").
+``429 TOO_MANY_REQUESTS`` is live and modelled as ``RateLimitedError``, which
+carries the server's ``Retry-After``. Credential-accepting endpoints run on a
+tight per-IP budget that a heartbeat timer reaches easily.
 """
 
 from __future__ import annotations
@@ -52,6 +51,25 @@ class TamgaError(Exception):
         self.detail = detail
         self.pointer = pointer
         super().__init__(f"{code} ({status}): {detail}")
+
+
+class RateLimitedError(TamgaError):
+    """The server answered ``429 Too Many Requests``.
+
+    Credential-accepting endpoints (session creation, password reset,
+    license-key validation, token minting) run on a tight per-IP budget — 5
+    requests/second by default — which a heartbeat timer reaches easily.
+
+    Its own class on purpose: a caller that cannot tell "you are going too
+    fast, wait N seconds" from "your credential is wrong" will retry the second
+    one forever and give up on the first.
+
+    Attributes:
+        retry_after: The server's ``Retry-After`` in seconds, when it sent one.
+            Wait at least this long before trying again.
+    """
+
+    retry_after: int | None = None
 
 
 class NotFoundError(TamgaError):
@@ -140,7 +158,9 @@ _CODE_TO_EXCEPTION: dict[str, type[TamgaError]] = {
 }
 
 
-def parse_error_envelope(status: int, body: bytes) -> TamgaError:
+def parse_error_envelope(
+    status: int, body: bytes, retry_after: int | None = None
+) -> TamgaError:
     """Parse a JSON:API error envelope and dispatch to a typed ``TamgaError`` subclass.
 
     Args:
@@ -162,6 +182,11 @@ def parse_error_envelope(status: int, body: bytes) -> TamgaError:
     detail = first.get("detail", "")
     source = first.get("source") or {}
     pointer = source.get("pointer")
+
+    if status == 429:
+        err = RateLimitedError(status=status, code=code, detail=detail, pointer=pointer)
+        err.retry_after = retry_after
+        return err
 
     exc_cls = _CODE_TO_EXCEPTION.get(code, UnknownTamgaError)
     return exc_cls(status=status, code=code, detail=detail, pointer=pointer)

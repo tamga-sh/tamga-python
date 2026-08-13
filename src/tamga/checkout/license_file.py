@@ -6,10 +6,20 @@ File format::
     <base64 of JSON: {"enc": "<base64>", "sig": "<base64 ed25519 sig>", "alg": "<string>"}>
     -----END LICENSE FILE-----
 
-``alg`` is exactly ``"base64+ed25519"`` (plain) or ``"aes-256-gcm+ed25519"``
-(encrypted) — the checkout signature is **always Ed25519**, independent of
-the license's own key ``scheme`` (contrast with machine files, which dispatch
-on scheme — see ``tamga.checkout.machine_file``).
+``alg`` is exactly ``"base64+ed25519+v2"`` (plain) or
+``"aes-256-gcm+ed25519+v2"`` (encrypted) — the checkout signature is **always
+Ed25519**, independent of the license's own key ``scheme`` (contrast with
+machine files, which dispatch on scheme — see ``tamga.checkout.machine_file``).
+
+**Format v2, and why v1 files are refused.** In v1 the ``ttl``/``expiry`` a
+caller asked for lived only in the JSON:API envelope *around* the certificate,
+never inside the signed bytes. A 24-hour trial file was therefore
+cryptographically valid forever: the client is the attacker, so any check built
+on the envelope is bypassed by simply keeping — or redistributing — the raw
+``certificate`` string. v2 moves ``iat``/``exp``/``jti``/``kid`` inside the
+signature, and this module enforces ``exp``. Accepting both formats would give
+the old behaviour back, so a file whose ``alg`` lacks the ``+v2`` suffix is
+rejected.
 
 ⚠️ **The single most important trap in this SDK**: the Ed25519 signature
 covers ``enc``'s ASCII/UTF-8 bytes — the base64 **string itself**
@@ -30,18 +40,60 @@ from cryptography.exceptions import InvalidSignature
 from tamga.checkout._envelope import parse_certificate_envelope
 from tamga.crypto.aes_gcm import decrypt as aes_gcm_decrypt
 from tamga.crypto.ed25519 import verify as ed25519_verify
-from tamga.crypto.naive_key import derive_license_file_key
+from tamga.crypto.hkdf import derive_license_file_key
 from tamga.models.license import LicenseResource
 
 PEM_HEADER: str = "-----BEGIN LICENSE FILE-----"
 PEM_FOOTER: str = "-----END LICENSE FILE-----"
 
-ALG_PLAIN: str = "base64+ed25519"
-ALG_ENCRYPTED: str = "aes-256-gcm+ed25519"
+ALG_PLAIN: str = "base64+ed25519+v2"
+ALG_ENCRYPTED: str = "aes-256-gcm+ed25519+v2"
 VALID_ALGORITHMS: frozenset[str] = frozenset({ALG_PLAIN, ALG_ENCRYPTED})
 
 _NONCE_LENGTH = 12
 _GCM_TAG_LENGTH = 16
+
+CLOCK_SKEW_TOLERANCE_SECONDS: int = 60
+"""How much clock skew to tolerate when checking ``exp``.
+
+Deliberately small. The client's clock is under the attacker's control, so a
+generous allowance is just a free extension on every expired file; this covers
+ordinary NTP drift and nothing more.
+"""
+
+
+class LicenseFileExpired(ValueError):
+    """The file's signature verified, but its signed ``exp`` claim has passed.
+
+    Distinct from a signature failure on purpose: a caller that cannot tell
+    "expired" from "forged" either warns the user about tampering when their
+    trial merely ended, or treats a forgery as a renewal prompt.
+    """
+
+    def __init__(self, exp: int) -> None:
+        super().__init__(f"license file expired at unix timestamp {exp}")
+        self.exp = exp
+
+
+@dataclass(frozen=True)
+class LicenseFileClaims:
+    """The claims carried *inside* the signed bytes.
+
+    These are the point of format v2: unlike the response envelope, they cannot
+    be edited by whoever holds the file.
+
+    Attributes:
+        iat: Issued-at, seconds since the Unix epoch.
+        exp: Expiry, seconds since the Unix epoch. ``None`` means the file
+            never expires (checkout was made without a ``ttl``).
+        jti: Unique per checkout — usable for replay detection.
+        kid: Identifies the signing key, so a file survives a key rotation.
+    """
+
+    iat: int
+    jti: str
+    kid: str
+    exp: int | None = None
 
 
 @dataclass(frozen=True)
@@ -95,19 +147,32 @@ class LicenseFile:
             )
         return cls(enc=enc, sig=sig_bytes, alg=alg)
 
-    def verify(self, public_key: bytes, license_key: str | None = None) -> LicenseResource:
+    def verify(
+        self,
+        public_key: bytes,
+        license_key: str | None = None,
+        now: int | None = None,
+    ) -> LicenseResource:
         """Run the full verification pipeline and return the embedded license.
 
         Pipeline: Ed25519-verify ``sig`` against ``self.enc``'s ASCII bytes
         using ``public_key`` -> base64-decode ``self.enc`` -> if
-        ``self.alg == ALG_ENCRYPTED``, derive the naive key from the caller's
-        license key and AES-256-GCM-open the payload -> parse the resulting
-        bytes as ``{"data": <LicenseResource>}``.
+        ``self.alg == ALG_ENCRYPTED``, derive the AES key with HKDF and
+        AES-256-GCM-open the payload -> parse the resulting bytes as
+        ``{"data": <LicenseResource>, "meta": <claims>}`` -> **enforce**
+        ``meta.exp``.
+
+        The signature only establishes that the file is authentic. Without the
+        expiry check, verifying it would say nothing about whether it is still
+        valid — which is exactly the v1 behaviour format v2 exists to close.
 
         Args:
             public_key: The account's raw 32-byte Ed25519 public key.
             license_key: The license's raw key string. Required only if
                 ``self.alg == ALG_ENCRYPTED``.
+            now: Current Unix timestamp. Defaults to the system clock. Pass a
+                server-supplied timestamp instead if you are defending against
+                a user winding their clock back to revive an expired file.
 
         Returns:
             The verified, embedded ``LicenseResource``.
@@ -154,12 +219,40 @@ class LicenseFile:
             data = parsed["data"]
         except (KeyError, TypeError) as exc:
             raise ValueError("malformed license file: payload is missing the 'data' key") from exc
+
+        claims = _parse_claims(parsed)
+        _enforce_expiry(claims, now)
+
         return LicenseResource(
             id=data["id"],
             type=data["type"],
             attributes=data.get("attributes", {}),
             relationships=data.get("relationships", {}),
         )
+
+    def verify_with_claims(
+        self,
+        public_key: bytes,
+        license_key: str | None = None,
+        now: int | None = None,
+    ) -> tuple[LicenseResource, LicenseFileClaims]:
+        """As :meth:`verify`, also returning the signed claims.
+
+        Use this when you want ``jti`` for replay detection or ``kid`` for
+        key-rotation bookkeeping. Expiry is enforced either way — it is not
+        opt-in.
+        """
+        license = self.verify(public_key, license_key, now)
+        payload_bytes = base64.b64decode(self.enc)
+        if self.alg == ALG_ENCRYPTED:
+            assert license_key is not None  # verify() already enforced this
+            nonce = payload_bytes[:_NONCE_LENGTH]
+            plaintext = aes_gcm_decrypt(
+                derive_license_file_key(license_key), nonce, payload_bytes[_NONCE_LENGTH:]
+            )
+        else:
+            plaintext = payload_bytes
+        return license, _parse_claims(json.loads(plaintext))
 
     def is_expired(self, as_of: datetime | None = None) -> bool:
         """Check the unsigned ``expiry`` metadata field.
@@ -193,3 +286,38 @@ class LicenseFile:
             reference = reference.replace(tzinfo=timezone.utc)
         expiry_dt = datetime.fromisoformat(self.expiry.replace("Z", "+00:00"))
         return expiry_dt < reference
+
+
+def _parse_claims(parsed: object) -> LicenseFileClaims:
+    """Pull the signed ``meta`` claims out of a decoded payload.
+
+    A payload with no ``meta`` is a v1 file. The ``alg`` gate should have
+    caught it already; this is the second line, so a file cannot reach the
+    expiry check with nothing to check.
+    """
+    if not isinstance(parsed, dict):
+        raise ValueError("malformed license file: payload is not a JSON object")
+    meta = parsed.get("meta")
+    if not isinstance(meta, dict):
+        raise ValueError(
+            "malformed license file: payload is missing the signed 'meta' claims "
+            "(this looks like a pre-v2 file)"
+        )
+    try:
+        return LicenseFileClaims(
+            iat=int(meta["iat"]),
+            jti=str(meta["jti"]),
+            kid=str(meta["kid"]),
+            exp=int(meta["exp"]) if meta.get("exp") is not None else None,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"malformed license file: bad 'meta' claims ({exc})") from exc
+
+
+def _enforce_expiry(claims: LicenseFileClaims, now: int | None) -> None:
+    """Reject a file whose signed ``exp`` has passed."""
+    if claims.exp is None:
+        return
+    reference = now if now is not None else int(datetime.now(timezone.utc).timestamp())
+    if reference - CLOCK_SKEW_TOLERANCE_SECONDS > claims.exp:
+        raise LicenseFileExpired(claims.exp)
