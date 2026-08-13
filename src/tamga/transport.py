@@ -21,9 +21,12 @@ Every issued token gets the ``tok-`` prefix regardless of documented type —
 do not build prefix-based token type detection; treat all tokens as opaque
 strings.
 
-Not implemented server-side, do not build against: ``Tamga-Environment``
-request header (planned EE feature); ``X-RateLimit-*`` response headers /
-``429`` responses (declared in the CORS allowlist only, never set).
+Not implemented server-side, do not build against: the ``Tamga-Environment``
+request header (planned EE feature).
+
+``429`` responses *are* sent — see ``tamga.errors.RateLimitedError`` and
+``TamgaConfig.max_retries``. ``X-RateLimit-*`` response headers are still not
+set, so ``Retry-After`` on a ``429`` is the only server-side signal available.
 """
 
 from __future__ import annotations
@@ -217,7 +220,11 @@ def parse_response(response: httpx.Response, *, is_quick_validate: bool = False)
             see ``tamga.errors.parse_error_envelope``.
     """
     if response.status_code >= 400:
-        raise parse_error_envelope(response.status_code, response.content)
+        raise parse_error_envelope(
+            response.status_code,
+            response.content,
+            retry_after=parse_retry_after(response),
+        )
 
     body = json.loads(response.content) if response.content else None
 
@@ -230,3 +237,19 @@ def parse_response(response: httpx.Response, *, is_quick_validate: bool = False)
         tamga_mode=response.headers.get("Tamga-Mode"),
         request_id=response.headers.get("X-Request-Id"),
     )
+
+
+def parse_retry_after(response: httpx.Response) -> int | None:
+    """Read ``Retry-After`` as delta-seconds.
+
+    The HTTP-date form is ignored deliberately: the server sends seconds, and
+    misreading a date as a duration would be far worse than falling back to
+    the client's own backoff.
+    """
+    raw = response.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None

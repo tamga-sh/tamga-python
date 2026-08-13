@@ -1,9 +1,8 @@
 """AES-256-GCM decryption.
 
-Shared by both checkout flows — license checkout uses the naive
-zero-pad/truncate key (``tamga.crypto.naive_key``), machine checkout uses the
-HKDF-derived key (``tamga.crypto.hkdf``). The decrypt operation itself is
-identical either way.
+Shared by both checkout flows. Both keys come from ``tamga.crypto.hkdf``,
+differing only in salt and ``info``; the decrypt operation itself is identical
+either way.
 """
 
 from __future__ import annotations
