@@ -16,6 +16,13 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+#: Matches tamga-rust's reference implementation (aws-lc-rs's
+#: RSA_PKCS1_2048_8192_SHA256 / RSA_PSS_2048_8192_SHA256 algorithm objects,
+#: crypto/rsa.rs) -- the accepted range is 2048-8192 bits, not exactly 2048,
+#: even though the wire scheme names are RSA_2048_*.
+_MIN_KEY_SIZE_BITS = 2048
+_MAX_KEY_SIZE_BITS = 8192
+
 
 def _load_rsa_public_key(public_key_pem_or_der: bytes) -> rsa.RSAPublicKey:
     """Load an RSA public key from PEM or DER (SubjectPublicKeyInfo) bytes."""
@@ -25,6 +32,15 @@ def _load_rsa_public_key(public_key_pem_or_der: bytes) -> rsa.RSAPublicKey:
         key = serialization.load_der_public_key(public_key_pem_or_der)
     if not isinstance(key, rsa.RSAPublicKey):
         raise ValueError("key is not an RSA public key")
+    # SECURITY: neither load_pem_public_key nor load_der_public_key checks
+    # key size -- a caller-influenced downgrade to a weaker RSA key (e.g.
+    # 1024-bit) would otherwise verify successfully. Found via audit; see
+    # tests/test_crypto_rsa.py for the regression coverage.
+    if not (_MIN_KEY_SIZE_BITS <= key.key_size <= _MAX_KEY_SIZE_BITS):
+        raise ValueError(
+            f"RSA key size {key.key_size} bits outside the accepted "
+            f"{_MIN_KEY_SIZE_BITS}-{_MAX_KEY_SIZE_BITS}-bit range"
+        )
     return key
 
 
