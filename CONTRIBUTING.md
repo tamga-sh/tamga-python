@@ -29,9 +29,9 @@ uv run ruff format .
 
 ## Test-driven development
 
-Write the test in the same task as the implementation, not after — see
-[`docs/plans/tamga-python.plan.md`](docs/plans/tamga-python.plan.md) for the section-by-section
-task breakdown. Fixtures live in `tests/conftest.py` (mock-transport HTTP client via
+Write the test in the same task as the implementation, not after — the section-by-section task
+breakdown lives in `docs/plans/tamga-python.plan.md` in the sibling `tamga-sdk` workspace, one
+directory up, not inside this repo. Fixtures live in `tests/conftest.py` (mock-transport HTTP client via
 `httpx.MockTransport`, throwaway Ed25519/RSA/ECDSA keypairs) — reuse these rather than
 hand-rolling new ones per test file.
 
@@ -43,8 +43,8 @@ derivation test asserts an exact 32-byte key for a fixed input, not just "produc
 
 Any change touching `src/tamga/crypto/`, `src/tamga/checkout/`, or `src/tamga/proof.py` requires
 a `security-reviewer` pass before merge — a general code-quality review alone is not sufficient.
-See [`docs/plans/tamga-python.plan.md`](docs/plans/tamga-python.plan.md) Section 4 (Quality
-Gates) and [`SECURITY.md`](SECURITY.md) for the specific assumptions those files encode.
+See Section 4 (Quality Gates) of `docs/plans/tamga-python.plan.md` in the sibling `tamga-sdk`
+workspace, and [`SECURITY.md`](SECURITY.md) for the specific assumptions those files encode.
 
 ## Pull request expectations
 
