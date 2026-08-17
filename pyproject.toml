@@ -13,12 +13,11 @@ authors = [
     { name = "Tamga", email = "oss@tamga.sh" },
 ]
 keywords = [
-    "tamga",
     "licensing",
-    "license-key",
     "software-licensing",
-    "keygen",
-    "sdk",
+    "license-key",
+    "activation",
+    "entitlements",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
