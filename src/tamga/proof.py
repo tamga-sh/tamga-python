@@ -7,17 +7,15 @@ RSA-2048 PKCS#1 v1.5 / SHA-256, **regardless of the license's ``scheme``**
 (unlike checkout, there is no scheme dispatch here). Response:
 ``meta.proof = "v1x0.<base64 signature>"``.
 
-⚠️ **Byte-exact serialization gotcha — deviation from the plan's literal
-wording**: the plan's stub docstring said to serialize
-``{"account":..., "machine":..., "dataset":...}`` "with no key sorting",
-implying the literal source-code field order must be preserved. Ground
-truth contradicts this: the server (``tamga-api``'s
-``src/features/machines/generate_offline_proof.rs``) builds the payload via
-``serde_json::json!(...)``, and `serde_json::Map` is `BTreeMap`-backed
-(alphabetically sorted output at every nesting level) because neither
-`tamga-api` nor `tamga-rust` enables serde_json's `preserve_order` feature
-(confirmed: no `indexmap` next to `serde_json` in either `Cargo.lock`; see
-`tamga-rust/src/proof.rs`'s module doc comment and its
+⚠️ **Byte-exact serialization gotcha**: it is tempting to assume the signed
+bytes preserve the server source code's literal field order,
+``{"account":..., "machine":..., "dataset":...}``. They do not. The server
+builds the payload via ``serde_json::json!(...)``, and `serde_json::Map` is
+`BTreeMap`-backed
+(alphabetically sorted output at every nesting level) because neither the
+server nor the Rust SDK enables serde_json's `preserve_order` feature
+(confirmed: no `indexmap` next to `serde_json` in either `Cargo.lock`, and
+the Rust SDK carries a matching
 `payload_json_field_order_is_alphabetical_not_source_order` test, which this
 SDK's own test suite mirrors). So despite the server's source code literally
 writing ``{"account": ..., "machine": ..., "dataset": ...}``, the actual
@@ -28,11 +26,9 @@ and `fingerprint` before `id`. This module therefore builds the payload with
 which — like `serde_json::Value`'s `BTreeMap` — canonicalizes to alphabetical
 order regardless of Python's (insertion-ordered) dict construction order.
 ``ensure_ascii=False`` is required too: `json.dumps`'s default would
-``\uXXXX``-escape non-ASCII characters, which `serde_json` does not do (a
-security-review finding during Section H — see `build_proof_payload`'s
-docstring for the full explanation and the non-ASCII regression test it
-points to). See the plan checkbox note in docs/plans/tamga-python.plan.md
-Section H for both documented deviations.
+``\uXXXX``-escape non-ASCII characters, which `serde_json` does not do — see
+`build_proof_payload`'s docstring for the full explanation and the non-ASCII
+regression test it points to.
 """
 
 from __future__ import annotations

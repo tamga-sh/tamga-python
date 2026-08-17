@@ -1,7 +1,7 @@
 """Offline machine file parsing and multi-scheme verification.
 
 Same inner ``{enc, sig, alg}`` JSON structure as license files, wrapped in
-``-----BEGIN/END MACHINE FILE-----`` markers instead. Two key differences
+``-----BEGIN/END MACHINE FILE-----`` markers instead. Three key differences
 from license checkout (``tamga.checkout.license_file``):
 
 1. The signing scheme is taken from the **license's** ``scheme`` field
@@ -9,9 +9,14 @@ from license checkout (``tamga.checkout.license_file``):
    ``ECDSA_P256_SIGN``), not hardcoded to Ed25519. ``RSA_2048_JWT_RS256`` is
    explicitly rejected (server returns ``422 SCHEME_NOT_SUPPORTED``) — mirror
    that rejection client-side rather than attempting to verify it.
-2. The encryption key (when encrypted) is HKDF-SHA256 derived
-   (``tamga.crypto.hkdf``), requiring both the license key and the target
-   machine's fingerprint — not the naive license-checkout derivation.
+2. The encryption key (when encrypted) needs both the license key and the
+   target machine's fingerprint, so a machine file only decrypts on the
+   machine it was issued for. Both file types derive their key with
+   HKDF-SHA256 (``tamga.crypto.hkdf``); they differ only in salt and
+   ``info`` — here the ``info`` is the fingerprint.
+3. Machine-file ``alg`` values carry no ``+v2`` suffix. The format-v2 gate
+   and signed-``exp`` enforcement described in
+   ``tamga.checkout.license_file`` apply to ``.lic`` files only.
 
 ⚠️ **``alg`` is not covered by the signature** (security-review note, Section
 F): the signature covers only ``enc``'s ASCII bytes (see the signing-message

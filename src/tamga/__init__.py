@@ -1,15 +1,19 @@
 """Official Python SDK for Tamga.
 
 Integrate license activation, offline verification, and machine management
-into your Python applications. See:
+into your Python applications.
+
+Distributed on PyPI as ``tamga-sdk``; the importable package is ``tamga``.
+
+Start with :class:`tamga.client.TamgaClient` for the HTTP surface (license
+validation, check-in/checkout, machine and process management, entitlements)
+and :mod:`tamga.checkout` for offline verification of ``.lic`` license files
+and machine files. ``.lic`` files must be format v2 — see
+:mod:`tamga.checkout.license_file` for what that enforces and why v1 files
+are refused.
 
 - Package README: https://github.com/tamga-sh/tamga-python
-- Protocol reference: docs/plans/tamga-python.plan.md (this repo) and
-  ``tamga-api``'s ``docs/sdk.md`` (upstream server spec).
-
-This package is currently a scaffold — public symbols are importable and
-fully typed/documented, but method bodies raise ``NotImplementedError``
-pending task-by-task implementation (see docs/plans/tamga-python.plan.md).
+- Product documentation: https://tamga.sh
 """
 
 from __future__ import annotations

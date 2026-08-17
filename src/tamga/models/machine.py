@@ -112,14 +112,18 @@ class MachineFileResource:
     the server's ``machine_file_response`` serializer emits the identical
     shape (``certificate``/``algorithm``/``includes``/``ttl``/``expiry``/
     ``issued``), just wrapping a machine-file certificate instead of a
-    license-file one. Not explicitly named in the plan's model list (only
-    ``LicenseFileResource`` was) — added for parity so ``machines.check_out``
-    can return a typed structured result instead of ``Any``.
+    license-file one.
 
     Attributes:
-        certificate: The full machine-file PEM-style wrapper string.
-        algorithm: Signing/encryption algorithm string, e.g.
-            ``"base64+ed25519"`` or an RSA/ECDSA-flavored equivalent.
+        certificate: The full machine-file PEM-style wrapper string. Parse
+            and verify it with ``tamga.checkout.machine_file.MachineFile``,
+            passing the license's own ``scheme``.
+        algorithm: An encryption prefix (``base64`` or ``aes-256-gcm``) plus
+            a signing suffix (``ed25519``, ``rsa-sha256``,
+            ``rsa-pss-sha256``, or ``ecdsa-p256``), e.g.
+            ``"aes-256-gcm+ecdsa-p256"``. Unlike license files, machine
+            files carry no ``+v2`` suffix — see
+            ``tamga.checkout.machine_file.VALID_ALGORITHMS``.
         includes: Always ``[]`` today, same caveat as license checkout.
         ttl: TTL in seconds, as requested. Metadata only.
         expiry: Computed expiry timestamp. Metadata only.

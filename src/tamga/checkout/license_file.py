@@ -181,7 +181,11 @@ class LicenseFile:
         Raises:
             cryptography.exceptions.InvalidSignature: If Ed25519 verification fails.
             cryptography.exceptions.InvalidTag: If AES-256-GCM authentication fails.
-            ValueError: If the file is encrypted but no ``license_key`` was supplied.
+            LicenseFileExpired: If the file is authentic but its signed
+                ``exp`` claim has passed (beyond the 60s skew tolerance).
+            ValueError: If the file is encrypted but no ``license_key`` was
+                supplied, or the payload is malformed / missing its signed
+                ``meta`` claims.
         """
         # ⚠️ Sign over `self.enc`'s ASCII/UTF-8 STRING bytes, never
         # `base64.b64decode(self.enc)` — see module docstring.
@@ -258,10 +262,16 @@ class LicenseFile:
     def is_expired(self, as_of: datetime | None = None) -> bool:
         """Check the unsigned ``expiry`` metadata field.
 
-        Advisory only — ``ttl``/``expiry`` are metadata, not embedded in the
-        signed payload, and are never re-checked by the server on any later
-        validation. Expiry enforcement for an offline file is entirely this
-        SDK's (and ultimately the caller's) responsibility.
+        Advisory only, and **not** the expiry check that matters: this reads
+        the ``expiry`` a ``POST`` checkout echoed back beside the
+        certificate, which lives outside the signature and is never
+        re-checked by the server on any later validation. The enforced copy
+        is the signed ``meta.exp`` claim inside the certificate, which
+        :meth:`verify` rejects on — that enforcement is not opt-in and does
+        not need this method.
+
+        Useful for showing a renewal prompt before a file actually lapses,
+        without re-running verification.
 
         Args:
             as_of: Reference time to compare against; defaults to now (UTC).

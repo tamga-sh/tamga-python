@@ -1,8 +1,8 @@
 """Regression tests for input-hardening findings from a cross-repo security audit.
 
 Each covers a real defect found in offline checkout parsing/verification --
-not the base64-string-vs-decoded-bytes/naive-key/field-order gotchas already
-covered elsewhere, but robustness gaps around malformed-but-not-forged input
+not the base64-string-vs-decoded-bytes/key-derivation/field-order gotchas
+already covered elsewhere, but robustness gaps around malformed-but-not-forged input
 reaching these code paths after signature verification has already passed
 (or, for the envelope-length guards, before it).
 """
