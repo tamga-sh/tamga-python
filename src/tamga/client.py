@@ -57,12 +57,13 @@ from tamga.transport import (
 T = TypeVar("T")
 
 #: Recommended machine heartbeat ping interval — roughly 1/3 of the
-#: server's hardcoded 600s heartbeat window (see docs/sdk.md section 5).
+#: server's hardcoded 600s heartbeat window (see the Tamga API protocol
+#: specification section 5).
 MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL: timedelta = timedelta(seconds=200)
 
 #: Recommended process heartbeat ping interval — well inside the server's
 #: hardcoded 30s process heartbeat window, which has no resurrection grace
-#: period (see docs/sdk.md section 8).
+#: period (see the Tamga API protocol specification section 8).
 PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL: timedelta = timedelta(seconds=10)
 
 #: Server-side bounds on machine/process checkout `ttl` (seconds): must be

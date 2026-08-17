@@ -84,8 +84,8 @@ def sample_account_id() -> str:
 def make_client() -> Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient]:
     """Factory fixture: build a ``TamgaClient`` wired to a caller-supplied mock handler.
 
-    Used by every endpoint-method test (Sections C onward) to exercise real
-    request-building/response-parsing logic without any network I/O.
+    Used by every endpoint-method test to exercise real request-building and
+    response-parsing logic without any network I/O.
     """
 
     def _make(handler: Callable[[httpx.Request], httpx.Response]) -> TamgaClient:

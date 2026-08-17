@@ -16,10 +16,10 @@ class HeartbeatStatus(str, Enum):
     arrived after a death event was already recorded).
 
     The heartbeat window is a **hardcoded 600 seconds (10 min)** server-side,
-    not driven by ``policy.heartbeat_duration`` (see docs/sdk.md "Known
-    Server-Side Gaps" item 8). Dead-machine handling beyond that depends on
-    the license's policy — see ``HeartbeatCullStrategy`` and
-    ``HeartbeatResurrectionStrategy`` in ``tamga.models.policy``.
+    not driven by ``policy.heartbeat_duration`` (see the Tamga API protocol
+    specification, "Known Server-Side Gaps" item 8). Dead-machine handling
+    beyond that depends on the license's policy — see ``HeartbeatCullStrategy``
+    and ``HeartbeatResurrectionStrategy`` in ``tamga.models.policy``.
     """
 
     NOT_STARTED = "NOT_STARTED"

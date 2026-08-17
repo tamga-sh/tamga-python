@@ -1,4 +1,4 @@
-"""Tests for policy-derived enums and PolicyResource parsing gotchas (plan Section K)."""
+"""Tests for policy-derived enums and PolicyResource parsing gotchas."""
 
 from __future__ import annotations
 

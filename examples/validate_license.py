@@ -28,7 +28,8 @@ def main() -> None:
             return
 
         # 2. Validate by ID with a scope — only product/policy/user/environment
-        #    are actually enforced server-side today (see docs/sdk.md section 2);
+        #    are actually enforced server-side today (see the Tamga API protocol
+        #    specification section 2);
         #    the other 4 fields are parsed but silently ignored.
         product_id = os.environ.get("TAMGA_PRODUCT_ID")
         scope = LicenseScope(product=UUID(product_id)) if product_id else None

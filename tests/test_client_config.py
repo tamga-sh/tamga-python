@@ -1,4 +1,4 @@
-"""Tests for ``TamgaConfig`` and base URL construction (plan Section B)."""
+"""Tests for ``TamgaConfig`` and base URL construction."""
 
 from __future__ import annotations
 

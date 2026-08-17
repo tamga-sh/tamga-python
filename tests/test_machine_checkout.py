@@ -1,7 +1,6 @@
-"""Tests for machine checkout crypto: multi-algorithm verify + HKDF (plan Section F).
+"""Tests for machine checkout crypto: multi-algorithm verify + HKDF.
 
-⚠️ Crypto-bearing — this section requires a mandatory security-reviewer pass
-per docs/plans/tamga-python.plan.md Section 4.
+⚠️ Crypto-bearing — changes here require a mandatory security-reviewer pass.
 """
 
 from __future__ import annotations
@@ -74,10 +73,9 @@ def _public_key_bytes(scheme: LicenseScheme, public_key) -> bytes:  # type: igno
     return public_key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
 
 
-#: Maps a scheme to its `alg` signing-suffix, matching the server's
-#: `scheme_to_alg_suffix` (`tamga-api`'s `shared/crypto/machine_file.rs`) —
-#: needed so test fixtures produce an `alg` value MachineFile.parse's
-#: closed `VALID_ALGORITHMS` set actually accepts.
+#: Maps a scheme to its `alg` signing-suffix, matching the server's own
+#: scheme-to-`alg`-suffix mapping — needed so test fixtures produce an `alg`
+#: value MachineFile.parse's closed `VALID_ALGORITHMS` set actually accepts.
 _ALG_SUFFIX = {
     LicenseScheme.ED25519_SIGN: "ed25519",
     LicenseScheme.RSA_2048_PKCS1_SIGN: "rsa-sha256",
@@ -169,7 +167,7 @@ def test_rsa_2048_jwt_rs256_scheme_raises_scheme_not_supported(rsa_keypair) -> N
 
 
 def test_parse_rejects_alg_outside_closed_vocabulary() -> None:
-    """Security-review regression test (Section F, M-1): `alg` is not
+    """Security-review regression test (finding M-1): `alg` is not
     covered by the signature (it lives in the same unsigned outer JSON as
     `enc`/`sig`), so `MachineFile.parse` must validate it against a closed
     set at parse time rather than accepting any string — a corrupted `alg`

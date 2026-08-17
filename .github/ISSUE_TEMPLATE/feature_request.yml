@@ -26,11 +26,11 @@ body:
     attributes:
       label: Is this feature actually available server-side?
       description: >-
-        Before requesting an SDK feature, please check tamga-api's docs/sdk.md
-        (https://github.com/tamga-sh/tamga-api/blob/main/docs/sdk.md), especially the
-        "Known Server-Side Gaps" section — several documented server features are not
-        actually wired up server-side yet. A feature request for one of those will be
-        tracked as blocked on server-side work rather than implemented here.
+        Before requesting an SDK feature, please check the Tamga API protocol
+        specification, especially its "Known Server-Side Gaps" section — several
+        documented server features are not actually wired up server-side yet. A feature
+        request for one of those will be tracked as blocked on server-side work rather
+        than implemented here.
     validations:
       required: false
   - type: textarea

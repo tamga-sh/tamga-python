@@ -1,4 +1,4 @@
-"""Tests for machine management: create/delete/activate/heartbeat (plan Section G)."""
+"""Tests for machine management: create/delete/activate/heartbeat."""
 
 from __future__ import annotations
 

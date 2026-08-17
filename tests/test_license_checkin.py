@@ -1,4 +1,4 @@
-"""Tests for license check-in (plan Section D)."""
+"""Tests for license check-in."""
 
 from __future__ import annotations
 

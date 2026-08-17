@@ -1,8 +1,8 @@
 """Create a machine, then validate the license, handling an over-limit rollback.
 
-This is the documented activation flow (docs/sdk.md section 5): the server
-does not check machine/core/memory/disk/process limits at *creation* time —
-only later, on license validation. `activate_machine` implements
+This is the documented activation flow (Tamga API protocol specification
+section 5): the server does not check machine/core/memory/disk/process limits
+at *creation* time — only later, on license validation. `activate_machine` implements
 create -> validate -> delete-and-raise-on-over-limit so a caller doesn't
 have to hand-roll the rollback themselves.
 

@@ -1,8 +1,8 @@
 """License validation result models.
 
 Covers the response shape shared by all three validation endpoints
-(``validate-key``, ``validate`` by ID, quick-validate) as documented in
-docs/sdk.md section 2.
+(``validate-key``, ``validate`` by ID, quick-validate) as documented in the
+Tamga API protocol specification section 2.
 """
 
 from __future__ import annotations
@@ -118,7 +118,7 @@ class ValidationCode(str, Enum):
         Rather than raising ``ValueError`` (the default ``Enum`` behavior for
         an unrecognized value), returns ``UNKNOWN`` so deserialization never
         crashes on a value this SDK version doesn't yet model — see the
-        module docstring and docs/sdk.md gap #4.
+        module docstring and the Tamga API protocol specification gap #4.
         """
         return cls.UNKNOWN
 

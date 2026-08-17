@@ -1,4 +1,4 @@
-"""Tests for entitlements list/get and LicenseResource.has_entitlement caching (Section J)."""
+"""Tests for entitlements list/get and LicenseResource.has_entitlement caching."""
 
 from __future__ import annotations
 

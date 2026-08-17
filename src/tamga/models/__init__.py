@@ -1,7 +1,7 @@
 """Data models for the Tamga SDK.
 
-JSON:API resources, validation results, and policy-derived enums. See
-docs/sdk.md for the wire-level protocol these models mirror.
+JSON:API resources, validation results, and policy-derived enums. See the Tamga
+API protocol specification for the wire-level protocol these models mirror.
 """
 
 from __future__ import annotations

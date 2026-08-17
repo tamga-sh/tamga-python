@@ -1,7 +1,6 @@
-"""Tests for ``.lic`` license checkout crypto (plan Section E).
+"""Tests for ``.lic`` license checkout crypto.
 
-⚠️ Crypto-bearing — this section requires a mandatory security-reviewer pass
-per docs/plans/tamga-python.plan.md Section 4.
+⚠️ Crypto-bearing — changes here require a mandatory security-reviewer pass.
 """
 
 from __future__ import annotations

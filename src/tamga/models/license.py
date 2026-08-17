@@ -2,8 +2,9 @@
 
 ``LicenseResource`` is intentionally generic (JSON:API `type`/`id`/`attributes`/
 `relationships` only) rather than a fully-typed attribute schema, because the
-full license attribute set is not enumerated in docs/sdk.md — this is
-documented as deliberate pending a published OpenAPI schema, not an oversight.
+full license attribute set is not enumerated in the Tamga API protocol
+specification — this is documented as deliberate pending a published OpenAPI
+schema, not an oversight.
 """
 
 from __future__ import annotations

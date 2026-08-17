@@ -1,4 +1,4 @@
-"""Tests for the 3 license validation endpoints (plan Section C)."""
+"""Tests for the 3 license validation endpoints."""
 
 from __future__ import annotations
 

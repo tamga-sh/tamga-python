@@ -1,4 +1,4 @@
-"""Tests for the 5 auth transports, header handling, and response parsing (plan Section B)."""
+"""Tests for the 5 auth transports, header handling, and response parsing."""
 
 from __future__ import annotations
 
