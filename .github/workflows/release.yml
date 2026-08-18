@@ -17,9 +17,23 @@ jobs:
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
     steps:
+      # Mint a short-lived GitHub App installation token for release-please.
+      # The default GITHUB_TOKEN cannot be used here: GitHub's loop-prevention
+      # rule means a PR it authors never triggers `pull_request` workflows, so
+      # CI never reports on the release PR and branch protection blocks the
+      # merge forever. A GitHub App-authored PR does trigger workflows.
+      # Scoped to release-please only — the publish job authenticates to PyPI
+      # via OIDC Trusted Publishing and must not see this token.
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - uses: googleapis/release-please-action@v5
         id: release
         with:
+          token: ${{ steps.app-token.outputs.token }}
           release-type: python
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
