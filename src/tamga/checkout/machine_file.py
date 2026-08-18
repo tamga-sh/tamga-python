@@ -1,7 +1,7 @@
 """Offline machine file parsing and multi-scheme verification.
 
 Same inner ``{enc, sig, alg}`` JSON structure as license files, wrapped in
-``-----BEGIN/END MACHINE FILE-----`` markers instead. Two key differences
+``-----BEGIN/END MACHINE FILE-----`` markers instead. Three key differences
 from license checkout (``tamga.checkout.license_file``):
 
 1. The signing scheme is taken from the **license's** ``scheme`` field
@@ -9,9 +9,14 @@ from license checkout (``tamga.checkout.license_file``):
    ``ECDSA_P256_SIGN``), not hardcoded to Ed25519. ``RSA_2048_JWT_RS256`` is
    explicitly rejected (server returns ``422 SCHEME_NOT_SUPPORTED``) — mirror
    that rejection client-side rather than attempting to verify it.
-2. The encryption key (when encrypted) is HKDF-SHA256 derived
-   (``tamga.crypto.hkdf``), requiring both the license key and the target
-   machine's fingerprint — not the naive license-checkout derivation.
+2. The encryption key (when encrypted) needs both the license key and the
+   target machine's fingerprint, so a machine file only decrypts on the
+   machine it was issued for. Both file types derive their key with
+   HKDF-SHA256 (``tamga.crypto.hkdf``); they differ only in salt and
+   ``info`` — here the ``info`` is the fingerprint.
+3. Machine-file ``alg`` values carry no ``+v2`` suffix. The format-v2 gate
+   and signed-``exp`` enforcement described in
+   ``tamga.checkout.license_file`` apply to ``.lic`` files only.
 
 ⚠️ **``alg`` is not covered by the signature** (security-review note, Section
 F): the signature covers only ``enc``'s ASCII bytes (see the signing-message
@@ -27,9 +32,9 @@ against the closed ``VALID_ALGORITHMS`` set (mirroring
 corrupted value fails fast with a clear ``ValueError`` rather than an opaque
 ``InvalidTag``/JSON-parse exception from deeper in ``verify()``.
 
-⚠️ **``scheme`` must come from a trusted source** (security-review note,
-Section F): ``MachineFile.verify``'s ``scheme`` parameter must be sourced
-from the license's own ``scheme`` field via an authenticated API response —
+⚠️ **``scheme`` must come from a trusted source** (security-review note):
+``MachineFile.verify``'s ``scheme`` parameter must be sourced from the
+license's own ``scheme`` field via an authenticated API response —
 never from this certificate's own unauthenticated ``alg`` string or any
 other untrusted input. Feeding an attacker-influenced ``scheme`` value in
 could force verification down a mismatched key-family path (the dispatch
@@ -69,9 +74,8 @@ _ENC_PREFIX_ENCRYPTED = "aes-256-gcm"
 _SIGNING_SUFFIXES = frozenset({"ed25519", "rsa-sha256", "rsa-pss-sha256", "ecdsa-p256"})
 
 #: Closed set of `alg` values the server can actually produce for a machine
-#: file (`{enc_prefix}+{signing_suffix}`, from
-#: `tamga-api`'s `shared/crypto/machine_file.rs::encode_machine_file` /
-#: `scheme_to_alg_suffix`). Security-review finding (Section F, M-1):
+#: file (`{enc_prefix}+{signing_suffix}`, matching the server's own machine-file
+#: encoder and its scheme-to-`alg`-suffix mapping). Security-review finding M-1:
 #: `MachineFile.parse` previously accepted any `alg` string and `verify()`
 #: branched on a loose `"aes-256-gcm" in self.alg` substring check — both
 #: are now validated against this closed set at parse time, mirroring
@@ -195,7 +199,7 @@ class MachineFile:
 
         # Exact prefix match against the closed alg vocabulary validated in
         # `parse()` — no longer a bare substring check (security-review
-        # hardening, Section F M-1).
+        # hardening, finding M-1).
         if self.alg.startswith(f"{_ENC_PREFIX_ENCRYPTED}+"):
             if license_key is None or fingerprint is None:
                 raise ValueError(

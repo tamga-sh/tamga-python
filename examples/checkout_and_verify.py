@@ -34,8 +34,9 @@ def main() -> None:
         print("Plain checkout verified. License id:", plain_license.id)
 
         # Encrypted checkout — requires the license's own key string to
-        # derive the AES-256-GCM decryption key (naive zero-pad/truncate
-        # transform, NOT a KDF — see tamga.crypto.naive_key).
+        # derive the AES-256-GCM decryption key via HKDF-SHA256
+        # (salt "tamga:license-file-key-v1", info "license-file" — see
+        # tamga.crypto.hkdf.derive_license_file_key).
         license_key_string = os.environ["TAMGA_LICENSE_KEY_STRING"]
         encrypted_result = client.licenses.check_out(license_id, encrypt=True)
         assert not isinstance(encrypted_result, bytes)
@@ -43,9 +44,10 @@ def main() -> None:
         encrypted_license = encrypted_file.verify(public_key, license_key=license_key_string)
         print("Encrypted checkout verified. License id:", encrypted_license.id)
 
-        # ttl/expiry are metadata only — never embedded in the signed
-        # payload, never re-checked by the server. Expiry enforcement for
-        # an offline file is entirely this application's responsibility.
+        # The `expiry` echoed back here sits outside the signature and is
+        # advisory only. The enforced copy is the `exp` claim inside the
+        # certificate's signed `meta`, which verify() above already checked
+        # (it raises LicenseFileExpired for a lapsed file).
         if encrypted_result.expiry:
             print("Checkout expiry metadata (advisory only):", encrypted_result.expiry)
 

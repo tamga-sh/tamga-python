@@ -2,8 +2,9 @@
 
 ``LicenseResource`` is intentionally generic (JSON:API `type`/`id`/`attributes`/
 `relationships` only) rather than a fully-typed attribute schema, because the
-full license attribute set is not enumerated in docs/sdk.md — this is
-documented as deliberate pending a published OpenAPI schema, not an oversight.
+full license attribute set is not enumerated in the Tamga API protocol
+specification — this is documented as deliberate pending a published OpenAPI
+schema, not an oversight.
 """
 
 from __future__ import annotations
@@ -117,14 +118,20 @@ class LicenseFileResource:
     """The JSON:API ``license-files`` resource returned by the ``POST`` checkout variant.
 
     Attributes:
-        certificate: The full ``.lic`` PEM-style wrapper string.
-        algorithm: One of ``"base64+ed25519"`` or ``"aes-256-gcm+ed25519"``.
+        certificate: The full ``.lic`` PEM-style wrapper string. Parse and
+            verify it with ``tamga.checkout.license_file.LicenseFile``.
+        algorithm: One of ``"base64+ed25519+v2"`` or
+            ``"aes-256-gcm+ed25519+v2"`` — file format v2 is the only
+            accepted form.
         includes: Always ``[]`` today — there is no working ``include[]``
             param despite the field existing server-side. Do not build a
             "checkout with embedded relationships" feature around this.
-        ttl: TTL in seconds, as requested. Metadata only — not embedded in
-            the signed payload and not re-checked by the server later.
-        expiry: Computed expiry timestamp. Metadata only, same caveat as ``ttl``.
+        ttl: TTL in seconds, as requested. Echoed back here outside the
+            signature; the enforced copy is the ``exp`` claim inside the
+            certificate's signed ``meta``.
+        expiry: Computed expiry timestamp, same caveat as ``ttl`` — this
+            field is advisory, ``LicenseFile.verify`` enforces the signed
+            ``exp``.
         issued: Issuance timestamp.
     """
 

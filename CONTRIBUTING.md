@@ -29,11 +29,9 @@ uv run ruff format .
 
 ## Test-driven development
 
-Write the test in the same task as the implementation, not after — see
-[`docs/plans/tamga-python.plan.md`](docs/plans/tamga-python.plan.md) for the section-by-section
-task breakdown. Fixtures live in `tests/conftest.py` (mock-transport HTTP client via
-`httpx.MockTransport`, throwaway Ed25519/RSA/ECDSA keypairs) — reuse these rather than
-hand-rolling new ones per test file.
+Write the test in the same task as the implementation, not after. Fixtures live in
+`tests/conftest.py` (mock-transport HTTP client via `httpx.MockTransport`, throwaway
+Ed25519/RSA/ECDSA keypairs) — reuse these rather than hand-rolling new ones per test file.
 
 Golden-byte/known-answer tests matter more than structural-equality tests for the crypto paths —
 e.g. the offline-proof payload test asserts an exact expected byte string, and the HKDF
@@ -43,8 +41,7 @@ derivation test asserts an exact 32-byte key for a fixed input, not just "produc
 
 Any change touching `src/tamga/crypto/`, `src/tamga/checkout/`, or `src/tamga/proof.py` requires
 a `security-reviewer` pass before merge — a general code-quality review alone is not sufficient.
-See [`docs/plans/tamga-python.plan.md`](docs/plans/tamga-python.plan.md) Section 4 (Quality
-Gates) and [`SECURITY.md`](SECURITY.md) for the specific assumptions those files encode.
+See [`SECURITY.md`](SECURITY.md) for the specific assumptions those files encode.
 
 ## Pull request expectations
 
@@ -55,9 +52,9 @@ Gates) and [`SECURITY.md`](SECURITY.md) for the specific assumptions those files
   `.github/workflows/ci.yml`): `ruff check`, `ruff format --check`, `mypy src/`, and
   `pytest --cov=tamga --cov-fail-under=80` all passing. Branch protection on `main` should require
   all of these plus the full Python version matrix (3.9–3.13) before merge.
-- Keep PRs scoped to one plan section (or one bug/feature) where practical — crypto-bearing
-  sections in particular should not be batched with unrelated changes, so a security review can
-  stay scoped to exactly the files that changed.
+- Keep PRs scoped to one bug or feature where practical — crypto-bearing changes in particular
+  should not be batched with unrelated changes, so a security review can stay scoped to exactly the
+  files that changed.
 
 ## Branch & commit convention
 

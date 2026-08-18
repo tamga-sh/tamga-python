@@ -1,12 +1,11 @@
-"""Tests for machine offline proof — byte-exact serialization + RSA verify (plan Section H).
+"""Tests for machine offline proof — byte-exact serialization + RSA verify.
 
-⚠️ Crypto-bearing — this section requires a mandatory security-reviewer pass
-per docs/plans/tamga-python.plan.md Section 4.
+⚠️ Crypto-bearing — changes here require a mandatory security-reviewer pass.
 
 ⚠️ These tests assert the **alphabetical** field order documented in
-``tamga.proof``'s module docstring, which is a deliberate deviation from the
-plan's literal "no key sorting" wording — see that docstring for the full
-ground-truth justification (server ``serde_json::json!`` + `BTreeMap`
+``tamga.proof``'s module docstring. That ordering is deliberate, not an
+oversight — see that docstring for the full ground-truth justification
+(server ``serde_json::json!`` + `BTreeMap`
 canonicalization, cross-checked against ``tamga-rust``'s
 ``payload_json_field_order_is_alphabetical_not_source_order`` test).
 """
@@ -61,7 +60,7 @@ def test_build_proof_payload_field_order_is_alphabetical_not_source_order() -> N
 
 
 def test_build_proof_payload_matches_server_bytes_for_non_ascii_dataset() -> None:
-    """Regression test for a security-review finding (Section H): Python's
+    """Regression test for a security-review finding: Python's
     ``json.dumps`` default (``ensure_ascii=True``) would ``\\uXXXX``-escape
     non-ASCII characters, but the server's ``serde_json`` emits raw UTF-8
     bytes for them (only control chars, ``"``, and ``\\`` are escaped).

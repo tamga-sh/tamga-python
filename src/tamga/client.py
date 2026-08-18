@@ -3,13 +3,19 @@
 ``TamgaClient`` wraps an ``httpx.Client`` and exposes namespaced sub-clients
 (``.licenses``, ``.machines``, ``.components``, ``.processes``,
 ``.entitlements``) rather than one flat method namespace, mirroring the
-resource grouping in docs/sdk.md.
+server's own resource grouping.
 
 Auth note: server-side auth enforcement is **not currently active** on the
-license or machine endpoints (see docs/sdk.md "Known Server-Side Gaps" item
-3) — this SDK still always sends proper credentials (default: ``Authorization:
-License <key>`` for license-key-based flows) for forward-compatibility, not
-because the server currently checks them.
+license or machine endpoints — this SDK still always sends proper
+credentials (default: ``Authorization: License <key>`` for license-key-based
+flows) for forward-compatibility, not because the server currently checks
+them.
+
+Rate limiting: the server does answer ``429``. Requests that are safe to
+repeat are retried here with capped ``Retry-After``/jittered backoff — see
+``_is_retryable``, ``_retry_delay``, and ``_request_with_retry`` — and a
+request that exhausts ``TamgaConfig.max_retries`` surfaces as
+``tamga.errors.RateLimitedError``.
 """
 
 from __future__ import annotations
@@ -51,12 +57,13 @@ from tamga.transport import (
 T = TypeVar("T")
 
 #: Recommended machine heartbeat ping interval — roughly 1/3 of the
-#: server's hardcoded 600s heartbeat window (see docs/sdk.md section 5).
+#: server's hardcoded 600s heartbeat window (see the Tamga API protocol
+#: specification section 5).
 MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL: timedelta = timedelta(seconds=200)
 
 #: Recommended process heartbeat ping interval — well inside the server's
 #: hardcoded 30s process heartbeat window, which has no resurrection grace
-#: period (see docs/sdk.md section 8).
+#: period (see the Tamga API protocol specification section 8).
 PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL: timedelta = timedelta(seconds=10)
 
 #: Server-side bounds on machine/process checkout `ttl` (seconds): must be
@@ -249,13 +256,11 @@ def _send_request(
     parses the response through ``tamga.transport.parse_response`` (which
     raises a typed ``tamga.errors.TamgaError`` on any non-2xx response).
 
-    Returns the parsed ``.data`` payload (already unwrapped from the
-    JSON:API envelope), or, when ``meta`` is present in the raw JSON:API
-    response body, a ``(data, meta)`` tuple — callers that need ``meta``
-    (validate/checkout/offline-proof endpoints) pass ``want_meta=True``
-    implicitly by inspecting the return value themselves via the lower-level
-    ``_send_request_raw`` instead. Endpoint methods below call
-    ``_send_request_raw`` directly when they need response ``meta``.
+    Always returns just the parsed ``.data`` payload, already unwrapped from
+    the JSON:API envelope. The response ``meta`` object is dropped here, so
+    the endpoints that need it (validate, checkout, offline proof) build
+    their request through ``_client_request`` and read ``meta`` off the raw
+    response via ``_raw_response_meta`` instead.
     """
     return _send_request_raw(
         http,
@@ -529,15 +534,14 @@ class LicensesClient:
         fresh UUIDv7 per call — **not idempotent**, repeat calls yield
         different certificates.
 
+        The returned certificate is format v2 — verify it with
+        ``tamga.checkout.license_file.LicenseFile``, which enforces the
+        signed ``exp`` claim.
+
         Note:
-            The plan's stub signature for this method didn't include a
-            parameter to select between the ``GET``/``POST`` variants
-            despite documenting both — ``as_bytes`` is this SDK's resolution
-            of that gap (documented deviation; see
-            docs/plans/tamga-python.plan.md Section E's checkbox note).
-            ``tamga-rust`` resolves the same ambiguity by exposing two
-            separate methods (``check_out_license``/``check_out_license_json``)
-            instead.
+            One method with an ``as_bytes`` switch, rather than the two
+            separate methods some sibling SDKs expose, is a deliberate
+            choice for this SDK's surface.
 
         Raises:
             tamga.errors.LicenseNotEncryptedError: On ``422
@@ -723,9 +727,11 @@ class MachinesClient:
         authoritative and still returns ``422 TTL_INVALID`` on violation.
 
         Note:
-            Same ``as_bytes`` deviation as ``LicensesClient.check_out`` — see
-            its docstring and docs/plans/tamga-python.plan.md Section F's
-            checkbox note.
+            Same ``as_bytes`` switch as ``LicensesClient.check_out``. Unlike
+            license files, machine-file ``alg`` values carry no ``+v2``
+            suffix — verify them with
+            ``tamga.checkout.machine_file.MachineFile``, passing the
+            license's own ``scheme``.
 
         Raises:
             tamga.errors.TtlInvalidError: If ``ttl`` fails the client-side
@@ -1085,11 +1091,26 @@ class TamgaClient:
     Exposes namespaced sub-clients: ``.licenses``, ``.machines``,
     ``.components``, ``.processes``, ``.entitlements``.
 
-    Example (illustrative — implementation is currently a stub):
-        >>> client = TamgaClient(TamgaConfig(account_id="acct_123", host="api.tamga.sh"))
-        >>> result = client.licenses.validate_by_key("MY-LICENSE-KEY")
-        >>> result.meta.valid
-        True
+    Synchronous only — this wraps ``httpx.Client``, not ``httpx.AsyncClient``.
+    Usable as a context manager, which closes the underlying HTTP client on
+    exit.
+
+    A rate-limited (``429``) request is retried automatically when it is safe
+    to repeat; see ``TamgaConfig.max_retries`` and ``_is_retryable``.
+
+    Example::
+
+        from tamga import TamgaClient, TamgaConfig
+        from tamga.transport import LicenseAuth
+
+        config = TamgaConfig(
+            account_id="018f2f3a-0000-7000-8000-000000000001",
+            host="api.tamga.sh",
+            default_auth=LicenseAuth(key="MY-LICENSE-KEY"),
+        )
+        with TamgaClient(config) as client:
+            result = client.licenses.validate_by_key("MY-LICENSE-KEY")
+            print(result.meta.valid, result.meta.code.value)
     """
 
     licenses: LicensesClient
@@ -1106,9 +1127,8 @@ class TamgaClient:
         Args:
             config: Client configuration, including account ID, host, auth,
                 and timeout.
-            transport: Optional ``httpx`` transport override — not part of
-                the plan's literal stub signature, added so tests can inject
-                ``httpx.MockTransport`` without reaching into private
+            transport: Optional ``httpx`` transport override, so tests can
+                inject ``httpx.MockTransport`` without reaching into private
                 ``httpx.Client`` internals. ``None`` (default) uses real
                 network I/O via ``httpx``'s default transport.
         """

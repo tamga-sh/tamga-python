@@ -1,7 +1,7 @@
 """Policy-derived enums, ``PolicyResource``, and ``Entitlement``.
 
 A validating client needs to interpret the *policy* behind a license, not
-just the validation code — see docs/sdk.md section 10.
+just the validation code — see the Tamga API protocol specification section 10.
 """
 
 from __future__ import annotations
@@ -83,7 +83,8 @@ class CheckInInterval(str, Enum):
 class PolicyResource:
     """A license's policy, describing enforcement behavior.
 
-    Important parsing gotchas (see docs/sdk.md section 10):
+    Important parsing gotchas (see the Tamga API protocol specification
+    section 10):
 
     - ``overage_strategy`` may be the string ``"DENY_ACCESS"`` on freshly
       created policies — this is **not a real ``OverageStrategy`` variant**;
@@ -121,11 +122,12 @@ class PolicyResource:
         max_memory: Memory limit, subject to ``overage_strategy``. **Always
             ``None`` in practice** — the server's ``GET`` response for a
             policy omits this field even though it's enforced during
-            validation (see docs/sdk.md section 10 and "Known Server-Side
-            Gaps" item 9's neighboring note). Modeled here anyway so parsing
-            doesn't break if/when the server starts including it, and so
-            callers have a typed field to check rather than reaching into
-            raw attributes. Do not rely on this being populated — the only
+            validation (see the Tamga API protocol specification section 10
+            and "Known Server-Side Gaps" item 9's neighboring note). Modeled
+            here anyway so parsing doesn't break if/when the server starts
+            including it, and so callers have a typed field to check rather
+            than reaching into raw attributes. Do not rely on this being
+            populated — the only
             way to observe this limit today is a ``TOO_MUCH_MEMORY``
             validation code.
         max_disk: Disk limit, subject to ``overage_strategy``. Same

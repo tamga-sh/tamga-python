@@ -3,9 +3,7 @@
 
 * @tamga-sh/sdk-maintainers
 
-# Crypto-bearing paths require a security-focused reviewer on every change —
-# mirrors the mandatory security-reviewer gate in docs/plans/tamga-python.plan.md
-# Section 4 for Sections E, F, H.
+# Crypto-bearing paths require a security-focused reviewer on every change.
 /src/tamga/crypto/    @tamga-sh/sdk-maintainers @tamga-sh/security
 /src/tamga/checkout/  @tamga-sh/sdk-maintainers @tamga-sh/security
 /src/tamga/proof.py   @tamga-sh/sdk-maintainers @tamga-sh/security

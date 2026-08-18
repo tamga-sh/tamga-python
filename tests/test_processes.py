@@ -1,4 +1,4 @@
-"""Tests for process creation and heartbeat pinging (plan Section I)."""
+"""Tests for process creation and heartbeat pinging."""
 
 from __future__ import annotations
 

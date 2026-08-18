@@ -1,4 +1,4 @@
-"""Tests for the JSON:API error envelope parser and typed exception dispatch (plan Section K)."""
+"""Tests for the JSON:API error envelope parser and typed exception dispatch."""
 
 from __future__ import annotations
 

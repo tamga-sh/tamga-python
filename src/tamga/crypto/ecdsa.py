@@ -2,18 +2,11 @@
 
 Used for the ``ECDSA_P256_SIGN`` machine checkout scheme.
 
-⚠️ **Public key format deviation from the plan's literal wording**: the
-plan's stub docstring for this module said "PEM or DER encoded" only. Ground
-truth (``tamga-api``'s ``src/shared/crypto/license_signing.rs`` and
-``tamga-rust``'s ``crypto/ecdsa.rs``, both of which this SDK must interop
-with) shows the server exports/verifies P-256 public keys as a **raw
-65-byte uncompressed point** (``aws_lc_rs::signature::EcdsaKeyPair::public_key()``
-output — ``0x04 || X(32B) || Y(32B)``), *not* PEM/DER SubjectPublicKeyInfo.
-This module therefore accepts **both**: a raw 65-byte uncompressed point
-(the actual server/tamga-rust wire format, tried first) and PEM/DER SPKI
-(for callers who re-wrap the raw point themselves) — see the plan
-checkbox note in docs/plans/tamga-python.plan.md Section F for this
-documented deviation.
+⚠️ **Public key format**: the server exports and verifies P-256 public keys
+as a **raw 65-byte uncompressed point** (``0x04 || X(32B) || Y(32B)``), not
+PEM/DER SubjectPublicKeyInfo. This module therefore accepts **both**: the
+raw uncompressed point (the actual wire format, tried first) and PEM/DER
+SPKI, for callers who re-wrap the raw point themselves.
 """
 
 from __future__ import annotations

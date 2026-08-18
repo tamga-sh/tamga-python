@@ -1,4 +1,4 @@
-"""Tests for component creation and listing (plan Section I)."""
+"""Tests for component creation and listing."""
 
 from __future__ import annotations
 

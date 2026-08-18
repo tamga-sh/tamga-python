@@ -1,9 +1,9 @@
 """Shared pytest fixtures: a mock-transport HTTP client and throwaway keypairs.
 
 These fixtures are test infrastructure, not SDK business logic — they exist
-so that Sections B onward can write request/response tests against a
-``TamgaClient`` without touching the network, and so that Sections E/F/H's
-crypto tests have deterministic, disposable keypairs to sign/verify against.
+so endpoint tests can drive a ``TamgaClient`` without touching the network,
+and so the crypto tests have deterministic, disposable keypairs to
+sign/verify against.
 """
 
 from __future__ import annotations
@@ -20,12 +20,11 @@ from tamga.client import TamgaClient, TamgaConfig
 
 @pytest.fixture
 def mock_transport_handler() -> Callable[[httpx.Request], httpx.Response]:
-    """Default handler for the mock transport: 501, since no real routes are wired yet.
+    """Default handler for the mock transport: an unconditional 501.
 
-    Individual tests are expected to override this via
-    ``httpx.MockTransport(their_own_handler)`` once endpoint implementations
-    land; this default only guarantees the fixture machinery itself is
-    exercised during scaffold-phase test collection.
+    Every endpoint test supplies its own handler through the ``make_client``
+    factory below. This default exists so a test that forgets to fails
+    loudly instead of reaching the network.
     """
 
     def _handler(request: httpx.Request) -> httpx.Response:
@@ -65,7 +64,7 @@ def ecdsa_keypair() -> tuple[ec.EllipticCurvePrivateKey, ec.EllipticCurvePublicK
 
 @pytest.fixture
 def sample_license_key() -> str:
-    """A fixed license key string used across naive-key-derivation known-answer tests."""
+    """A fixed license key string used across the HKDF known-answer tests."""
     return "TEST-LICENSE-KEY-0000-1111-2222-3333"
 
 
@@ -85,8 +84,8 @@ def sample_account_id() -> str:
 def make_client() -> Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient]:
     """Factory fixture: build a ``TamgaClient`` wired to a caller-supplied mock handler.
 
-    Used by every endpoint-method test (Sections C onward) to exercise real
-    request-building/response-parsing logic without any network I/O.
+    Used by every endpoint-method test to exercise real request-building and
+    response-parsing logic without any network I/O.
     """
 
     def _make(handler: Callable[[httpx.Request], httpx.Response]) -> TamgaClient:
