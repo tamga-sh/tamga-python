@@ -38,6 +38,37 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      # release-please bumps pyproject.toml's version but knows nothing about
+      # uv.lock, which repeats that version for the root package. Left alone
+      # the lockfile drifts one release behind on every cycle and only gets
+      # corrected by accident, whenever someone next runs uv locally.
+      # These steps run only while a release PR is open, and push the refreshed
+      # lockfile onto that same PR branch so the bump lands as one coherent
+      # change. They are scoped to the release-please job — the publish job
+      # below never sees the App token and keeps authenticating via OIDC.
+      - uses: actions/checkout@v7
+        if: steps.release.outputs.pr
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: astral-sh/setup-uv@v5
+        if: steps.release.outputs.pr
+
+      - name: Sync uv.lock with the bumped version
+        if: steps.release.outputs.pr
+        run: |
+          uv lock
+          if git diff --quiet -- uv.lock; then
+            echo "uv.lock already in sync"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uv.lock
+          git commit -m "chore: sync uv.lock with the release version"
+          git push
+
   # Runs only right after release-please's own step above actually created a
   # release (i.e. this run was the release-PR-merge push) — builds and
   # publishes to PyPI via Trusted Publishing (OIDC), no long-lived API token
