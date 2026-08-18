@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file. This file i
 [Conventional Commits](https://www.conventionalcommits.org/) history — do not hand-edit entries
 below the `[Unreleased]` header.
 
+## [1.0.1](https://github.com/tamga-sh/tamga-python/compare/v1.0.0...v1.0.1) (2026-08-18)
+
+
+### Bug Fixes
+
+* correct SDK documentation and align package metadata ([114b16d](https://github.com/tamga-sh/tamga-python/commit/114b16d985e85ed34ea82a42c5f9a9d6856b5c9f))
+
 ## [0.2.0](https://github.com/tamga-sh/tamga-python/compare/v0.1.2...v0.2.0) (2026-08-13)
 
 
