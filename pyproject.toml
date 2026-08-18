@@ -50,7 +50,7 @@ dev = [
     # mypy 2.0 dropped support for `python_version = "3.9"` as a check
     # target (see [tool.mypy] below) — pin to the 1.x series until this
     # SDK's `requires-python` floor moves past 3.9.
-    "mypy>=1.8,<2",
+    "mypy>=1.8,<3",
     "pytest",
     "pytest-cov",
     "cryptography>=42",
