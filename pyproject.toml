@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tamga-sdk"
-version = "1.0.2"
+version = "1.0.3"
 description = "Official Python SDK for Tamga. Integrate license activation, offline verification, and machine management into your Python applications."
 readme = "README.md"
 license = "MIT"

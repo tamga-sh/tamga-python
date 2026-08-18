@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file. This file i
 [Conventional Commits](https://www.conventionalcommits.org/) history — do not hand-edit entries
 below the `[Unreleased]` header.
 
+## [1.0.3](https://github.com/tamga-sh/tamga-python/compare/v1.0.2...v1.0.3) (2026-08-18)
+
+
+### Bug Fixes
+
+* **ci:** keep the lockfile in step with the released version ([#19](https://github.com/tamga-sh/tamga-python/issues/19)) ([f77824b](https://github.com/tamga-sh/tamga-python/commit/f77824b51e4b3be1470738d2b372afcdb0fbe5a1))
+
 ## [1.0.2](https://github.com/tamga-sh/tamga-python/compare/v1.0.1...v1.0.2) (2026-08-18)
 
 
