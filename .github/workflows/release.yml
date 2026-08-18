@@ -14,6 +14,7 @@ jobs:
   # GitHub Release directly.
   release-please:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
     steps:
@@ -54,9 +55,11 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
         if: steps.release.outputs.pr
+        timeout-minutes: 10
 
       - name: Sync uv.lock with the bumped version
         if: steps.release.outputs.pr
+        timeout-minutes: 10
         run: |
           uv lock
           if git diff --quiet -- uv.lock; then
@@ -85,6 +88,7 @@ jobs:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: pypi
     permissions:
       contents: read
@@ -94,6 +98,7 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        timeout-minutes: 10
         with:
           python-version: "3.12"
 
