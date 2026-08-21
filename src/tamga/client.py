@@ -23,6 +23,7 @@ request that exhausts ``TamgaConfig.max_retries`` surfaces as
 from __future__ import annotations
 
 import builtins
+import contextlib
 import json
 import random
 import time
@@ -34,11 +35,14 @@ from uuid import UUID
 import httpx
 
 from tamga.errors import (
+    FingerprintTakenError,
     MachineOverLimitError,
+    NotFoundError,
     TamgaError,
     TtlInvalidError,
     parse_error_envelope,
 )
+from tamga.models.health import HealthStatus
 from tamga.models.license import LicenseFileResource, LicenseResource, LicenseScope
 from tamga.models.machine import (
     ComponentResource,
@@ -47,7 +51,8 @@ from tamga.models.machine import (
     MachineResource,
     ProcessResource,
 )
-from tamga.models.policy import Entitlement
+from tamga.models.policy import Entitlement, PolicyResource
+from tamga.models.release import ReleaseResource
 from tamga.models.validation import ValidationCode, ValidationMeta, ValidationResult
 from tamga.proof import ProofResult
 from tamga.transport import (
@@ -56,6 +61,7 @@ from tamga.transport import (
     LicenseAuth,
     apply_auth,
     build_base_url,
+    build_root_url,
     parse_response,
     parse_retry_after,
     sanitize_tamga_version,
@@ -84,6 +90,26 @@ MAX_PAGE_SIZE: int = 100
 #: Server-side bounds on machine/process checkout `ttl` (seconds): must be
 #: `> 0` and `<= 31536000` (365 days), else `422 TTL_INVALID`.
 MAX_CHECKOUT_TTL_SECONDS: int = 31536000
+
+#: How many pings the SDK aims to fit inside one heartbeat window.
+#:
+#: Three, so two consecutive pings can be lost — to a `429`, a network blip, a
+#: paused process — before the machine falls outside the window. One ping per
+#: window would make every single failure terminal.
+HEARTBEAT_PINGS_PER_WINDOW: int = 3
+
+#: Hard ceiling on how many pages ``MachinesClient.find_by_fingerprint`` will
+#: walk before giving up.
+#:
+#: The search is bounded three separate ways — this ceiling, the server's own
+#: ``meta.page.totalPages``, and an empty page — and the loop is written as a
+#: ``range`` so that even a server reporting nonsense page metadata cannot make
+#: it spin. That belt-and-braces is deliberate: this SDK has already shipped one
+#: list helper that looped forever against an endpoint whose cursor turned out
+#: to be inert (see ``EntitlementsClient.list_all``), and the failure mode was an
+#: unbounded ``items`` list that exhausted memory rather than an error anyone
+#: could see.
+MAX_MACHINE_SEARCH_PAGES: int = 20
 
 #: Create-time limit error codes on ``POST /machines``, mapped to the
 #: ``ValidationCode`` that describes the same limit.
@@ -183,6 +209,58 @@ def _parse_entitlement(data: dict[str, Any]) -> Entitlement:
         created=_parse_datetime(attrs.get("created")),
         updated=_parse_datetime(attrs.get("updated")),
         inherited=attrs.get("inherited"),
+    )
+
+
+def _parse_policy_resource(data: dict[str, Any]) -> PolicyResource:
+    """Parse a JSON:API ``policies`` resource object into a ``PolicyResource``.
+
+    ``PolicyResource.from_api`` takes a flat attributes mapping and looks for
+    ``id`` inside it, but JSON:API carries ``id`` on the resource object rather
+    than among its attributes — so the id is merged in here. Attributes win on a
+    collision: a future server that also emitted an ``id`` attribute would be
+    describing the same resource, and preferring the envelope's copy would be an
+    arbitrary choice between two spellings of one value.
+    """
+    attributes = dict(data.get("attributes") or {})
+    attributes.setdefault("id", data["id"])
+    return PolicyResource.from_api(attributes)
+
+
+def _parse_release_resource(data: dict[str, Any]) -> ReleaseResource:
+    attrs = data.get("attributes", {})
+    return ReleaseResource(
+        id=UUID(str(data["id"])),
+        product_id=UUID(str(attrs["product_id"])),
+        version=attrs.get("version", ""),
+        channel=attrs.get("channel", ""),
+        status=attrs.get("status", ""),
+        name=attrs.get("name"),
+        # Absent rather than null when unset — the server skips serializing it.
+        tag=attrs.get("tag"),
+        metadata=attrs.get("metadata") or {},
+        created=_parse_datetime(attrs.get("created")),
+        updated=_parse_datetime(attrs.get("updated")),
+    )
+
+
+def _parse_page_meta(meta: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Read ``meta.page{number,size,total,totalPages}`` off a list response.
+
+    Note the lone camelCase key in an otherwise snake_case protocol:
+    ``totalPages``. Falls back to zeroes rather than raising if the member is
+    missing — a page of items with unreadable metadata is still a usable page,
+    and ``has_next_page`` then reports ``False``, which stops a pagination loop
+    instead of spinning it.
+    """
+    page = meta.get("page")
+    if not isinstance(page, dict):
+        return (0, 0, 0, 0)
+    return (
+        int(page.get("number", 0)),
+        int(page.get("size", 0)),
+        int(page.get("total", 0)),
+        int(page.get("totalPages", 0)),
     )
 
 
@@ -287,6 +365,81 @@ class Page(Generic[T]):
     next_after: str | None
 
 
+@dataclass(frozen=True)
+class OffsetPage(Generic[T]):
+    """An offset-paginated page of resources, with real server-sent page metadata.
+
+    Distinct from ``Page``, and the distinction is not cosmetic. ``Page`` models
+    the *keyset* routes, where the server sends no pagination metadata at all
+    and the SDK has to synthesize a cursor from ``len(items) == limit``.
+    ``GET /machines`` is the one route on this SDK's surface that paginates the
+    other way: it answers with ``meta.page{number,size,total,totalPages}``, so
+    the page count is known rather than inferred, and pages are addressed by
+    number rather than by the previous page's last id.
+
+    Sending ``page[after]`` to an offset route, or a page number to a keyset
+    route, is silently ignored in both directions — which is precisely the shape
+    of bug that made ``EntitlementsClient.list_all`` loop forever. Keeping the
+    two page types apart is what stops a caller writing that loop here.
+
+    Attributes:
+        items: The resources on this page.
+        page_number: 1-based number of the page returned, as the server floored
+            and reports it — not necessarily the number that was requested.
+        page_size: Page size the server applied, after clamping to 1..100.
+        total: Rows matching the request's filters across every page — not the
+            size of the whole table.
+        total_pages: Number of pages at this page size. ``0`` when ``total`` is
+            ``0``.
+    """
+
+    items: list[T]
+    page_number: int
+    page_size: int
+    total: int
+    total_pages: int
+
+    @property
+    def has_next_page(self) -> bool:
+        """Whether a page after this one exists, per the server's own page count."""
+        return self.page_number < self.total_pages
+
+
+def heartbeat_interval_for_policy(policy: PolicyResource) -> timedelta:
+    """The machine ping interval this policy implies.
+
+    ``policy.effective_heartbeat_window_seconds / HEARTBEAT_PINGS_PER_WINDOW``,
+    which reduces to the 200s default only when the policy leaves
+    ``heartbeat_duration`` unset. **This is the supported way to size a
+    ``HeartbeatScheduler``** — see ``HeartbeatScheduler.for_policy``, which wires
+    it up in one call.
+
+    Read the policy through ``TamgaClient.licenses.get_policy(license_id)``:
+    that route authorizes on ``license.read``, which a license-key credential
+    holds, whereas ``TamgaClient.policies.get(policy_id)`` authorizes on
+    ``policy.read``, which it does not.
+
+    Do **not** try to recover the window from a machine response's
+    ``next_heartbeat_at`` instead. The field is computed from whichever window
+    the answering query happened to have joined, so ``POST /machines``,
+    ``ping-heartbeat``, ``reset-heartbeat`` and ``PATCH /machines/{id}`` all
+    size it against the 600s fallback while ``GET /machines/{id}``, the machine
+    list, check-out and offline-proof size it against the policy. Two responses
+    for the same machine seconds apart can disagree, and nothing on the wire
+    says which kind you are holding.
+
+    Args:
+        policy: The policy governing the machine's license.
+
+    Returns:
+        The ping interval, floor-divided and clamped to at least one second so
+        that an absurdly short policy window cannot turn the scheduler into a
+        busy loop.
+    """
+    seconds = policy.effective_heartbeat_window_seconds // HEARTBEAT_PINGS_PER_WINDOW
+    return timedelta(seconds=max(1, seconds))
+
+
 def _send_request(
     http: httpx.Client,
     config: TamgaConfig,
@@ -323,7 +476,7 @@ def _send_request(
     ).data
 
 
-def _send_request_raw(
+def _send_raw_response(
     http: httpx.Client,
     config: TamgaConfig,
     method: str,
@@ -333,7 +486,14 @@ def _send_request_raw(
     params: dict[str, Any] | None = None,
     auth_override: AuthTransport | None = None,
     is_quick_validate: bool = False,
-) -> Any:
+) -> httpx.Response:
+    """Build, authenticate and send one request, returning the un-parsed response.
+
+    Split out of ``_send_request_raw`` so the endpoints that need the response
+    ``meta`` (or, for ``/v1/health``, a body that is not a JSON:API envelope at
+    all) can reach the raw response without each rebuilding the header and auth
+    assembly and drifting from it.
+    """
     headers: dict[str, str] = {
         "Tamga-Version": sanitize_tamga_version(config.api_version),
     }
@@ -348,7 +508,7 @@ def _send_request_raw(
     if auth is not None:
         apply_auth(headers, request_params, auth)
 
-    response = _request_with_retry(
+    return _request_with_retry(
         http,
         config,
         method,
@@ -357,7 +517,49 @@ def _send_request_raw(
         params=request_params,
         headers=headers,
     )
+
+
+def _send_request_raw(
+    http: httpx.Client,
+    config: TamgaConfig,
+    method: str,
+    path: str,
+    *,
+    json_body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    auth_override: AuthTransport | None = None,
+    is_quick_validate: bool = False,
+) -> Any:
+    response = _send_raw_response(
+        http,
+        config,
+        method,
+        path,
+        json_body=json_body,
+        params=params,
+        auth_override=auth_override,
+        is_quick_validate=is_quick_validate,
+    )
     return parse_response(response, is_quick_validate=is_quick_validate)
+
+
+def _send_request_with_meta(
+    http: httpx.Client,
+    config: TamgaConfig,
+    method: str,
+    path: str,
+    *,
+    json_body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Send a request and return ``(data, meta)`` from the JSON:API document.
+
+    ``_send_request`` drops the document's ``meta`` member, which is where the
+    offset-paginated routes put ``page{number,size,total,totalPages}``.
+    """
+    response = _send_raw_response(http, config, method, path, json_body=json_body, params=params)
+    parsed = parse_response(response)
+    return parsed.data, _raw_response_meta(response)
 
 
 _RETRYABLE_POST_SUFFIXES = (
@@ -573,6 +775,75 @@ class LicensesClient:
         )
         return ValidationResult(license=None, meta=_parse_validation_meta(data))
 
+    def get(self, license_id: UUID) -> LicenseResource:
+        """``GET /licenses/{license_id}`` — read a license without validating it.
+
+        A pure read: unlike ``validate_by_id`` it touches no timestamp, returns
+        no ``meta.valid`` verdict, and tells you nothing about whether the
+        license currently passes its policy's checks. Use it to inspect stored
+        fields (``status``, ``expiry``, ``machines_count``, ``max_machines``,
+        ``metadata``); use ``validate_by_id`` to ask whether the license is
+        *valid*.
+
+        Warning:
+            **This route is not scoped to the calling credential's own
+            license.** It authorizes on the ``license.read`` permission and the
+            account resolved from the bearer, and nothing further — so a license
+            key that authenticates successfully can read every license in the
+            same account, including each one's ``attributes.key`` in plain text.
+            That is server-side behaviour this SDK cannot fix and does not work
+            around; it is documented here so nobody builds a multi-tenant
+            assumption on top of it. Reported upstream.
+
+        Args:
+            license_id: The license to read.
+
+        Returns:
+            The license resource.
+
+        Raises:
+            tamga.errors.NotFoundError: If no such license exists in the account.
+        """
+        data = _send_request(self._http, self._config, "GET", f"/licenses/{license_id}")
+        return self._license_from_data(data)
+
+    def get_policy(self, license_id: UUID) -> PolicyResource:
+        """``GET /licenses/{license_id}/policy`` — the policy governing this license.
+
+        **This is the SDK's supported way to learn the heartbeat window.**
+        ``PolicyResource.effective_heartbeat_window_seconds`` reads
+        ``heartbeat_duration`` off the result, and
+        ``HeartbeatScheduler.for_policy`` turns it straight into a correctly
+        sized ping loop. It is also how to read ``require_check_in`` before
+        scheduling check-ins, and ``machine_uniqueness_strategy`` before
+        reasoning about a ``409 FINGERPRINT_TAKEN``.
+
+        Prefer this over ``TamgaClient.policies.get``. The two return the same
+        resource but authorize differently: this route needs only
+        ``license.read``, which a license-key credential holds, while
+        ``GET /policies/{policy_id}`` needs ``policy.read``, which it does not —
+        so under license-key auth the direct route answers ``403`` and this one
+        works.
+
+        Warning:
+            Carries the same missing license scoping as ``get``: any license id
+            in the account resolves, not just the caller's own.
+
+        Args:
+            license_id: The license whose policy to read.
+
+        Returns:
+            The policy resource. ``max_memory`` and ``max_disk`` are always
+            ``None`` — the server omits both from this response even though it
+            enforces them.
+
+        Raises:
+            tamga.errors.NotFoundError: If the license, or its policy, does not
+                exist in the account.
+        """
+        data = _send_request(self._http, self._config, "GET", f"/licenses/{license_id}/policy")
+        return _parse_policy_resource(data)
+
     def check_in(self, license_id: UUID) -> LicenseResource:
         """``POST /licenses/{license_id}/actions/check-in``, no body.
 
@@ -753,6 +1024,194 @@ class MachinesClient:
         """Standard resource deletion. Used by ``activate_machine``'s rollback path."""
         _send_request(self._http, self._config, "DELETE", f"/machines/{machine_id}")
 
+    def get(self, machine_id: UUID) -> MachineResource:
+        """``GET /machines/{machine_id}`` — read a machine without writing to it.
+
+        This is the one plain-JSON route on this SDK's surface that reports a
+        machine's **true** heartbeat state. The status is derived from
+        ``last_heartbeat_at`` against the policy's window, and this query joins
+        the policy, so both ``heartbeat_status`` and ``next_heartbeat_at`` are
+        computed against the real window rather than the 600s fallback.
+
+        Contrast the write routes. ``ping_heartbeat`` sets
+        ``last_heartbeat_at = NOW()`` and then derives the status from that same
+        timestamp, so it can only ever answer ``ALIVE`` or ``RESURRECTED``;
+        ``reset_heartbeat`` nulls the column (``NOT_STARTED``); ``create`` never
+        sets it (``NOT_STARTED``). A ``DEAD`` reading is therefore reachable
+        here and from ``check_out``, and from nowhere else this SDK calls.
+
+        ``DEAD`` still does not mean the row was culled — it means only that the
+        last ping is older than the window. Culling is gated on the policy's
+        ``require_heartbeat``, which defaults to ``False``, so under a default
+        policy the row and its seat survive indefinitely and the next ping
+        revives the machine. The only signal that the row is genuinely gone is a
+        ``404`` from the ping itself.
+
+        Args:
+            machine_id: The machine to read.
+
+        Returns:
+            The machine resource.
+
+        Raises:
+            tamga.errors.NotFoundError: If no such machine exists in the account.
+        """
+        data = _send_request(self._http, self._config, "GET", f"/machines/{machine_id}")
+        return _parse_machine_resource(data)
+
+    def list(
+        self,
+        *,
+        page_number: int = 1,
+        page_size: int | None = None,
+        search: str | None = None,
+        license_id: UUID | None = None,
+        platform: str | None = None,
+    ) -> OffsetPage[MachineResource]:
+        """``GET /machines`` — **offset**-paginated, unlike every other list here.
+
+        This route answers with ``meta.page{number,size,total,totalPages}`` and
+        addresses pages by number. It is the only route on this SDK's surface
+        that does; ``components``, ``processes`` and ``entitlements`` are keyset
+        routes returning ``Page``. Passing ``page[after]`` here is accepted and
+        ignored, and so is passing a page number to a keyset route — which is
+        exactly why the two return different types rather than one type with
+        both sets of fields half-populated.
+
+        There is deliberately no ``list_all`` companion. Walk pages with
+        ``OffsetPage.has_next_page`` and a bounded loop; see
+        ``find_by_fingerprint`` for the shape.
+
+        Args:
+            page_number: 1-based page to fetch. The server floors anything below
+                1 and bounds the resulting offset, so a page far past the end
+                returns an empty page rather than an error.
+            page_size: Rows per page, clamped server-side to 1..100. Defaults to
+                the maximum. The server's own default of 25 is applied silently
+                when the parameter is absent, so the SDK always sends one — but
+                note the reason differs from the keyset routes: here ``total``
+                makes truncation visible either way, so this is about
+                predictability rather than about detecting a short page.
+            search: Free-text term, sent as ``filter[q]``. **A case-insensitive
+                substring match across ``name``, ``hostname`` *and*
+                ``fingerprint``**, not an exact match on any of them, and the
+                term is truncated to 200 characters server-side. Treat the
+                result as a superset to filter locally — see
+                ``find_by_fingerprint``.
+            license_id: Restrict to machines on one license, sent as
+                ``filter[license]``. Note the machine resource carries no
+                license id of its own, so this filter is the *only* way to tie
+                a listed machine to a license.
+            platform: Restrict to one platform string, sent as
+                ``filter[platform]``.
+
+        Returns:
+            One page of machines plus the server's own page metadata.
+        """
+        effective_size = page_size if page_size is not None else MAX_PAGE_SIZE
+        params: dict[str, Any] = {
+            "page[number]": page_number,
+            "page[size]": effective_size,
+        }
+        if search is not None:
+            params["filter[q]"] = search
+        if license_id is not None:
+            params["filter[license]"] = str(license_id)
+        if platform is not None:
+            params["filter[platform]"] = platform
+
+        data, meta = _send_request_with_meta(
+            self._http, self._config, "GET", "/machines", params=params
+        )
+        number, size, total, total_pages = _parse_page_meta(meta)
+        return OffsetPage(
+            items=[_parse_machine_resource(d) for d in (data or [])],
+            page_number=number,
+            page_size=size,
+            total=total,
+            total_pages=total_pages,
+        )
+
+    def update(
+        self,
+        machine_id: UUID,
+        *,
+        name: str | None = None,
+        ip: str | None = None,
+        hostname: str | None = None,
+        platform: str | None = None,
+        cores: int | None = None,
+        memory: int | None = None,
+        disk: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> MachineResource:
+        """``PATCH /machines/{machine_id}`` — update mutable machine attributes.
+
+        Every field is optional and **omitted fields are left untouched**: the
+        server applies each one through ``COALESCE(new, existing)``. The
+        corollary is that ``None`` means "leave alone", not "clear" — there is
+        no way through this route to null out a column that already has a value.
+
+        ``fingerprint`` is not updatable, by design: it is the identity the
+        uniqueness scope and every activation check are keyed on.
+
+        ``memory`` and ``disk`` are **megabytes**, the same unit as ``create``,
+        and they feed the same license-wide totals that create-time and
+        validate-time limit checks compare against.
+
+        Note:
+            The response's ``heartbeat_status`` and ``next_heartbeat_at`` are
+            computed against the **600s fallback**, not the policy's window:
+            this route's ``UPDATE ... RETURNING`` does not join ``policies``.
+            The status can still read ``DEAD`` here (unlike on a ping, since
+            this write does not touch ``last_heartbeat_at``) — but judged
+            against the wrong window whenever the policy sets a different one.
+            Read the machine back with ``get`` if either field matters.
+
+        Args:
+            machine_id: The machine to update.
+            name: New display name.
+            ip: New IP address.
+            hostname: New hostname.
+            platform: New platform string.
+            cores: New core count.
+            memory: New memory, in **megabytes**.
+            disk: New disk, in **megabytes**.
+            metadata: Replacement metadata object. Replaces the stored object
+                wholesale rather than merging into it.
+
+        Returns:
+            The updated machine resource.
+
+        Raises:
+            tamga.errors.NotFoundError: If no such machine exists in the account.
+            tamga.errors.ForbiddenError: If the credential's role may not update
+                machines.
+        """
+        attributes: dict[str, Any] = {}
+        if name is not None:
+            attributes["name"] = name
+        if ip is not None:
+            attributes["ip"] = ip
+        if hostname is not None:
+            attributes["hostname"] = hostname
+        if platform is not None:
+            attributes["platform"] = platform
+        if cores is not None:
+            attributes["cores"] = cores
+        if memory is not None:
+            attributes["memory"] = memory
+        if disk is not None:
+            attributes["disk"] = disk
+        if metadata is not None:
+            attributes["metadata"] = metadata
+
+        body = {"data": {"type": "machines", "attributes": attributes}}
+        data = _send_request(
+            self._http, self._config, "PATCH", f"/machines/{machine_id}", json_body=body
+        )
+        return _parse_machine_resource(data)
+
     def activate_machine(self, license_id: UUID, fingerprint: str, **attrs: Any) -> MachineResource:
         """Create a machine, then validate the license, rolling back on over-limit.
 
@@ -796,9 +1255,9 @@ class MachinesClient:
                 deleted). It subclasses both ``TamgaError`` and ``ValueError``,
                 so handlers written against either still catch it.
             tamga.errors.FingerprintTakenError: If the fingerprint is already
-                registered within the policy's uniqueness scope. Activation is
-                not idempotent — this SDK version offers no way to recover the
-                existing machine's id.
+                registered within the policy's uniqueness scope. This method
+                does not recover from that; ``activate_machine_idempotent``
+                does, by looking the existing machine back up.
         """
         try:
             machine = self.create(license_id, fingerprint, **attrs)
@@ -849,6 +1308,144 @@ class MachinesClient:
                 rolled_back=True,
             )
         return machine
+
+    def find_by_fingerprint(
+        self,
+        fingerprint: str,
+        *,
+        license_id: UUID | None = None,
+        max_pages: int = MAX_MACHINE_SEARCH_PAGES,
+    ) -> MachineResource | None:
+        """Find an already-registered machine by its exact fingerprint.
+
+        There is **no exact fingerprint filter server-side.** The nearest thing
+        is the free-text ``filter[q]`` term, which is a case-insensitive
+        substring match over ``name``, ``hostname`` and ``fingerprint``, and
+        which the server truncates to 200 characters. So this method uses the
+        search only to narrow the candidate set and then compares
+        ``machine.fingerprint`` exactly in Python. Both approximations run in
+        the safe direction — a truncated term matches a *superset*, and a
+        substring hit is discarded unless it is also an exact match — so the
+        result is never a machine with a different fingerprint.
+
+        The scan is bounded three independent ways: by ``max_pages``, by the
+        server's own ``meta.page.totalPages``, and by an empty page. The loop is
+        a ``range`` rather than a ``while``, so even page metadata that never
+        terminates cannot make it spin. That is deliberate belt-and-braces: this
+        SDK previously shipped a list helper that looped forever against a route
+        whose cursor turned out to be inert, growing its result list until the
+        process ran out of memory.
+
+        Args:
+            fingerprint: The exact fingerprint to find. Must not be blank —
+                a blank term is *ignored* by the server rather than matching
+                nothing, which would turn this into an unfiltered scan of every
+                machine in the account.
+            license_id: Optionally restrict the search to one license. Leave it
+                unset — the default — when recovering from a ``409
+                FINGERPRINT_TAKEN``: under ``UNIQUE_PER_POLICY`` or
+                ``UNIQUE_PER_ACCOUNT`` the machine that caused the conflict may
+                sit on a *different* license, and filtering by the license being
+                activated would hide exactly the row being looked for.
+            max_pages: Hard ceiling on pages walked. Each page holds up to 100
+                machines.
+
+        Returns:
+            The matching machine, or ``None`` if the scan completed without an
+            exact match.
+
+        Raises:
+            ValueError: If ``fingerprint`` is empty or whitespace-only.
+
+        Warning:
+            The machine resource carries no license id, so a returned machine
+            cannot be attributed to a license from its own fields. If that
+            matters, pass ``license_id`` and accept the narrowing.
+        """
+        if not fingerprint.strip():
+            raise ValueError(
+                "fingerprint must be a non-empty string — the server ignores a blank "
+                "search term, which would scan every machine in the account instead "
+                "of matching none"
+            )
+        for page_number in range(1, max_pages + 1):
+            page = self.list(
+                page_number=page_number,
+                page_size=MAX_PAGE_SIZE,
+                search=fingerprint,
+                license_id=license_id,
+            )
+            for machine in page.items:
+                if machine.fingerprint == fingerprint:
+                    return machine
+            if not page.items or not page.has_next_page:
+                return None
+        return None
+
+    def activate_machine_idempotent(
+        self, license_id: UUID, fingerprint: str, **attrs: Any
+    ) -> MachineResource:
+        """``activate_machine``, but a re-activation returns the existing machine.
+
+        The server reports a repeat activation as ``409 FINGERPRINT_TAKEN``
+        rather than returning the row, and that is intentional on its side: its
+        own comment reads "already activated, carry on". Getting from there back
+        to the machine's id needs a second lookup, which is what this adds.
+
+        1. Try ``activate_machine`` — create, validate, roll back on an
+           over-limit verdict. Anything it returns or raises other than
+           ``FingerprintTakenError`` passes straight through, including
+           ``MachineOverLimitError``.
+        2. On ``FingerprintTakenError``, look the machine up by exact
+           fingerprint with ``find_by_fingerprint`` and return it.
+        3. If the lookup finds nothing, re-raise the original conflict — with
+           the lookup failure chained onto it — because there is nothing
+           truthful to return. That happens if the credential lacks
+           ``machine.read``, or if the machine was deleted in the window between
+           the two calls.
+
+        **The recovery path deliberately does not validate the license.**
+        ``activate_machine`` deletes the machine it just created when validation
+        comes back over-limit; applying that here would delete a pre-existing
+        machine this call did not create — destroying a seat the caller never
+        asked to touch. Validate separately with
+        ``TamgaClient.licenses.validate_by_id`` if the verdict matters, and
+        decide for yourself what to do with it.
+
+        Args:
+            license_id: The license to activate the machine against.
+            fingerprint: The machine's unique fingerprint.
+            **attrs: Additional optional machine attributes, as
+                ``activate_machine``. They are **not** applied to a machine
+                recovered on the conflict path — that row already exists with
+                whatever attributes it was created with. Use ``update`` if they
+                need to be brought into line.
+
+        Returns:
+            The newly created machine, or the existing one that caused the
+            conflict.
+
+        Raises:
+            tamga.errors.FingerprintTakenError: If the machine could not be
+                recovered after the conflict.
+            tamga.errors.MachineOverLimitError: As ``activate_machine``, on the
+                creation path only.
+        """
+        try:
+            return self.activate_machine(license_id, fingerprint, **attrs)
+        except FingerprintTakenError as conflict:
+            existing = self.find_by_fingerprint(fingerprint)
+            if existing is not None:
+                return existing
+            raise FingerprintTakenError(
+                status=conflict.status,
+                code=conflict.code,
+                detail=(
+                    f"{conflict.detail} — and the existing machine could not be "
+                    f"recovered by fingerprint, so its id is unavailable"
+                ),
+                pointer=conflict.pointer,
+            ) from conflict
 
     def ping_heartbeat(self, machine_id: UUID) -> MachineResource:
         """``POST /machines/{id}/actions/ping-heartbeat``, no body. Sets ``last_heartbeat_at``.
@@ -1119,6 +1716,73 @@ class ProcessesClient:
         )
         return _parse_process_resource(data)
 
+    def delete(self, process_id: UUID) -> None:
+        """``DELETE /processes/{process_id}`` — remove a process row. ``204``, no body.
+
+        **Nothing on the server deletes these rows for you.** A 30s process
+        heartbeat window exists and a process reaper was written, but no
+        scheduled job runs it, so a crashed or exited process keeps its row —
+        and with it its slot against the policy's ``max_processes`` — forever.
+        The count only ever grows, and a long-lived install eventually
+        activates into ``TOO_MANY_PROCESSES`` for processes that stopped
+        running months earlier.
+
+        So this is not an optional tidy-up: an application that creates
+        processes has to delete them, and the natural place is wherever it
+        already tears the process down. ``ProcessHeartbeatScheduler.dispose``
+        pairs stopping the ping loop with this call for exactly that reason.
+
+        Args:
+            process_id: The process row to delete.
+
+        Raises:
+            tamga.errors.NotFoundError: If the row does not exist — including
+                when it was already deleted. ``dispose`` tolerates that;
+                this method does not, because a caller deleting a specific id
+                usually wants to know it was not there.
+        """
+        _send_request(self._http, self._config, "DELETE", f"/processes/{process_id}")
+
+    def list(
+        self, machine_id: UUID, limit: int | None = None, after: str | None = None
+    ) -> Page[ProcessResource]:
+        """``GET /machines/{id}/processes``, keyset-paginated (``limit``/``page[after]``).
+
+        Keyset paging genuinely works here — the cursor reaches the query and
+        narrows it — so unlike ``EntitlementsClient.list`` this page really can
+        be followed to completion by feeding ``next_after`` back as ``after``.
+        Note that puts it on the opposite pagination scheme from
+        ``MachinesClient.list``, which is offset-based and returns an
+        ``OffsetPage``.
+
+        As with ``ComponentsClient.list``, an omitted ``limit`` sends the server
+        maximum (100) rather than letting the server apply its own default of
+        25: the next-page cursor is synthesized from ``len(items) == limit``, so
+        without a known page size a truncated page is indistinguishable from the
+        last one.
+
+        Args:
+            machine_id: The machine whose processes to list.
+            limit: Page size, clamped server-side to 1..100.
+            after: Cursor from a previous page's ``next_after``.
+
+        Returns:
+            One page of processes, with a synthesized ``next_after``.
+        """
+        effective_limit = limit if limit is not None else MAX_PAGE_SIZE
+        params: dict[str, Any] = {"limit": effective_limit}
+        if after is not None:
+            params["page[after]"] = after
+        response = _send_request_raw(
+            self._http,
+            self._config,
+            "GET",
+            f"/machines/{machine_id}/processes",
+            params=params,
+        )
+        items = [_parse_process_resource(d) for d in (response.data or [])]
+        return Page(items=items, next_after=_next_after_cursor(items, effective_limit))
+
 
 @dataclass
 class EntitlementsClient:
@@ -1239,14 +1903,145 @@ def _next_after_cursor(items: list[Any], limit: int | None) -> str | None:
 
 
 @dataclass
+class PoliciesClient:
+    """Namespaced client for ``/policies`` endpoints. Access via ``TamgaClient.policies``."""
+
+    _http: httpx.Client
+    _config: TamgaConfig
+
+    def get(self, policy_id: UUID) -> PolicyResource:
+        """``GET /policies/{policy_id}``.
+
+        Warning:
+            **Answers ``403`` under license-key auth.** This route authorizes on
+            the ``policy.read`` permission, which is not among the permissions a
+            license credential is granted — unlike ``license.read``, which is.
+            An embedded client authenticating with a license key must read the
+            policy through ``TamgaClient.licenses.get_policy(license_id)``
+            instead, which returns the identical resource by way of a route
+            gated on ``license.read``. This method exists for callers holding a
+            privileged token, and for the case where the policy id is known but
+            no license id is.
+
+        Args:
+            policy_id: The policy to read.
+
+        Returns:
+            The policy resource. ``max_memory`` and ``max_disk`` are always
+            ``None``; the server omits both.
+
+        Raises:
+            tamga.errors.ForbiddenError: If the credential lacks ``policy.read``
+                — which is the normal outcome for a license key.
+            tamga.errors.NotFoundError: If no such policy exists in the account.
+        """
+        data = _send_request(self._http, self._config, "GET", f"/policies/{policy_id}")
+        return _parse_policy_resource(data)
+
+
+@dataclass
+class ReleasesClient:
+    """Namespaced client for ``/releases`` endpoints. Access via ``TamgaClient.releases``."""
+
+    _http: httpx.Client
+    _config: TamgaConfig
+
+    def check_for_upgrade(
+        self,
+        *,
+        product_id: UUID,
+        platform: str,
+        filetype: str,
+        version: str,
+        channel: str | None = None,
+        constraint: str | None = None,
+    ) -> ReleaseResource | None:
+        """``GET /releases/actions/upgrade`` — the auto-updater's "is there a newer build?".
+
+        Returning ``None`` means **"there is no update available to you"** — and
+        that phrasing is exact, not cautious. The server answers ``204 No
+        Content`` in two different situations and does so on purpose:
+
+        1. No newer release exists; the caller is already current.
+        2. A newer release *does* exist, but this license is not entitled to it
+           — an expired license under an ``expiration_strategy`` that stops it
+           receiving new builds.
+
+        The server's own comment explains the second case: a denial there would
+        leak "a newer version exists but you can't have it", and ``204`` is the
+        honest answer for a license that is not entitled to move further. **No
+        client-side way to tell the two apart exists, and none should.** Do not
+        report ``None`` to a user as "you are up to date"; report it as "no
+        update is available".
+
+        A third outcome is distinct and does surface: a **suspended** license
+        gets ``403``, not ``204``.
+
+        The route uses optional authentication, so a product with an ``Open``
+        distribution strategy is reachable with no credential at all — that is
+        deliberate server-side, since otherwise every auto-updater in the field
+        would break the moment its license lapsed. This SDK sends its configured
+        credential anyway, per its "always send auth" rule; for a ``Licensed``
+        product the credential is required, and for a ``Closed`` one only an
+        admin, developer or product token is accepted.
+
+        Args:
+            product_id: The product to check for updates. Required.
+            platform: Target platform string, e.g. ``"darwin-arm64"``. Required.
+            filetype: Artifact file type, e.g. ``"dmg"``. Required. Note the
+                server spells this ``filetype``, one word.
+            version: The caller's **current** version, which the server compares
+                against. Required.
+            channel: Optional release channel to restrict to.
+            constraint: Optional version constraint to restrict to.
+
+        Returns:
+            The release to upgrade to, or ``None`` when nothing is available to
+            this caller.
+
+        Raises:
+            tamga.errors.ForbiddenError: If the license is suspended, or the
+                product's distribution strategy excludes this credential.
+            tamga.errors.UnauthorizedError: If the product requires a credential
+                and none was configured.
+            tamga.errors.NotFoundError: If the product does not exist in the
+                account.
+        """
+        params: dict[str, Any] = {
+            "product": str(product_id),
+            "platform": platform,
+            "filetype": filetype,
+            "version": version,
+        }
+        if channel is not None:
+            params["channel"] = channel
+        if constraint is not None:
+            params["constraint"] = constraint
+
+        data = _send_request(
+            self._http,
+            self._config,
+            "GET",
+            "/releases/actions/upgrade",
+            params=params,
+        )
+        # `204 No Content` parses to `None`; see the two meanings above.
+        if data is None:
+            return None
+        return _parse_release_resource(data)
+
+
+@dataclass
 class HeartbeatScheduler:
     """Background-safe machine heartbeat ping loop.
 
     The default interval (~200s) is roughly 1/3 of the server's *default* 600s
     heartbeat window. That window is the license policy's
     ``heartbeat_duration`` and only falls back to 600s when it is unset, so
-    against a policy with a shorter window the interval must be passed
-    explicitly — a fixed 200s ping is not safe under, say, a 120s window.
+    against a policy with a shorter window the interval must be sized from the
+    policy — a fixed 200s ping is not safe under, say, a 120s window. Use
+    ``HeartbeatScheduler.for_policy`` to do that in one call rather than
+    computing an interval by hand.
 
     **No heartbeat status ends this loop.** The loop pings until ``stop()`` is
     called, the caller's runtime cancels it, or the ping returns ``404`` — that
@@ -1265,13 +2060,55 @@ class HeartbeatScheduler:
         machine_id: The machine to ping.
         interval: Ping interval; defaults to
             ``MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL``. Size it against the
-            policy's ``heartbeat_duration`` when that is known.
+            policy's ``heartbeat_duration`` when that is known — see
+            ``for_policy``.
     """
 
     machines: MachinesClient
     machine_id: UUID
     interval: timedelta = field(default=MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL)
     _stop: bool = field(default=False, repr=False, compare=False)
+
+    @classmethod
+    def for_policy(
+        cls,
+        machines: MachinesClient,
+        machine_id: UUID,
+        policy: PolicyResource,
+    ) -> HeartbeatScheduler:
+        """Build a scheduler whose interval is sized from the license's actual policy.
+
+        The default ``interval`` on this class is sized against the server's
+        600s *fallback* window, which is only correct for a policy that leaves
+        ``heartbeat_duration`` unset. Under a policy asking for, say, 120s, the
+        default pings roughly twice per hour into a two-minute window: the
+        machine spends nearly all its time outside that window, reports
+        ``DEAD``, and — where ``require_heartbeat`` is on — is eventually
+        culled, with no signal the SDK could have observed beforehand.
+
+        Read the policy first, then build the scheduler from it::
+
+            policy = client.licenses.get_policy(license_id)
+            scheduler = HeartbeatScheduler.for_policy(
+                client.machines, machine.id, policy
+            )
+            scheduler.run_forever()
+
+        Args:
+            machines: The machines sub-client to ping through.
+            machine_id: The machine to ping.
+            policy: The policy governing that machine's license, from
+                ``TamgaClient.licenses.get_policy``.
+
+        Returns:
+            A scheduler whose ``interval`` is
+            ``heartbeat_interval_for_policy(policy)``.
+        """
+        return cls(
+            machines=machines,
+            machine_id=machine_id,
+            interval=heartbeat_interval_for_policy(policy),
+        )
 
     def stop(self) -> None:
         """Signal ``run_forever`` to return after its current sleep completes."""
@@ -1318,9 +2155,10 @@ class ProcessHeartbeatScheduler:
     Note:
         Nothing reaps process rows server-side: the 30s window exists, but no
         scheduled job acts on it, so a crashed process keeps its slot against
-        the policy's process limit until the row is deleted explicitly. This
-        SDK version exposes no process-delete method, so stopping the loop
-        does **not** free the slot.
+        the policy's process limit until the row is deleted explicitly.
+        **Stopping the loop does not free the slot** — ``stop`` only ends the
+        pinging. Call ``dispose`` instead, or use the scheduler as a context
+        manager, to stop pinging *and* delete the row.
 
     Attributes:
         process_id: The process to ping.
@@ -1334,8 +2172,48 @@ class ProcessHeartbeatScheduler:
     _stop: bool = field(default=False, repr=False, compare=False)
 
     def stop(self) -> None:
-        """Signal ``run_forever`` to return after its current sleep completes."""
+        """Signal ``run_forever`` to return after its current sleep completes.
+
+        Ends the pinging only. The process row, and the slot it holds against
+        the policy's ``max_processes``, survive — see ``dispose``.
+        """
         self._stop = True
+
+    def dispose(self) -> None:
+        """Stop pinging **and** delete the process row, freeing its slot.
+
+        The pair belongs together because the server will not do the second half
+        for anyone: no job reaps process rows, so a process that merely stops
+        pinging holds its slot against ``max_processes`` indefinitely. An
+        application that creates one process per run and only ever calls
+        ``stop`` accumulates rows until activation fails with
+        ``TOO_MANY_PROCESSES`` — for processes that exited long ago.
+
+        Stopping comes first, so the loop is not left pinging a row that is
+        about to disappear.
+
+        An already-deleted row (``404``) is treated as success: the outcome
+        this method promises is "the row is gone", and it is. Every other error
+        propagates — a ``403`` means the slot is still held and the caller needs
+        to know.
+        """
+        self.stop()
+        # Already gone is success: `dispose` promises the row does not exist,
+        # not that this call is what removed it.
+        with contextlib.suppress(NotFoundError):
+            self.processes.delete(self.process_id)
+
+    def __enter__(self) -> ProcessHeartbeatScheduler:
+        """Return ``self``, so ``with`` guarantees the matching ``dispose``."""
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Dispose on exit — including when the body raised.
+
+        Returns ``None``, so an exception in the body is never suppressed. A
+        crash is precisely when the row would otherwise be orphaned.
+        """
+        self.dispose()
 
     def run_forever(self) -> None:
         """Ping on ``self.interval`` until stopped/cancelled by the caller's runtime.
@@ -1352,7 +2230,8 @@ class TamgaClient:
     """Top-level façade wrapping ``httpx.Client``.
 
     Exposes namespaced sub-clients: ``.licenses``, ``.machines``,
-    ``.components``, ``.processes``, ``.entitlements``.
+    ``.components``, ``.processes``, ``.entitlements``, ``.policies``,
+    ``.releases``.
 
     Synchronous only — this wraps ``httpx.Client``, not ``httpx.AsyncClient``.
     Usable as a context manager, which closes the underlying HTTP client on
@@ -1381,6 +2260,8 @@ class TamgaClient:
     components: ComponentsClient
     processes: ProcessesClient
     entitlements: EntitlementsClient
+    policies: PoliciesClient
+    releases: ReleasesClient
 
     def __init__(
         self, config: TamgaConfig, *, transport: httpx.BaseTransport | None = None
@@ -1408,6 +2289,57 @@ class TamgaClient:
         self.machines = MachinesClient(_http=self._http, _config=config)
         self.components = ComponentsClient(_http=self._http, _config=config)
         self.processes = ProcessesClient(_http=self._http, _config=config)
+        self.policies = PoliciesClient(_http=self._http, _config=config)
+        self.releases = ReleasesClient(_http=self._http, _config=config)
+
+    def health(self) -> HealthStatus:
+        """``GET /v1/health`` — the server's unauthenticated liveness probe.
+
+        The **only** route this SDK calls that lives outside
+        ``/v1/accounts/{account_id}``. Every other request is built on a base
+        URL with the account segment already appended, which is why this one
+        assembles an absolute URL from ``tamga.transport.build_root_url``
+        instead — the account segment cannot be un-appended from a client
+        already constructed around it. It reuses the same ``httpx.Client``, so
+        it shares the connection pool, timeout, injected transport and ``429``
+        backoff.
+
+        The response is a **bare object**, not a JSON:API document: no ``data``
+        envelope, no ``type``/``id``. It is decoded directly rather than through
+        the envelope parser the rest of the surface uses.
+
+        **What this is actually for: telling a misconfiguration apart from a bad
+        credential.** The route is exempt from two separate server-side gates —
+        it is on the public-route allowlist, and it bypasses the ``Host``-header
+        allowlist. So if every other call is failing with ``403`` and "The Host
+        header does not match any configured host" while this one succeeds, the
+        problem is the server's ``TAMGA_ALLOWED_HOSTS`` configuration, not the
+        caller's token. If this one fails too, the server is unreachable and no
+        credential would have helped.
+
+        The configured credential is sent anyway, for consistency with this
+        SDK's "always send auth" rule; the route ignores it either way.
+
+        Returns:
+            The server's status, its own build version, and its uptime.
+
+        Raises:
+            tamga.errors.TamgaError: On any non-2xx response.
+        """
+        url = f"{build_root_url(self.config.host)}/v1/health"
+        response = _send_raw_response(self._http, self.config, "GET", url)
+        if response.status_code >= 400:
+            raise parse_error_envelope(
+                response.status_code,
+                response.content,
+                retry_after=parse_retry_after(response),
+            )
+        body = json.loads(response.content) if response.content else {}
+        return HealthStatus(
+            status=body.get("status", ""),
+            version=body.get("version", ""),
+            uptime_seconds=int(body.get("uptime_secs", 0)),
+        )
 
     def close(self) -> None:
         """Close the underlying ``httpx.Client``."""
