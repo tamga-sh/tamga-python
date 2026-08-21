@@ -198,6 +198,30 @@ wrong — these replace it.
   must stay in `activate_machine`: create-time 422 raises without a rollback DELETE (no row
   exists), validate-time over-limit deletes the row first. The uniqueness pre-check runs before
   the limit checks, so a duplicate fingerprint always yields `409 FINGERPRINT_TAKEN`.
+- **Request-body shape is PER-ENDPOINT: some take a JSON:API envelope, some take a flat object.**
+  Responses are enveloped throughout; requests are not, and there is no rule to infer either from.
+  The only reliable source is the handler's own body struct.
+  - **Enveloped** — `POST /machines` (`create_machine.rs`, reads
+    `body.data.relationships.license.data.id`) and `PATCH /machines/{id}`
+    (`update_machine.rs:16-26`, `UpdateMachineRequest { data: { type, attributes } }`).
+  - **Flat** — `POST /components` (`create_component.rs:13-20`,
+    `CreateComponentBody { machine_id, fingerprint, name, metadata }`) and `POST /processes`
+    (`create_process.rs:13-19`, `CreateProcessBody { machine_id, pid, metadata }`). Only
+    `metadata` carries `#[serde(default)]`, so an enveloped body fails deserialization on every
+    other field and axum answers **422** — which is what this SDK did to both endpoints until
+    `fix/component-process-request-shape`. (`application/vnd.api+json` is accepted by axum's
+    `Json` extractor — its suffix is `json` — so the request reaches deserialization rather than
+    being turned away as an unsupported media type. That is why the failure is 422 and not 415.)
+  - **`meta`-wrapped** — `validate` (`{meta:{scope,skip_touch}}`), both check-outs
+    (`{meta:{encrypt,ttl}}`), `generate-offline-proof` (`{meta:{dataset}}`); all optional bodies.
+  - **Bare field** — `validate-key` (`ValidateKeyBody { key }`).
+
+  `tests/test_request_wire_shapes.py` asserts the enveloped and flat cases side by side precisely
+  so "normalize them to match" fails loudly. Never assert a request body with
+  `body["data"]["attributes"][…]` lookups on a flat endpoint: that is how this bug survived — the
+  test pinned the broken shape instead of catching it, the same way tamga-dotnet's fixtures hid
+  the mirror-image defect on the *response* axis for the same two endpoints. Prefer whole-body
+  equality, which cannot pass against an extra wrapper.
 - **`GET /licenses/{id}/entitlements` cannot be paginated.** The listing unions direct and
   policy-inherited rows, so the server accepts `page[after]` and ignores it — every "next page"
   repeats the first. `entitlements.list` must send an explicit `limit` (the SDK sends the server
@@ -290,6 +314,34 @@ wrong — these replace it.
   constant. `HeartbeatScheduler`'s default ~200s interval is sized against the *fallback*; use
   `HeartbeatScheduler.for_policy(machines, machine_id, policy)` (window / 3, floored at 1s via
   `heartbeat_interval_for_policy`) with a policy from `licenses.get_policy(license_id)`.
+  ⚠️ **Both schedulers now hold that floor themselves, so an interval passed by hand is not
+  honoured verbatim below one second.** The rule, stated so no reader has to run it: a
+  non-positive `interval` becomes the scheduler's recommended default (200s machine, 10s
+  process) and a positive one below `MIN_HEARTBEAT_INTERVAL` is raised to one second.
+  `timedelta(seconds=40)` stays 40s; `timedelta(milliseconds=500)` becomes 1s;
+  `timedelta(microseconds=1)` becomes 1s; `timedelta(0)` and a negative become the default.
+  Nothing raises. ⚠️ Do **not** "improve" this back into a guard on the non-positive case
+  alone — that was the first shape it shipped in, and it was rejected on measurement.
+  `time.sleep` *honours* a sub-second request, so there is no runtime threshold to key a
+  narrower rule to: measured on CPython 3.13 a bare sleep loop turns ~1,368,000/sec at
+  `sleep(0)`, ~163,000/sec at `sleep(0.000001)` and ~696/sec at `sleep(0.001)`, the last to
+  within 1.4x of what was asked. A rule keyed to what the runtime refuses to honour clamps
+  `timedelta(0)` and passes a positive interval issuing 163,000 authenticated pings a second;
+  that describes where a number came from, not what it does. The floor costs nothing a policy
+  can ask for, because `heartbeat_duration` is an integer-**seconds** column. ⚠️ **And liveness
+  is judged on truncated whole seconds**, which is what makes the flat floor safe on a short
+  window: `heartbeat_status_within` computes `(Utc::now() - hb_ts).num_seconds() <= window_secs`
+  and `num_seconds()` truncates (`Duration::milliseconds(1999).num_seconds() == 1`), so a
+  machine first reads `DEAD` at `window_secs + 1` seconds and every window carries one free
+  second. Do **not** restate that as "DEAD once the age passes the window" — the pessimistic
+  reading makes a 1s window look unserveable at a 1s ping when it has 2s of slack. What the
+  floor does cost is `HEARTBEAT_PINGS_PER_WINDOW`'s two-loss promise on windows under 3s:
+  `heartbeat_duration` 3 is where floor and divisor agree, 2 keeps one spare ping, 1 keeps none.
+  The one window that cannot be held is `0` — and note that this SDK reaches that verdict by a
+  different route than tamga-js, because `effective_heartbeat_window_seconds` treats a
+  non-positive `heartbeat_duration` as unset while the server's own
+  `COALESCE(p.heartbeat_duration, 600)` substitutes only for `NULL`. The whole table is pinned
+  by value in `tests/test_policy_read.py`.
   **Route matters:** `GET /policies/{id}` authorizes on `policy.read`, which is *not* in the
   license-token permission set (`tamga-api/src/shared/authz/mod.rs:236-261`), so `policies.get`
   403s under license-key auth; `GET /licenses/{id}/policy` authorizes on `license.read`, which is,
