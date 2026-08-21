@@ -323,6 +323,26 @@ def test_encrypted_machine_file_ciphertext_too_short_for_a_tag_is_rejected(
         )
 
 
+def test_encrypted_license_file_payload_too_short_for_a_nonce_and_tag_is_rejected(
+    ed25519_keypair, sample_license_key: str
+) -> None:  # type: ignore[no-untyped-def]
+    """A `.lic` blob shorter than a 12-byte nonce plus a 16-byte GCM tag.
+
+    The single-blob layout's counterpart to the machine file's separate
+    nonce/ciphertext length checks above: slicing 12 bytes off a shorter blob
+    would hand AES-GCM a truncated nonce and an empty ciphertext rather than
+    saying what is actually wrong.
+    """
+    private_key, public_key = ed25519_keypair
+    enc = base64.b64encode(b"tooshort").decode("ascii")
+    certificate = _cert_from_enc_string(private_key, enc, ALG_ENCRYPTED, PEM_HEADER, PEM_FOOTER)
+
+    with pytest.raises(ValueError, match="too short to contain"):
+        LicenseFile.parse(certificate).verify(
+            public_key.public_bytes_raw(), license_key=sample_license_key
+        )
+
+
 def test_encrypted_machine_file_missing_separator_is_rejected(
     ed25519_keypair, sample_license_key: str
 ) -> None:  # type: ignore[no-untyped-def]
