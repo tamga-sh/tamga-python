@@ -166,6 +166,50 @@ with TamgaClient(config) as client:
         scheduler.run_forever()
 ```
 
+## Choosing a machine fingerprint
+
+The server treats a fingerprint as an opaque string: `fingerprint TEXT NOT NULL`, unique per
+licence, with no normalisation of any kind. So `"ABC-123"`, `"abc-123"` and `" ABC-123 "` are
+three different machines holding three seats, and nothing surfaces the mistake — each activation
+simply succeeds.
+
+`machine_fingerprint` fixes the spelling, not the choice:
+
+```python
+from tamga import machine_fingerprint
+
+# Whatever your product decides identifies a machine.
+components = {
+    "machine-id": read_machine_id(),
+    "disk": read_disk_serial(),
+}
+fp = machine_fingerprint(components)
+
+machine = client.machines.activate_machine(license_id, fingerprint=fp)
+```
+
+It is a pure function — it reads no hardware, no environment and no files. That is deliberate:
+what identifies a machine is a product decision, not a library's. A cloned VM template shares its
+identifiers, a container has none, and a replaced motherboard changes them; no default is right
+for both a desktop application and a Kubernetes sidecar.
+
+What it guarantees:
+
+| Property | Meaning |
+|---|---|
+| Order-independent | `{"a": …, "b": …}` and `{"b": …, "a": …}` agree. |
+| Whitespace-trimmed | A value with a trailing newline — the usual result of reading a file — agrees with one without. |
+| Case-preserving | Case is **not** folded; lowercasing a base64 or hex identifier would corrupt it. |
+| Stable across SDKs | All eight Tamga SDKs implement the same rule against the same shared test vectors. |
+
+Values are **not** Unicode-normalised. If your components can arrive in more than one normal form,
+normalise them before calling — the rule is left out so that all eight ports can implement it
+identically, since NFC is not freely available in every one of their languages.
+
+Invalid components raise `FingerprintComponentError` (a `ValueError`) rather than being repaired:
+a repeated label, an empty label, a non-ASCII label, or a control character in a value. Repairing
+any of those would map two genuinely different inputs onto one seat.
+
 ## Checking for updates
 
 ```python

@@ -48,6 +48,11 @@ from tamga.errors import (
     UnauthorizedError,
     UnknownTamgaError,
 )
+from tamga.fingerprint import (
+    FingerprintComponentError,
+    canonical_form,
+    machine_fingerprint,
+)
 
 # Kept in sync by release-please via the `generic` updater and the annotation below.
 # The `python` updater was configured here previously and silently never fired, so this
@@ -60,6 +65,7 @@ __all__ = [
     "CoreLimitExceededError",
     "DatasetInvalidError",
     "DiskLimitExceededError",
+    "FingerprintComponentError",
     "FingerprintTakenError",
     "ForbiddenError",
     "InternalServerError",
@@ -85,4 +91,6 @@ __all__ = [
     "UnauthorizedError",
     "UnknownTamgaError",
     "__version__",
+    "canonical_form",
+    "machine_fingerprint",
 ]
