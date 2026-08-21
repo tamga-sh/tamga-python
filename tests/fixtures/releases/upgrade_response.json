@@ -1,0 +1,32 @@
+{
+  "_provenance": {
+    "source": "tamga-api/src/features/releases/serializer.rs, struct ReleaseAttributes",
+    "derivation": "Wire keys were extracted mechanically from the Rust struct, applying serde's own precedence (an explicit #[serde(rename)] on a field beats the struct-level rename_all). They were NOT transcribed from this SDK's ReleaseResource dataclass — a fixture built from the Python field names would encode the same assumption the parser makes and could not disprove it.",
+    "rename_all": "camelCase (serializer.rs:24) — this is 1 of only 10 attribute structs on the server that use it; MachineAttributes, PolicyAttributes, LicenseAttributes, ComponentAttributes and ProcessAttributes are all snake_case",
+    "key_map": {
+      "product_id": "productId",
+      "name": "name",
+      "version": "version",
+      "channel": "channel",
+      "status": "status",
+      "tag": "tag (omitted entirely when None — skip_serializing_if)",
+      "metadata": "metadata",
+      "created_at": "created (EXPLICIT RENAME at serializer.rs:41 — camelCase does not apply)",
+      "updated_at": "updated (EXPLICIT RENAME at serializer.rs:43 — camelCase does not apply)"
+    }
+  },
+  "data": {
+    "id": "018f2f3a-0000-7000-8000-000000000090",
+    "type": "releases",
+    "attributes": {
+      "productId": "018f2f3a-0000-7000-8000-000000000070",
+      "name": "1.4.0",
+      "version": "1.4.0",
+      "channel": "stable",
+      "status": "PUBLISHED",
+      "metadata": {"notes": "faster"},
+      "created": "2026-01-02T03:04:05Z",
+      "updated": "2026-01-02T03:04:05Z"
+    }
+  }
+}

@@ -93,6 +93,32 @@ def build_base_url(host: str, account_id: str) -> str:
     return f"{scheme}://{normalized_host}/v1/accounts/{account_id}"
 
 
+def build_root_url(host: str) -> str:
+    """Build the account-*less* origin: ``https://<host>``, no path.
+
+    ``build_base_url`` appends ``/v1/accounts/{account_id}`` unconditionally,
+    which is right for every route this SDK calls but one: ``GET /v1/health``
+    sits at the server root, outside any account. Without a second builder there
+    is no way to address it at all — the account segment cannot be un-appended
+    from a client already constructed around it.
+
+    Scheme handling is identical to ``build_base_url`` (explicit ``http://``
+    preserved, anything else resolved to ``https``), so a self-hosted plain-HTTP
+    deployment stays reachable on both.
+
+    Args:
+        host: API host, with or without scheme.
+
+    Returns:
+        The scheme-qualified origin, with no path and no trailing slash.
+    """
+    stripped = host.strip()
+    scheme = "http" if stripped.startswith("http://") else "https"
+    normalized_host = stripped.removeprefix("https://").removeprefix("http://")
+    normalized_host = normalized_host.rstrip("/")
+    return f"{scheme}://{normalized_host}"
+
+
 def sanitize_tamga_version(version: str) -> str:
     """Sanitize a ``Tamga-Version`` header value client-side.
 

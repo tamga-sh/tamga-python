@@ -12,6 +12,8 @@ function, not a symmetric gap.
 
 from __future__ import annotations
 
+import hashlib
+
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -63,7 +65,14 @@ def test_still_accepts_a_valid_p256_signature_via_pem(ecdsa_keypair) -> None:  #
 
 
 def test_still_accepts_a_valid_p256_signature_via_raw_point(ecdsa_keypair) -> None:  # type: ignore[no-untyped-def]
-    """Guard against a regression on the already-safe raw-point path."""
+    """Guard against a regression on the already-safe raw-point path.
+
+    This is the format the server actually emits: `EcdsaKeyPair::public_key().as_ref()`
+    is a raw 65-byte SEC1 uncompressed point (`0x04 || X || Y`), pinned server-side by
+    its own `ecdsa_public_key_is_65_bytes` test -- not SPKI. A loader that only
+    understood SPKI would reject every genuine key with a `False` a caller cannot tell
+    apart from a forged signature.
+    """
     private_key, public_key = ecdsa_keypair
     message = b"tamga-python ecdsa p256 raw point still works"
     signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
@@ -72,4 +81,41 @@ def test_still_accepts_a_valid_p256_signature_via_raw_point(ecdsa_keypair) -> No
         format=serialization.PublicFormat.UncompressedPoint,
     )
 
+    assert len(raw_point) == 65
+    assert raw_point[0] == 0x04
     assert verify_p256(raw_point, message, signature) is True
+
+
+def test_still_accepts_a_valid_p256_signature_via_der_spki(ecdsa_keypair) -> None:  # type: ignore[no-untyped-def]
+    """The DER branch must accept P-256, not only reject the wrong curves."""
+    private_key, public_key = ecdsa_keypair
+    message = b"tamga-python ecdsa p256 der spki still works"
+    signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+    public_key_der = public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    assert verify_p256(public_key_der, message, signature) is True
+
+
+def test_verify_p256_hashes_the_message_itself_and_must_not_be_handed_a_digest() -> None:
+    """`ec.ECDSA(hashes.SHA256())` digests internally -- pass raw bytes, never SHA-256(bytes).
+
+    Sibling SDKs sit on APIs that take a *pre-computed* digest and silently truncate
+    whatever they are handed, so "ECDSA must operate on SHA-256(enc)" is the right rule
+    there and exactly the wrong one here: pyca/cryptography hashes for you, so feeding it
+    a digest double-hashes and fails to verify. This pins which of the two contracts this
+    module is on, so a port of the sibling fix would go red here rather than break every
+    ECDSA machine file.
+    """
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    message = b"tamga-python ecdsa digest-vs-message contract"
+    signature = private_key.sign(message, ec.ECDSA(hashes.SHA256()))
+    raw_point = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint,
+    )
+
+    assert verify_p256(raw_point, message, signature) is True
+    assert verify_p256(raw_point, hashlib.sha256(message).digest(), signature) is False

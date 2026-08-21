@@ -127,6 +127,13 @@ class LicenseResource:
 class LicenseFileResource:
     """The JSON:API ``license-files`` resource returned by the ``POST`` checkout variant.
 
+    Wire-casing note: this resource's attributes carry ``rename_all =
+    "camelCase"`` server-side, like ``releases`` — but unlike ``releases`` it
+    makes no difference here, because every field is a single word. Should a
+    multi-word field ever be added to it, it will arrive camelCased. Do not
+    "correct" the existing six to snake_case, and do not assume the next one is
+    snake_case by analogy with ``machines``/``licenses``/``policies``, which are.
+
     Attributes:
         certificate: The full ``.lic`` PEM-style wrapper string. Parse and
             verify it with ``tamga.checkout.license_file.LicenseFile``.
