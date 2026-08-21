@@ -326,6 +326,27 @@ vocabulary); offline proof had 1 HIGH finding fixed (`build_proof_payload` was m
 non-ASCII field value). All three fixes are live in the current code; this note exists so the review
 trail is discoverable without archaeology through commit history.
 
+**Second machine-checkout pass (machine-file v2, PR #25).** Re-reviewed after the v2/`+v2`,
+dot-separated-`enc` and `meta.exp` work. No CRITICAL and no bypass: verification order, `alg`
+handling (never selects a primitive), expiry enforcement, AES-GCM parameters and the 1 MiB
+envelope cap all held under adversarial probing, and two suspected defects carried over from
+sibling SDKs were **disproven here** — `cryptography`'s `load_der_public_key` accepts the server's
+PKCS#1 `RSAPublicKey` DER as well as SPKI (both encodings really are reachable: `extract_public_key`
+emits PKCS#1, `key_material.rs` stores SPKI on the account), and `ec.ECDSA(hashes.SHA256())` hashes
+the message itself, so this SDK must pass raw `enc` bytes and **not** `SHA-256(enc)`. Both are now
+pinned by tests in `tests/test_crypto_rsa.py`/`tests/test_crypto_ecdsa.py` so a port of the sibling
+fixes fails loudly here instead of breaking verification. One HIGH was fixed: `data["id"]`,
+`data["type"]` and a non-object `attributes`/`relationships` leaked `KeyError`/`TypeError`/
+`AttributeError` past the documented `Raises: ValueError` on both `verify()`s — the license path
+had no `isinstance(data, dict)` guard at all. Two LOWs were fixed: `LicenseFile.verify_with_claims`
+decrypted the file a second time behind an `assert` that `python -O` strips (now one shared
+`_verify`, mirroring `MachineFile`), and the `.lic` path decoded `enc` non-strictly (now the shared
+`_envelope.b64decode_strict`, so neither file type can drift back to a lax decode). One LOW was
+**not** fixed on purpose: a malformed `public_key` and a forged signature both surface as
+`InvalidSignature`, because the crypto wrappers deliberately return a uniform "not valid" for
+untrusted input rather than handing a caller — who may be the attacker — an oracle distinguishing
+"your key is wrong" from "your signature is wrong".
+
 ## Release
 
 `release-please` (config: `release-please-config.json`, manifest:

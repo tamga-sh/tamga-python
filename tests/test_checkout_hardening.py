@@ -11,17 +11,25 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from datetime import datetime, timezone
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from tamga.checkout import license_file as license_file_module
 from tamga.checkout._envelope import parse_certificate_envelope
-from tamga.checkout.license_file import ALG_PLAIN, PEM_FOOTER, PEM_HEADER, LicenseFile
+from tamga.checkout.license_file import (
+    ALG_ENCRYPTED,
+    ALG_PLAIN,
+    PEM_FOOTER,
+    PEM_HEADER,
+    LicenseFile,
+)
 from tamga.checkout.machine_file import PEM_FOOTER as MACHINE_PEM_FOOTER
 from tamga.checkout.machine_file import PEM_HEADER as MACHINE_PEM_HEADER
 from tamga.checkout.machine_file import MachineFile
-from tamga.crypto.hkdf import derive_machine_file_key
+from tamga.crypto.hkdf import derive_license_file_key, derive_machine_file_key
 from tamga.models.machine import HeartbeatStatus
 from tamga.models.policy import LicenseScheme
 
@@ -394,6 +402,185 @@ def test_machine_file_non_object_data_raises_clear_value_error(ed25519_keypair) 
 
     with pytest.raises(ValueError, match="'data' is not a JSON object"):
         machine_file.verify(public_key.public_bytes_raw(), LicenseScheme.ED25519_SIGN)
+
+
+# ---------------------------------------------------------------------------
+# The rest of the `data` shape. The `isinstance(data, dict)` guard above only
+# closed half the gap: `data["id"]`/`data["type"]` are bare subscripts and
+# `attributes`/`relationships` were read without a type check, so a KeyError,
+# a TypeError or an AttributeError still escaped the documented
+# `Raises: ValueError` on both verify()s. All are behind a valid signature --
+# a contract gap, not a bypass. Found by the mandatory security-reviewer pass
+# on the machine-file v2 work.
+# ---------------------------------------------------------------------------
+
+
+def _machine_cert(private_key, payload: dict) -> str:
+    return _cert_with_raw_enc_bytes(
+        private_key,
+        json.dumps(payload).encode("utf-8"),
+        "base64+ed25519+v2",
+        MACHINE_PEM_HEADER,
+        MACHINE_PEM_FOOTER,
+    )
+
+
+def _license_cert(private_key, payload: dict) -> str:
+    return _cert_with_raw_enc_bytes(
+        private_key, json.dumps(payload).encode("utf-8"), ALG_PLAIN, PEM_HEADER, PEM_FOOTER
+    )
+
+
+def test_machine_file_data_without_id_raises_clear_value_error(ed25519_keypair) -> None:  # type: ignore[no-untyped-def]
+    """`data["id"]` is a bare subscript -- a missing key must not leak a KeyError."""
+    private_key, public_key = ed25519_keypair
+    cert = _machine_cert(private_key, {"data": {"type": "machines"}, "meta": V2_CLAIMS})
+
+    with pytest.raises(ValueError, match="'data' is missing 'id'"):
+        MachineFile.parse(cert).verify(public_key.public_bytes_raw(), LicenseScheme.ED25519_SIGN)
+
+
+@pytest.mark.parametrize("attributes", [["a"], "s", 7, True])
+def test_machine_file_non_object_attributes_raises_clear_value_error(  # type: ignore[no-untyped-def]
+    ed25519_keypair, attributes: object
+) -> None:
+    """A non-object `attributes` reaches `.get` and would raise AttributeError."""
+    private_key, public_key = ed25519_keypair
+    payload = {"data": {"id": "x", "attributes": attributes}, "meta": V2_CLAIMS}
+    cert = _machine_cert(private_key, payload)
+
+    with pytest.raises(ValueError, match="'data.attributes' is not a JSON object"):
+        MachineFile.parse(cert).verify(public_key.public_bytes_raw(), LicenseScheme.ED25519_SIGN)
+
+
+def test_machine_file_null_attributes_is_treated_as_absent(ed25519_keypair) -> None:  # type: ignore[no-untyped-def]
+    """Guard against an overcorrection: an explicit null is 'no attributes', not an error.
+
+    Matches the leniency `metadata=attributes.get("metadata", {}) or {}` already applies
+    one line down, and the absent-`attributes` case that has always worked.
+    """
+    private_key, public_key = ed25519_keypair
+    cert = _machine_cert(private_key, {"data": {"id": "x", "attributes": None}, "meta": V2_CLAIMS})
+
+    machine = MachineFile.parse(cert).verify(
+        public_key.public_bytes_raw(), LicenseScheme.ED25519_SIGN
+    )
+    assert machine.fingerprint == ""
+    assert machine.heartbeat_status is HeartbeatStatus.NOT_STARTED
+
+
+@pytest.mark.parametrize("data", [["not", "an", "object"], "a string", 7])
+def test_license_file_non_object_data_raises_clear_value_error(  # type: ignore[no-untyped-def]
+    ed25519_keypair, data: object
+) -> None:
+    """The `.lic` path never got the machine path's `isinstance(data, dict)` guard.
+
+    Without it `data["id"]` raises TypeError -- not even in the same family as the
+    documented ValueError.
+    """
+    private_key, public_key = ed25519_keypair
+    cert = _license_cert(private_key, {"data": data, "meta": V2_CLAIMS})
+
+    with pytest.raises(ValueError, match="'data' is not a JSON object"):
+        LicenseFile.parse(cert).verify(public_key.public_bytes_raw())
+
+
+@pytest.mark.parametrize(
+    ("data", "missing"),
+    [({"type": "licenses"}, "id"), ({"id": "x"}, "type")],
+)
+def test_license_file_data_missing_id_or_type_raises_clear_value_error(  # type: ignore[no-untyped-def]
+    ed25519_keypair, data: dict, missing: str
+) -> None:
+    private_key, public_key = ed25519_keypair
+    cert = _license_cert(private_key, {"data": data, "meta": V2_CLAIMS})
+
+    with pytest.raises(ValueError, match=f"'data' is missing '{missing}'"):
+        LicenseFile.parse(cert).verify(public_key.public_bytes_raw())
+
+
+@pytest.mark.parametrize("key", ["attributes", "relationships"])
+def test_license_file_non_object_attributes_or_relationships_is_refused(  # type: ignore[no-untyped-def]
+    ed25519_keypair, key: str
+) -> None:
+    """Both are declared `dict[str, Any]`; storing a list defers the crash to the caller."""
+    private_key, public_key = ed25519_keypair
+    data = {"id": "x", "type": "licenses", key: ["not", "an", "object"]}
+    cert = _license_cert(private_key, {"data": data, "meta": V2_CLAIMS})
+
+    with pytest.raises(ValueError, match=f"'data.{key}' is not a JSON object"):
+        LicenseFile.parse(cert).verify(public_key.public_bytes_raw())
+
+
+@pytest.mark.parametrize("key", ["attributes", "relationships"])
+def test_license_file_null_attributes_or_relationships_is_treated_as_absent(  # type: ignore[no-untyped-def]
+    ed25519_keypair, key: str
+) -> None:
+    """Overcorrection guard, mirroring the machine-file null case."""
+    private_key, public_key = ed25519_keypair
+    data = {"id": "x", "type": "licenses", key: None}
+    cert = _license_cert(private_key, {"data": data, "meta": V2_CLAIMS})
+
+    license_resource = LicenseFile.parse(cert).verify(public_key.public_bytes_raw())
+    assert license_resource.attributes == {}
+    assert license_resource.relationships == {}
+
+
+# ---------------------------------------------------------------------------
+# The `.lic` path decodes strictly too. The machine-file path was made strict
+# in this PR; leaving `LicenseFile` on a non-validating `base64.b64decode` kept
+# exactly the laxity that hid the `<nonce_b64>.<cipher_b64>` misreading for two
+# years -- silently discarding whatever it does not recognize. Reaching it
+# needs a certificate signed *over* the junk, which is why it takes the
+# keypair fixture: the signature covers `enc`'s exact bytes, so no
+# third party can steer a genuine file down here. LOW finding from the
+# mandatory security-reviewer pass.
+# ---------------------------------------------------------------------------
+
+
+def test_license_file_enc_with_junk_characters_is_rejected(ed25519_keypair) -> None:  # type: ignore[no-untyped-def]
+    private_key, public_key = ed25519_keypair
+    payload = {"data": {"id": "x", "type": "licenses"}, "meta": V2_CLAIMS}
+    clean = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+    enc = f"{clean[:8]}*! \n{clean[8:]}"
+    cert = _cert_from_enc_string(private_key, enc, ALG_PLAIN, PEM_HEADER, PEM_FOOTER)
+
+    with pytest.raises(ValueError, match="not valid base64"):
+        LicenseFile.parse(cert).verify(public_key.public_bytes_raw())
+
+
+def test_license_file_verify_with_claims_decrypts_exactly_once(  # type: ignore[no-untyped-def]
+    ed25519_keypair, sample_license_key: str, monkeypatch
+) -> None:
+    """It used to call verify() and then redo the whole decode/HKDF/AES-GCM pass.
+
+    Two decrypts per file, plus an `assert license_key is not None` that `python -O`
+    strips out. Both go away by running the shared pipeline once.
+    """
+    private_key, public_key = ed25519_keypair
+    payload = {"data": {"id": "x", "type": "licenses"}, "meta": V2_CLAIMS}
+    key = derive_license_file_key(sample_license_key)
+    nonce = os.urandom(12)
+    ciphertext_and_tag = AESGCM(key).encrypt(nonce, json.dumps(payload).encode("utf-8"), None)
+    enc = base64.b64encode(nonce + ciphertext_and_tag).decode("ascii")
+    cert = _cert_from_enc_string(private_key, enc, ALG_ENCRYPTED, PEM_HEADER, PEM_FOOTER)
+
+    calls = []
+    real_decrypt = license_file_module.aes_gcm_decrypt
+
+    def counting_decrypt(*args: object, **kwargs: object) -> bytes:
+        calls.append(1)
+        return real_decrypt(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(license_file_module, "aes_gcm_decrypt", counting_decrypt)
+
+    license_resource, claims = LicenseFile.parse(cert).verify_with_claims(
+        public_key.public_bytes_raw(), license_key=sample_license_key
+    )
+
+    assert len(calls) == 1
+    assert str(license_resource.id) == "x"
+    assert claims.jti == V2_CLAIMS["jti"]
 
 
 # ---------------------------------------------------------------------------

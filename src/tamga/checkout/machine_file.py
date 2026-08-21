@@ -76,14 +76,12 @@ the caller-supplied ``scheme`` — never used to select a verifier.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidSignature
 
-from tamga.checkout._envelope import parse_certificate_envelope
+from tamga.checkout._envelope import b64decode_strict, parse_certificate_envelope
 from tamga.checkout.license_file import (
     LicenseFileClaims,
     LicenseFileExpired,
@@ -203,31 +201,6 @@ def _validate_alg(alg: str) -> tuple[str, str]:
             f"(expected one of {sorted(VALID_ALGORITHMS)})"
         )
     return prefix, suffix
-
-
-def _b64decode_strict(value: str, what: str) -> bytes:
-    """Base64-decode one already-authenticated piece of ``enc``.
-
-    Strict about the alphabet (so a stray ``.`` or whitespace is an error
-    rather than silently skipped, which is how a dot-separated ``enc`` fed to
-    a single non-validating decode turns into plausible-looking garbage), but
-    tolerant of absent ``=`` padding.
-
-    Args:
-        value: The base64 text to decode.
-        what: Name of the piece, used in the error message.
-
-    Returns:
-        The decoded bytes.
-
-    Raises:
-        ValueError: If ``value`` is not valid base64.
-    """
-    padding = "=" * (-len(value) % 4)
-    try:
-        return base64.b64decode(value + padding, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError(f"malformed machine file: {what} is not valid base64") from exc
 
 
 @dataclass(frozen=True)
@@ -417,7 +390,7 @@ class MachineFile:
         if enc_prefix == _ENC_PREFIX_ENCRYPTED:
             plaintext = self._decrypt(license_key, fingerprint)
         else:
-            plaintext = _b64decode_strict(self.enc, "payload")
+            plaintext = b64decode_strict(self.enc, "payload", file_kind="machine file")
 
         # SECURITY/robustness: same class of gap as license_file.py's verify()
         # -- without this wrapping, a malformed plaintext leaks a raw
@@ -443,7 +416,24 @@ class MachineFile:
         claims = _parse_claims(parsed, file_kind="machine file")
         _enforce_expiry(claims, now, expired_error=MachineFileExpired)
 
-        attributes = data.get("attributes", {})
+        # Same class of gap as the `data` check above, which the first pass
+        # only closed halfway: `data["id"]` below is a bare subscript, so a
+        # payload without it raises KeyError, and an `attributes` that is
+        # present but not an object raises AttributeError from `.get`. Both
+        # are outside every documented `Raises:` on verify()/
+        # verify_with_claims(), so a caller written as the documented
+        # `except (ValueError, MachineFileExpired):` misses the rejection
+        # entirely. Only reachable behind a valid signature, so not a bypass —
+        # a contract gap. Found by the mandatory security-reviewer pass.
+        if "id" not in data:
+            raise ValueError("malformed machine file: payload's 'data' is missing 'id'")
+        attributes = data.get("attributes")
+        if attributes is None:
+            attributes = {}
+        if not isinstance(attributes, dict):
+            raise ValueError(
+                "malformed machine file: payload's 'data.attributes' is not a JSON object"
+            )
 
         # SECURITY/robustness: an unrecognized heartbeat_status (a future
         # server-side addition, or any value not yet modeled) must not crash
@@ -493,8 +483,8 @@ class MachineFile:
                 "malformed encrypted machine file payload: expected exactly one "
                 f"{_ENC_SEPARATOR!r}-separated '<nonce_b64>.<ciphertext_b64>' pair"
             )
-        nonce = _b64decode_strict(nonce_b64, "nonce")
-        ciphertext_and_tag = _b64decode_strict(cipher_b64, "ciphertext")
+        nonce = b64decode_strict(nonce_b64, "nonce", file_kind="machine file")
+        ciphertext_and_tag = b64decode_strict(cipher_b64, "ciphertext", file_kind="machine file")
         if len(nonce) != _NONCE_LENGTH:
             raise ValueError(
                 f"malformed encrypted machine file payload: nonce is {len(nonce)} bytes, "

@@ -91,6 +91,21 @@ decode, then decrypt.** The signature covers the whole `enc` string — dot incl
 attacker-controlled is decoded before it has been authenticated. Which branch to take comes from
 `alg`'s encoding prefix, never from whether a `.` happens to be present.
 
+Both file types now decode through one strict helper,
+`src/tamga/checkout/_envelope.py::b64decode_strict` (alphabet-validating, padding-tolerant), so
+neither can quietly drift back to the lax decode that hid this for two years.
+
+### 1d. A verified payload's shape is checked before it is read
+
+Passing the signature proves a payload is *authentic*, not that it is *well-formed*. Every field
+read out of `data` afterwards is therefore guarded: `data` must be a JSON object, `id` (and, for
+`.lic`, `type`) must be present, and `attributes`/`relationships` must be objects when present —
+an explicit JSON `null` counts as absent, not as an error. Without those guards a `KeyError`,
+`TypeError` or `AttributeError` escapes past the `ValueError` both `verify()` methods document,
+and a caller written to that contract crashes instead of rejecting the file. No attacker without
+the account's signing key can produce such a payload, so this is a robustness and error-contract
+property rather than an authentication one.
+
 ### 2. Offline-proof signatures depend on byte-exact JSON serialization
 
 `src/tamga/proof.py::build_proof_payload` must reproduce the server's exact serialized bytes
