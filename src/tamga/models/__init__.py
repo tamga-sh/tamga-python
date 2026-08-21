@@ -27,11 +27,22 @@ from tamga.models.policy import (
     PolicyResource,
 )
 from tamga.models.release import ReleaseResource
+from tamga.models.signing_key import (
+    ACTIVE_STATUS,
+    ED25519_ALGORITHM,
+    ED25519_PUBLIC_KEY_LENGTH,
+    RETIRED_STATUS,
+    SigningKey,
+)
 from tamga.models.validation import ValidationCode, ValidationMeta, ValidationResult
 
 __all__ = [
+    "ACTIVE_STATUS",
     "DEFAULT_HEARTBEAT_DURATION_SECONDS",
+    "ED25519_ALGORITHM",
+    "ED25519_PUBLIC_KEY_LENGTH",
     "MACHINE_UNIQUENESS_STRATEGIES",
+    "RETIRED_STATUS",
     "CheckInInterval",
     "ComponentResource",
     "Entitlement",
@@ -49,6 +60,7 @@ __all__ = [
     "PolicyResource",
     "ProcessResource",
     "ReleaseResource",
+    "SigningKey",
     "ValidationCode",
     "ValidationMeta",
     "ValidationResult",

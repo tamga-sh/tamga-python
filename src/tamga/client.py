@@ -2,8 +2,8 @@
 
 ``TamgaClient`` wraps an ``httpx.Client`` and exposes namespaced sub-clients
 (``.licenses``, ``.machines``, ``.components``, ``.processes``,
-``.entitlements``) rather than one flat method namespace, mirroring the
-server's own resource grouping.
+``.entitlements``, ``.policies``, ``.releases``, ``.accounts``) rather than one
+flat method namespace, mirroring the server's own resource grouping.
 
 Auth note: auth **is** enforced server-side. For the license-key transport
 (``Authorization: License <key>``) the license's policy must set
@@ -34,6 +34,7 @@ from uuid import UUID
 
 import httpx
 
+from tamga.checkout.key_set import SigningKeySet
 from tamga.errors import (
     FingerprintTakenError,
     MachineOverLimitError,
@@ -53,6 +54,7 @@ from tamga.models.machine import (
 )
 from tamga.models.policy import Entitlement, PolicyResource
 from tamga.models.release import ReleaseResource
+from tamga.models.signing_key import ACTIVE_STATUS, ED25519_ALGORITHM, SigningKey
 from tamga.models.validation import ValidationCode, ValidationMeta, ValidationResult
 from tamga.proof import ProofResult
 from tamga.transport import (
@@ -318,6 +320,40 @@ def _parse_release_resource(data: dict[str, Any]) -> ReleaseResource:
         # Explicit `#[serde(rename)]`, so NOT `createdAt`/`updatedAt`.
         created=_parse_datetime(attrs.get("created")),
         updated=_parse_datetime(attrs.get("updated")),
+    )
+
+
+def _parse_signing_key_resource(data: dict[str, Any]) -> SigningKey:
+    """Parse one ``signing-keys`` JSON:API resource.
+
+    Two things here are not guesswork and must not be "tidied":
+
+    - **The resource ``id`` is the ``kid``.** The server sets it from the same
+      value it writes into an offline file's signed claim
+      (``accounts/serializer.rs:119-123``, whose own comment reads "The ``kid``
+      doubles as the resource id — it is what an offline file names"), so a
+      fetched key is matched by its ``id`` and needs no local hashing.
+      ``SigningKey.computed_kid`` re-derives it purely as a cross-check.
+    - **``publicKey`` is camelCase.** ``SigningKeyAttributes``
+      (``accounts/serializer.rs:108-117``) is snake_case except for an explicit
+      ``#[serde(rename = "publicKey")]`` on that one field. This SDK has already
+      shipped the mirror-image bug on ``productId``; the spelling is pinned by
+      ``tests/fixtures/signing_keys/list_response.json``, whose keys were derived
+      from the Rust struct rather than from these field names.
+
+    Lenient about missing attributes on purpose: this parses the account's whole
+    key history, and one unusable row must not strand every file the account has
+    already signed. An entry that ends up with no usable key material is simply
+    never selected — see ``SigningKeySet.usable_keys``.
+    """
+    attributes = data.get("attributes") or {}
+    return SigningKey(
+        kid=str(data["id"]),
+        public_key=str(attributes.get("publicKey", "")),
+        algorithm=str(attributes.get("algorithm", ED25519_ALGORITHM)),
+        status=str(attributes.get("status", ACTIVE_STATUS)),
+        created=_parse_datetime(attributes.get("created")),
+        retired=_parse_datetime(attributes.get("retired")),
     )
 
 
@@ -2094,6 +2130,73 @@ def _next_after_cursor(items: list[Any], limit: int | None) -> str | None:
 
 
 @dataclass
+class AccountsClient:
+    """Namespaced client for account-level endpoints. Access via ``TamgaClient.accounts``."""
+
+    _http: httpx.Client
+    _config: TamgaConfig
+
+    def list_signing_keys(self) -> builtins.list[SigningKey]:
+        """``GET /signing-keys`` — every signing key the account has held.
+
+        Current **and retired**, newest first (``ORDER BY created_at DESC, kid
+        ASC``). Retired keys are included by design: a client holding an offline
+        file signed before the last rotation needs the key that signed it, and
+        without it the only options are to fail verification or to accept any key
+        at all — the second of which defeats signing entirely.
+
+        Only public halves come back. ``PublishedSigningKey`` has no field for a
+        private key, so one cannot leak through this route even if the query were
+        changed to select it.
+
+        Warning:
+            **Answers ``403`` under license-key auth.** The route requires
+            ``account.read`` (``accounts/policy.rs:16-18``), which
+            ``Role::LicenseToken`` does not hold
+            (``shared/authz/mod.rs:241-267``) — and there is no second route
+            serving the same resource under a permission it does hold, unlike
+            ``policies.get`` and ``licenses.get_policy``. An embedded client
+            authenticating with a license key cannot call this.
+
+            That is not fatal to key rotation, because a key set does not have to
+            arrive over the wire: build one with
+            ``SigningKeySet.from_public_keys([...])`` from keys pinned into your
+            application, or fetched at build time with a privileged token. An
+            offline verifier that only works while it has a network is not
+            offline.
+
+        Note:
+            **An empty list is normal, not an error.** ``account_signing_keys``
+            is written only by ``rotate_ed25519``, which backfills the account's
+            current key on its way through, so an account that has never rotated
+            has no rows and this returns ``[]``.
+
+        Returns:
+            The published keys. ``algorithm`` is ``"ed25519"`` on every row
+            today: the table's ``CHECK`` also admits ``rsa2048`` and
+            ``ecdsa_p256``, but nothing writes them.
+
+        Raises:
+            tamga.errors.ForbiddenError: If the credential lacks
+                ``account.read`` — the normal outcome for a license key.
+        """
+        response = _send_request_raw(self._http, self._config, "GET", "/signing-keys")
+        return [_parse_signing_key_resource(d) for d in (response.data or [])]
+
+    def signing_key_set(self) -> SigningKeySet:
+        """The account's published keys, as a set ready to verify offline files with.
+
+        Convenience over :meth:`list_signing_keys` — same request, same
+        caveats (notably the ``403`` under license-key auth), wrapped for
+        ``LicenseFile.verify_with_key_set`` / ``MachineFile.verify_with_key_set``.
+
+        Returns:
+            The key set. Possibly empty; see :meth:`list_signing_keys`.
+        """
+        return SigningKeySet(self.list_signing_keys())
+
+
+@dataclass
 class PoliciesClient:
     """Namespaced client for ``/policies`` endpoints. Access via ``TamgaClient.policies``."""
 
@@ -2539,7 +2642,7 @@ class TamgaClient:
 
     Exposes namespaced sub-clients: ``.licenses``, ``.machines``,
     ``.components``, ``.processes``, ``.entitlements``, ``.policies``,
-    ``.releases``.
+    ``.releases``, ``.accounts``.
 
     Synchronous only — this wraps ``httpx.Client``, not ``httpx.AsyncClient``.
     Usable as a context manager, which closes the underlying HTTP client on
@@ -2563,6 +2666,7 @@ class TamgaClient:
             print(result.meta.valid, result.meta.code.value)
     """
 
+    accounts: AccountsClient
     licenses: LicensesClient
     machines: MachinesClient
     components: ComponentsClient
@@ -2599,6 +2703,7 @@ class TamgaClient:
         self.processes = ProcessesClient(_http=self._http, _config=config)
         self.policies = PoliciesClient(_http=self._http, _config=config)
         self.releases = ReleasesClient(_http=self._http, _config=config)
+        self.accounts = AccountsClient(_http=self._http, _config=config)
 
     def health(self) -> HealthStatus:
         """``GET /v1/health`` — the server's unauthenticated liveness probe.
