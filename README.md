@@ -404,6 +404,19 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
   bearer, and nothing further — so any license key that authenticates can read every license in
   the same account, `attributes.key` included, in plain text. Server-side behaviour this SDK
   cannot fix and does not work around; reported upstream.
+- **`check_in_interval` wire values are adverbial, and the server ignores the field anyway.**
+  The four storable values are `daily`/`weekly`/`monthly`/`yearly` — `policies/enums.rs:27` and
+  the column's own `CHECK` constraint both pin exactly those. Releases up to 1.0.4 modelled them
+  as `day`/`week`/`month`/`year` and constructed the enum strictly, so **any** policy with a
+  cadence configured raised `ValueError` out of `licenses.get_policy` / `policies.get` and took
+  the entire policy read down with it. Fixed in 1.1.0: `CheckInInterval` carries the adverbial
+  values, keeps the noun spellings as aliases (`CheckInInterval.DAY is CheckInInterval.DAILY`),
+  and accepts either spelling on the wire. A cadence outside the four still raises, deliberately —
+  `check_in_interval=None` means "no cadence configured", so guessing it would tell you there is
+  no schedule on a license that has one. Separately, the server does not act on this field at all:
+  `validate_license.rs:394-403` matches the *noun* spellings, so no storable value matches and
+  every cadence is enforced as thirty days (`tamga-api-internal#3`). Read `require_check_in`
+  before scheduling check-ins, and do not assume the interval you set is the one being enforced.
 - **`PolicyResource` does not model `max_memory` / `max_disk`.** The server enforces both during
   validation but no policy serializer emits either — the one response shape for the resource
   carries `max_machines` and `max_cores` and stops there. They are writable through the

@@ -10,6 +10,7 @@ import pytest
 from tamga.models.policy import (
     AUTHENTICATION_STRATEGIES,
     EXPIRATION_STRATEGIES,
+    CheckInInterval,
     HeartbeatCullStrategy,
     HeartbeatResurrectionStrategy,
     LicenseScheme,
@@ -191,3 +192,82 @@ def test_policy_parses_the_new_strategy_values() -> None:
     )
     assert policy.expiration_strategy == "REVOKE_ACCESS"
     assert policy.authentication_strategy == "NONE"
+
+
+@pytest.mark.parametrize(
+    ("wire_value", "expected"),
+    [
+        ("daily", CheckInInterval.DAILY),
+        ("weekly", CheckInInterval.WEEKLY),
+        ("monthly", CheckInInterval.MONTHLY),
+        ("yearly", CheckInInterval.YEARLY),
+    ],
+)
+def test_each_adverbial_cadence_round_trips(wire_value: str, expected: CheckInInterval) -> None:
+    policy = PolicyResource.from_api(
+        {"id": str(POLICY_ID), "require_check_in": True, "check_in_interval": wire_value}
+    )
+
+    assert policy.check_in_interval is expected
+    # `.value` is what would go back to the server, and only the adverbial
+    # spelling passes the column's CHECK constraint.
+    assert policy.check_in_interval is not None
+    assert policy.check_in_interval.value == wire_value
+
+
+@pytest.mark.parametrize(
+    ("legacy", "canonical"),
+    [
+        ("day", CheckInInterval.DAILY),
+        ("week", CheckInInterval.WEEKLY),
+        ("month", CheckInInterval.MONTHLY),
+        ("year", CheckInInterval.YEARLY),
+    ],
+)
+def test_the_legacy_noun_spellings_still_resolve(legacy: str, canonical: CheckInInterval) -> None:
+    assert CheckInInterval(legacy) is canonical
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        (CheckInInterval.DAY, CheckInInterval.DAILY),
+        (CheckInInterval.WEEK, CheckInInterval.WEEKLY),
+        (CheckInInterval.MONTH, CheckInInterval.MONTHLY),
+        (CheckInInterval.YEAR, CheckInInterval.YEARLY),
+    ],
+)
+def test_the_noun_members_are_aliases_not_separate_variants(
+    alias: CheckInInterval, canonical: CheckInInterval
+) -> None:
+    # Code written against 1.0.x compares `policy.check_in_interval` against
+    # `CheckInInterval.DAY`. That has to keep matching a policy parsed from a
+    # real "daily" response, or the crash would just become a wrong answer.
+    assert alias is canonical
+
+
+def test_the_enum_exposes_exactly_the_four_storable_values() -> None:
+    assert [m.value for m in CheckInInterval] == ["daily", "weekly", "monthly", "yearly"]
+
+
+def test_casing_and_whitespace_noise_is_absorbed() -> None:
+    assert CheckInInterval(" Weekly ") is CheckInInterval.WEEKLY
+    assert CheckInInterval("WEEK") is CheckInInterval.WEEKLY
+
+
+def test_a_genuinely_unknown_cadence_still_raises() -> None:
+    # Not softened to None: `check_in_interval=None` reads as "no cadence
+    # configured", so guessing it for an unrecognized value would tell a
+    # caller there is no schedule to keep on a license that has one.
+    with pytest.raises(ValueError, match="hourly"):
+        CheckInInterval("hourly")
+
+    with pytest.raises(ValueError):
+        PolicyResource.from_api(
+            {"id": str(POLICY_ID), "require_check_in": True, "check_in_interval": "hourly"}
+        )
+
+
+def test_a_non_string_cadence_does_not_crash_the_lookup() -> None:
+    with pytest.raises(ValueError):
+        CheckInInterval(7)

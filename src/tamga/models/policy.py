@@ -143,13 +143,102 @@ _REMOVED_PHANTOM_LIMITS: frozenset[str] = frozenset({"max_memory", "max_disk"})
 _PHANTOM_LIMIT_REMOVAL_VERSION: str = "2.0.0"
 
 
-class CheckInInterval(str, Enum):
-    """Lowercase — inconsistent with the ``SCREAMING_SNAKE_CASE`` convention above."""
+#: The noun spellings this SDK modelled as the whole vocabulary up to 1.0.4,
+#: mapped onto the adverbial values the server actually stores. Consulted by
+#: ``CheckInInterval._missing_`` so an old spelling resolves wherever it turns
+#: up, not just in ``PolicyResource.from_api``.
+_LEGACY_CHECK_IN_INTERVALS: dict[str, str] = {
+    "day": "daily",
+    "week": "weekly",
+    "month": "monthly",
+    "year": "yearly",
+}
 
-    DAY = "day"
-    WEEK = "week"
-    MONTH = "month"
-    YEAR = "year"
+
+class CheckInInterval(str, Enum):
+    """How often a license must check in. Lowercase, and **adverbial**.
+
+    The four storable values are ``daily``/``weekly``/``monthly``/``yearly``,
+    pinned twice over: ``policies/enums.rs:27`` lists exactly those, and the
+    column's own ``CHECK`` constraint
+    (``migrations/20240101000005:153-155``) rejects anything else. Combined
+    with ``check_in_interval_count`` they read as "every N periods" — count 2
+    plus ``weekly`` is every two weeks.
+
+    Warning:
+        Releases up to 1.0.4 modelled this as ``day``/``week``/``month``/
+        ``year`` — spellings the server cannot emit and the database will not
+        store — and constructed the enum strictly. Every policy with a
+        cadence configured therefore raised ``ValueError`` out of
+        ``licenses.get_policy`` and ``policies.get``, taking the whole policy
+        read down with it, ``heartbeat_duration`` included. Fixed in 1.1.0.
+
+    The noun spellings are kept as **aliases** rather than deleted, so
+    ``CheckInInterval.DAY`` still resolves and still compares equal to a
+    policy parsed from a real ``"daily"`` response — ``DAY is DAILY``. Their
+    ``.value`` is now the adverbial spelling, because that is the only form
+    the server accepts; code that round-tripped ``.value`` back to the API
+    was already sending something the ``CHECK`` constraint rejected.
+    ``_missing_`` accepts the noun spellings on the wire too.
+
+    A cadence outside the four still raises ``ValueError``, deliberately.
+    Softening that to ``None`` — as tamga-swift's ``init(rawValue:)`` path
+    does — would report "no check-in cadence" for a license that has one,
+    and ``require_check_in`` sits on a separate field, so the caller would
+    have every reason to believe there was no schedule to keep and would let
+    the license lapse. A closed set enforced by a database constraint is the
+    one place where failing loudly beats guessing.
+
+    Note:
+        The server does not honour this field. ``check_in_interval_days``
+        (``validate_license.rs:394-403``) matches on ``day``/``week``/
+        ``month``/``year`` — the same wrong vocabulary this SDK carried — so
+        no storable value matches any arm and ``_ => 30`` always wins: every
+        configured cadence is enforced as thirty days. Filed upstream as
+        ``tamga-api-internal#3``. The two bugs are independent; this SDK
+        reading the field correctly does not make the server act on it.
+    """
+
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    YEARLY = "yearly"
+
+    # Aliases, not distinct members: each shares its adverbial member's value,
+    # so `CheckInInterval.DAY is CheckInInterval.DAILY`. Kept for source
+    # compatibility with code written against 1.0.x.
+    DAY = "daily"
+    WEEK = "weekly"
+    MONTH = "monthly"
+    YEAR = "yearly"
+
+    @classmethod
+    def _missing_(cls, value: object) -> CheckInInterval | None:
+        """Resolve a wire value no member carries verbatim.
+
+        Lives on the enum rather than at the one call site that parses a
+        policy, so every construction path — a caller's own
+        ``CheckInInterval(raw)`` included — gets the same leniency.
+
+        Args:
+            value: Whatever ``CheckInInterval(...)`` was called with.
+
+        Returns:
+            The matching member for a legacy noun spelling or for casing and
+            whitespace noise, or ``None`` to let ``Enum`` raise ``ValueError``
+            for a cadence that is genuinely not one of the four.
+        """
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().lower()
+        normalized = _LEGACY_CHECK_IN_INTERVALS.get(normalized, normalized)
+        # Deliberately a scan rather than `cls(normalized)`: re-entering the
+        # constructor with a still-unknown value would recurse into here
+        # forever.
+        for member in cls:
+            if member.value == normalized:
+                return member
+        return None
 
 
 @dataclass(frozen=True)
@@ -176,7 +265,11 @@ class PolicyResource:
         overage_strategy: See gotcha above.
         heartbeat_cull_strategy: See ``HeartbeatCullStrategy``.
         heartbeat_resurrection_strategy: See gotcha above.
-        check_in_interval: See ``CheckInInterval``. ``None`` if check-in isn't required.
+        check_in_interval: See ``CheckInInterval``. ``None`` when the column is
+            unset, which is not the same as "check-in isn't required" — read
+            ``require_check_in`` for that. Wire values are adverbial
+            (``daily``, not ``day``); the enum accepts either spelling and
+            reports the adverbial one.
         require_check_in: Whether periodic check-in is required at all.
         scheme: See ``LicenseScheme``.
         expiration_strategy: One of ``EXPIRATION_STRATEGIES``.
@@ -364,6 +457,9 @@ class PolicyResource:
             else HeartbeatCullStrategy.DEACTIVATE_DEAD
         )
 
+        # No try/except here on purpose: the both-spellings leniency lives in
+        # `CheckInInterval._missing_`, so it applies to every construction of
+        # the enum rather than to this one call site.
         raw_check_in_interval = attributes.get("check_in_interval")
         check_in_interval = (
             CheckInInterval(raw_check_in_interval) if raw_check_in_interval is not None else None

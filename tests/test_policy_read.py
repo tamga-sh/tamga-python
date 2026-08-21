@@ -41,7 +41,7 @@ def _policy_data(**attribute_overrides: object) -> dict:
         "overage_strategy": "NO_OVERAGE",
         "heartbeat_cull_strategy": "DEACTIVATE_DEAD",
         "heartbeat_resurrection_strategy": "NO_REVIVE",
-        "check_in_interval": "day",
+        "check_in_interval": "daily",
         "require_check_in": True,
         "scheme": "ED25519_SIGN",
         "expiration_strategy": "RESTRICT_ACCESS",
@@ -71,7 +71,7 @@ def test_get_license_policy_request_shape_and_parsing(
     assert policy.heartbeat_duration == 120
     assert policy.require_heartbeat is True
     assert policy.machine_uniqueness_strategy == "UNIQUE_PER_ACCOUNT"
-    assert policy.check_in_interval is CheckInInterval.DAY
+    assert policy.check_in_interval is CheckInInterval.DAILY
     assert policy.overage_strategy is OverageStrategy.NO_OVERAGE
 
 
@@ -359,3 +359,50 @@ def test_policy_defaults_stay_backwards_compatible_for_positional_construction()
     assert policy.heartbeat_duration is None
     assert policy.require_heartbeat is False
     assert policy.machine_uniqueness_strategy == "UNIQUE_PER_LICENSE"
+
+
+@pytest.mark.parametrize(
+    ("wire_value", "expected"),
+    [
+        ("daily", CheckInInterval.DAILY),
+        ("weekly", CheckInInterval.WEEKLY),
+        ("monthly", CheckInInterval.MONTHLY),
+        ("yearly", CheckInInterval.YEARLY),
+    ],
+)
+def test_every_storable_check_in_cadence_survives_the_read(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    wire_value: str,
+    expected: CheckInInterval,
+) -> None:
+    # The regression this exists for: through 1.0.4 the enum carried
+    # `day`/`week`/`month`/`year`, so each of these four — the only values the
+    # column's CHECK constraint permits — raised ValueError out of get_policy
+    # and took the whole read down, heartbeat_duration included. Every earlier
+    # test used a policy with a null column, which is why it stayed invisible.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"data": _policy_data(check_in_interval=wire_value, require_check_in=True)}
+        )
+
+    client = make_client(handler)
+    policy = client.licenses.get_policy(LICENSE_ID)
+
+    assert policy.check_in_interval is expected
+    assert policy.require_check_in is True
+    # The rest of the resource has to come back too — the old failure was not
+    # a lost cadence, it was a lost policy.
+    assert policy.heartbeat_duration == 120
+
+
+def test_a_legacy_noun_cadence_on_the_wire_still_reads(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    # The server cannot store this, but a fixture, a proxy or a replayed
+    # recording can carry it. Accept it rather than failing the whole read.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": _policy_data(check_in_interval="week")})
+
+    client = make_client(handler)
+
+    assert client.licenses.get_policy(LICENSE_ID).check_in_interval is CheckInInterval.WEEKLY
