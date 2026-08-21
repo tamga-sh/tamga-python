@@ -47,8 +47,16 @@ class HeartbeatStatus(str, Enum):
     the status is on the wire there too, but that method returns only a
     ``tamga.proof.ProofResult`` and does not surface the machine.)
 
-    A machine *read* — ``GET /machines/{id}`` or the machine list — would also
-    report it, but this SDK version exposes neither.
+    **Genuinely, from a machine read.** ``TamgaClient.machines.get`` and
+    ``TamgaClient.machines.list`` are plain reads of the stored row with the
+    policy joined, so both report it truthfully as well — and unlike checkout
+    they need no signature verification to get at it.
+
+    ``machines.update`` (``PATCH``) is the awkward middle case: it writes, but
+    never to ``last_heartbeat_at``, so it *can* answer ``DEAD``. Its query does
+    not join the policy, though, so it judges staleness against the 600s
+    fallback rather than the policy's window. Read the machine back with
+    ``get`` when the verdict matters.
 
     Whatever the source, ``DEAD`` means only "the last ping is older than the
     window" — never "the row was deleted". The culling worker skips any policy
@@ -94,8 +102,14 @@ class MachineResource:
             client-side basis for a liveness decision that does not re-derive
             ``heartbeat_status``.
         next_heartbeat_at: Server's own estimate of the next ping deadline.
-            Trustworthy on the machine *read* routes, which join the policy —
-            **not** on the ping response, which does not.
+            Computed against the policy's window on the routes whose query joins
+            ``policies`` — ``machines.get``, ``machines.list``, check-out and
+            offline-proof — and against the 600s fallback on the ones that do
+            not: ``create``, ``ping_heartbeat``, ``reset_heartbeat`` and
+            ``update``. Two responses for the same machine seconds apart can
+            therefore disagree, and nothing on the wire says which kind you are
+            holding. Do not size a ping interval from it; read the policy and
+            use ``tamga.client.heartbeat_interval_for_policy``.
         last_check_out_at: When a machine file was last checked out.
         created: Creation timestamp.
         updated: Last-update timestamp.

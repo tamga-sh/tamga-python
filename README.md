@@ -59,8 +59,9 @@ Runnable end-to-end scripts live in [`examples/`](examples/):
   encrypted, through the full verify pipeline.
 - [`machine_activation_flow.py`](examples/machine_activation_flow.py) — create machine → validate
   → roll back on over-limit.
-- [`heartbeat_scheduler.py`](examples/heartbeat_scheduler.py) — machine (policy-driven window,
-  600s default) vs. process (30s window) heartbeat scheduling side by side.
+- [`heartbeat_scheduler.py`](examples/heartbeat_scheduler.py) — machine (window read from the
+  policy, 600s only as a fallback) vs. process (30s window) heartbeat scheduling side by side,
+  including disposing of the process row afterwards.
 - [`offline_proof.py`](examples/offline_proof.py) — air-gapped machine proof generation and
   verification.
 
@@ -113,6 +114,78 @@ expiry through the validation result instead.
 
 The host may be given with an explicit `http://` scheme for a self-hosted or local deployment —
 it is preserved, not silently upgraded. A bare host defaults to `https`.
+
+## Activating a machine and keeping it alive
+
+```python
+from tamga.client import HeartbeatScheduler
+
+with TamgaClient(config) as client:
+    # Idempotent: a repeat activation of the same fingerprint returns the
+    # machine that already exists instead of raising `409 FINGERPRINT_TAKEN`.
+    machine = client.machines.activate_machine_idempotent(license_id, fingerprint)
+
+    # Size the ping interval from the policy that actually sets the window.
+    # 600s is only what the server falls back to when `heartbeat_duration` is
+    # unset — a 120s policy needs a 40s ping, not the 200s default.
+    policy = client.licenses.get_policy(license_id)
+    HeartbeatScheduler.for_policy(client.machines, machine.id, policy).run_forever()
+```
+
+Read the policy through `licenses.get_policy(license_id)`, not `policies.get(policy_id)`: the
+former is gated on `license.read`, which a license key holds; the latter on `policy.read`, which
+it does not, so it answers `403` under license-key auth.
+
+`machines.get(machine_id)` is the read path where `heartbeat_status` is a genuine staleness
+verdict — the ping/reset/create routes each derive the status from a timestamp they just wrote, so
+they can never report `DEAD`. `DEAD` still never means the row was culled; only a `404` from the
+ping does.
+
+A process is the mirror image, because nothing on the server reaps process rows:
+
+```python
+from tamga.client import ProcessHeartbeatScheduler
+
+with TamgaClient(config) as client:
+    process = client.processes.create(machine.id, pid=str(os.getpid()))
+    # `dispose` on exit stops the loop *and* deletes the row, freeing its slot
+    # against `policy.max_processes` — `stop()` alone would leak it.
+    with ProcessHeartbeatScheduler(client.processes, process.id) as scheduler:
+        scheduler.run_forever()
+```
+
+## Checking for updates
+
+```python
+with TamgaClient(config) as client:
+    release = client.releases.check_for_upgrade(
+        product_id=product_id,
+        platform="darwin-arm64",
+        filetype="dmg",
+        version=__version__,
+    )
+
+if release is None:
+    # NOT "you are up to date". The server answers `204 No Content` both when
+    # nothing newer exists and when something newer exists that this license is
+    # not entitled to, deliberately, so that a denial cannot leak the latter.
+    print("No update is available to you.")
+else:
+    print("Update available:", release.version)
+```
+
+## Diagnosing a misconfigured deployment
+
+```python
+with TamgaClient(config) as client:
+    print(client.health())
+```
+
+`GET /v1/health` is the one route outside `/v1/accounts/{account_id}`, and it is exempt both from
+the auth gate and from the server's `Host`-header allowlist. So if every other call fails with
+`403` and *"The Host header does not match any configured host"* while this one succeeds, the
+problem is the server's `TAMGA_ALLOWED_HOSTS` configuration — not the caller's credential. If this
+one fails too, the server is unreachable and no credential would have helped.
 
 ## Offline verification
 
@@ -227,11 +300,22 @@ Machine files are format v2 as well:
   server answers `429`. `src/tamga/client.py::_retry_delay` prefers the server's `Retry-After`
   but caps it at 60s, otherwise using jittered exponential backoff so a fleet does not reconverge
   into the spike it was backing off from. `src/tamga/client.py::_is_retryable` scopes auto-retry
-  to every `GET` plus exactly five `POST` actions — `validate`, `validate-key`, `check-in`,
-  `check-out`, `ping` — because those are the calls a client makes on a timer. Creates are
+  to every `GET` plus exactly seven `POST` actions — `validate`, `validate-key`, `check-in`,
+  `check-out`, `ping`, `ping-heartbeat`, `reset-heartbeat` — because those are the calls a client
+  makes on a timer. (`ping-heartbeat` does **not** end with `/actions/ping`; that suffix matches
+  only the process route, so it needs its own entry.) Creates are
   deliberately excluded: retrying `POST /machines` risks burning a second seat. Tune with
   `TamgaConfig(max_retries=...)`; `0` disables retries and the raised
   `tamga.errors.RateLimitedError` still carries `retry_after`.
+- **The license read routes are not scoped to the calling license.** `licenses.get(license_id)`
+  and `licenses.get_policy(license_id)` reach `GET /licenses/{id}` and
+  `GET /licenses/{id}/policy`, which authorize on the `license.read` permission and the account
+  resolved from the bearer — and on nothing else. Any license key that authenticates can therefore
+  read *every* license in the same account, including each one's `attributes.key` in plain text.
+  Both methods are exposed because reading your own policy is how the heartbeat window is
+  discovered at all, but do not mistake the surface for a scoped one: never embed a license key in
+  a context where an attacker recovering it should not also be able to enumerate the account's
+  other keys. This is server-side behaviour the SDK cannot fix; it has been reported upstream.
 - **Verification failures stay uniform inside a step.** A wrong key, a malformed key, and a
   tampered message all collapse to one `InvalidSignature`
   (`src/tamga/crypto/ed25519.py::verify`). The steps themselves remain distinguishable on
@@ -256,26 +340,56 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
 - **No session-cookie transport.** Browser/portal only, out of scope here.
 - **No `Tamga-Environment` header.** No server code path reads it yet, so the SDK does not send
   it.
-- **No releases/auto-update sub-client.** The upgrade-check endpoint itself works (it is live and
-  public, answering `204 No Content` when you are already current) — this SDK simply does not wrap
-  it yet.
-- **No machine/policy/license read methods.** There is no `get_machine`, `list_machines`,
-  `get_license`, or `get_license_policy`, so a client cannot read the policy-correct heartbeat
-  window, and `activate_machine` cannot recover from `409 FINGERPRINT_TAKEN` by looking up the
-  existing machine — activation is not idempotent.
-- **`heartbeat_status` is only truthful on a checked-out machine file.** The three write-shaped
-  routes preclude `DEAD` by construction: a heartbeat ping reports the timestamp it just wrote
-  (always `ALIVE` or `RESURRECTED`), a reset nulls it (`NOT_STARTED`), and a create never sets it
-  (`NOT_STARTED`). Machine checkout is different — it resolves the row without writing to it, so
-  the status inside the signed payload is a genuine staleness verdict and
-  `tamga.checkout.machine_file.MachineFile.verify` hands it back on the returned `MachineResource`.
-  That is where to read a machine's real heartbeat state. A `DEAD` reading still never means the
-  row was deleted, so it is information rather than a stop condition: `HeartbeatScheduler` stops
-  for no status at all — only `stop()`, cancellation, or a `404` from the ping (the row is gone —
+- **`204` from the upgrade check has two meanings, and no client can tell them apart.**
+  `releases.check_for_upgrade` returns `None` both when nothing newer exists *and* when something
+  newer exists that this license is not entitled to. That is deliberate server-side — a denial
+  would leak "a newer version exists but you can't have it" — so report `None` as *no update is
+  available to you*, never as "you are up to date". A suspended license is a separate `403`.
+- **There is no exact fingerprint filter on `GET /machines`.** The server offers
+  `filter[license|owner|group|platform]` and a free-text `filter[q]`, and `filter[q]` is a
+  case-insensitive substring match across `name`, `hostname` *and* `fingerprint`, truncated to 200
+  characters. `machines.find_by_fingerprint` therefore narrows with the search and then compares
+  exactly client-side; both approximations run toward a superset, so it never returns a machine
+  with a different fingerprint, but it costs a scan rather than a lookup.
+- **A listed machine cannot be attributed to a license.** The machine resource carries no
+  `license_id` and no `relationships` object, so `filter[license]` on `machines.list` is the only
+  way to tie machines to a license. That matters for re-activation recovery: under
+  `UNIQUE_PER_POLICY` or `UNIQUE_PER_ACCOUNT` the machine behind a `409 FINGERPRINT_TAKEN` may
+  sit on a *different* license, which is why `find_by_fingerprint` searches account-wide by
+  default.
+- **`GET /policies/{id}` always fails under license-key auth.** It authorizes on the `policy.read`
+  permission, which is not in the license-token permission set. Read the policy through
+  `licenses.get_policy(license_id)` instead — same resource, but a route gated on `license.read`,
+  which a license credential does hold. `policies.get` exists for callers holding a privileged
+  token.
+- **The license read routes are not scoped to the calling license.** `GET /licenses/{id}` and
+  `GET /licenses/{id}/policy` authorize on `license.read` and the account resolved from the
+  bearer, and nothing further — so any license key that authenticates can read every license in
+  the same account, `attributes.key` included, in plain text. Server-side behaviour this SDK
+  cannot fix and does not work around; reported upstream.
+- **`policy.max_memory` and `policy.max_disk` are always `None`.** The server omits both from the
+  policy response even though it enforces them, so the only way to observe either limit is a
+  `TOO_MUCH_MEMORY` / `TOO_MUCH_DISK` validation code.
+- **`machines.update` cannot clear a field.** Every column is applied through
+  `COALESCE(new, existing)` server-side, so an omitted or `None` field means "leave alone", never
+  "set to null". Its response also judges `heartbeat_status`/`next_heartbeat_at` against the 600s
+  fallback rather than the policy window — that query does not join `policies`. Read the machine
+  back with `machines.get` when either field matters.
+- **Whether `heartbeat_status` can say `DEAD` depends on whether the server wrote or read.** The
+  write-shaped routes preclude it by construction: a heartbeat ping reports the timestamp it just
+  wrote (always `ALIVE` or `RESURRECTED`), a reset nulls it (`NOT_STARTED`), and a create never
+  sets it (`NOT_STARTED`). The read paths do not, so `machines.get`, `machines.list` and machine
+  checkout all carry a genuine staleness verdict. `PATCH` sits between the two: it writes, but
+  never to `last_heartbeat_at`, so it *can* report `DEAD` — just judged against the 600s fallback,
+  since that query does not join the policy. A `DEAD` reading still never means the row was
+  deleted, so it is information rather than a stop condition: `HeartbeatScheduler` stops for no
+  status at all — only `stop()`, cancellation, or a `404` from the ping (the row is gone —
   re-activate) ends the loop.
-- **No process delete.** Nothing reaps process rows server-side, so a crashed process holds its
-  slot against `policy.max_processes` until the row is deleted, and this SDK exposes no way to
-  delete it.
+- **Nothing reaps process rows server-side.** The 30s process window exists but no scheduled job
+  acts on it, so a process that merely stops pinging holds its slot against `policy.max_processes`
+  forever. Deleting it is the application's job: call `processes.delete`, or use
+  `ProcessHeartbeatScheduler.dispose` (or the scheduler as a context manager), which stops the
+  loop and deletes the row together.
 - **`reset_heartbeat` and `generate_offline_proof` always fail under license-key auth.** Both are
   role-gated (admin / developer / product token / environment token), so a license key gets `403`
   every time. `ping_heartbeat` is permission-only and works.

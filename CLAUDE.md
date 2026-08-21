@@ -32,15 +32,18 @@ src/tamga/
 ├── __init__.py         # public re-exports: TamgaClient, TamgaConfig, errors, __version__
 ├── py.typed             # PEP 561 marker
 ├── client.py             # TamgaClient façade + namespaced sub-clients (licenses/machines/
-│                         #   components/processes/entitlements) + all endpoint methods
-├── transport.py          # httpx wiring, 5 auth transports, header handling
+│                         #   components/processes/entitlements/policies/releases) + all
+│                         #   endpoint methods + the two heartbeat schedulers
+├── transport.py          # httpx wiring, 5 auth transports, header handling, URL builders
 ├── proof.py               # offline proof payload build + verify
 ├── errors.py               # TamgaError hierarchy, JSON:API error envelope parsing
 ├── models/
 │   ├── validation.py     # ValidationCode (24 members), ValidationMeta, ValidationResult
 │   ├── license.py        # LicenseResource, LicenseScope, LicenseFileResource
 │   ├── machine.py        # MachineResource, ComponentResource, ProcessResource, HeartbeatStatus
-│   └── policy.py         # PolicyResource + policy-derived enums, Entitlement
+│   ├── policy.py         # PolicyResource + policy-derived enums, Entitlement
+│   ├── release.py        # ReleaseResource (auto-update check)
+│   └── health.py         # HealthStatus — NOT a JSON:API resource, see below
 ├── crypto/
 │   ├── ed25519.py         # Ed25519 verify (license checkout, one of 4 machine-checkout schemes)
 │   ├── rsa.py              # RSA-PKCS1v15 + RSA-PSS verify (machine checkout, offline proof)
@@ -203,10 +206,56 @@ wrong — these replace it.
   so a negative `has_entitlement` is only authoritative below that ceiling. Entitlements carry an
   `inherited` flag, and `entitlements.get` resolves direct attachments only — it 404s for an
   inherited row, so list-then-get-each is not a valid pattern here.
-  `/machines/{id}/components` is different: keyset paging genuinely works there.
-- **Never omit `limit` on a list call.** The server defaults to 25 and exposes no `links` or
-  `meta.page`, so an omitted page size makes truncation indistinguishable from completion. Send
-  `MAX_PAGE_SIZE` and derive the cursor from that known value.
+  `/machines/{id}/components` and `/machines/{id}/processes` are different: keyset paging
+  genuinely works on both, and the cursor reaches the query.
+- **`GET /machines` is the one OFFSET-paginated route on this surface.** It takes `page[number]` /
+  `page[size]` (aliases `page` / `limit`), `sort`, `order`, and the filters
+  `filter[q|license|owner|group|platform]`, and answers with
+  `meta.page{number,size,total,totalPages}` — note the lone camelCase key in an otherwise
+  snake_case protocol. `machines.list` therefore returns `OffsetPage`, not `Page`: the keyset
+  `Page` synthesizes its cursor from `len(items) == limit`, which is wrong here and is exactly the
+  shape of the bug that made `list_all` loop forever. `page[after]` on this route is accepted and
+  ignored, and so is a page number on a keyset route.
+- **There is no exact fingerprint filter, and a machine carries no license id.**
+  `filter[q]` is a substring `ILIKE` over `name`/`hostname`/`fingerprint`, truncated to 200
+  characters, so `machines.find_by_fingerprint` narrows with it and then compares exactly in
+  Python — both approximations run toward a superset, so it never returns the wrong machine.
+  It searches account-wide by default because `machine_uniqueness_strategy` may be
+  `UNIQUE_PER_POLICY`/`UNIQUE_PER_ACCOUNT`, which puts the conflicting machine on another license;
+  and `MachineResource` serializes no `license_id` and no `relationships`, so a listed machine
+  cannot be attributed to a license from its own fields. The scan is bounded three ways
+  (`max_pages`, the server's `totalPages`, an empty page) and written as a `range`, not a `while`.
+- **Never omit `limit` on a keyset list call.** The server defaults to 25 and exposes no `links`
+  or `meta.page` there, so an omitted page size makes truncation indistinguishable from
+  completion. Send `MAX_PAGE_SIZE` and derive the cursor from that known value. `machines.list`
+  sends an explicit page size too, but for a different reason: `total` already makes truncation
+  visible, so it is about predictability rather than detection.
+- **`409 FINGERPRINT_TAKEN` is a re-activation, not a failure.** The server checks uniqueness
+  *before* the quota limits precisely so a repeat activation reports the conflict rather than
+  `MACHINE_LIMIT_EXCEEDED`; its comment reads "already activated, carry on".
+  `machines.activate_machine_idempotent` catches it and recovers the machine via
+  `find_by_fingerprint`. **That path must never validate-and-roll-back**: `activate_machine`
+  deletes the machine it created on an over-limit verdict, and doing that to a pre-existing row
+  would destroy a seat the caller never asked to touch.
+- **Nothing reaps process rows.** `DELETE /processes/{id}` exists and returns `204`; no scheduled
+  job calls anything equivalent, so a process that stops pinging holds its `max_processes` slot
+  forever. `processes.delete` is the raw route and `ProcessHeartbeatScheduler.dispose` pairs it
+  with `stop()` (tolerating an already-deleted row, propagating everything else) — `stop()` alone
+  leaks the slot, which is the whole reason `dispose` exists.
+- **The license read routes are not license-scoped.** `GET /licenses/{id}` and
+  `GET /licenses/{id}/policy` call `LicensePolicy.require_read` and nothing else — no
+  `require_license_scope` — so any authenticated license key reads every license in the account,
+  `attributes.key` in plain text included. The SDK cannot fix it; it must not describe the surface
+  as safe. Reported upstream.
+- **`/v1/health` is the only route outside `/v1/accounts/{account_id}`.** It is on the
+  public-route allowlist (`require_auth.rs:53`, pinned by the test at `:147`) and bypasses the
+  `Host`-header allowlist (`host_auth.rs:23`), and its handler returns a **bare**
+  `{status, version, uptime_secs}` — not a JSON:API document, so it must not go through
+  `parse_response`'s envelope unwrap. `transport.build_root_url` builds the account-less origin;
+  `TamgaClient.health` sends an absolute URL through the same client so it keeps the pool and the
+  429 backoff. Diagnostic value: health succeeding while everything else 403s with "The Host
+  header does not match any configured host" identifies a `TAMGA_ALLOWED_HOSTS` problem, not a bad
+  token.
 - **`429` is live and handled client-side.** The limiter buckets per `(caller, route pattern)`,
   and with proxy headers untrusted every caller shares one bucket per route — a fleet throttles
   itself on exactly the calls it makes on a timer. `client.py`'s `_request_with_retry` retries
@@ -222,12 +271,19 @@ wrong — these replace it.
 - **`Tamga-Environment` header is not implemented** (gap #7). Don't add it to `transport.py`'s
   request headers even though it's documented as a planned EE feature — no server code path reads
   it yet.
-- **The heartbeat window comes from the policy.** It is `policy.heartbeat_duration`, falling back
-  to 600s only when that column is unset — not a fixed constant. `HeartbeatScheduler`'s default
-  ~200s interval is sized against the *fallback*, so a policy with a shorter window needs an
-  explicit interval. Do not schedule off the ping response's `next_heartbeat_at`: that code path
-  does not join the policy. Reading the policy-correct value needs `GET /machines/{id}` or
-  `GET /licenses/{id}/policy`, neither of which this SDK exposes yet.
+- **The heartbeat window comes from the policy, and the SDK now reads it.** It is
+  `policy.heartbeat_duration`, falling back to 600s only when that column is unset — not a fixed
+  constant. `HeartbeatScheduler`'s default ~200s interval is sized against the *fallback*; use
+  `HeartbeatScheduler.for_policy(machines, machine_id, policy)` (window / 3, floored at 1s via
+  `heartbeat_interval_for_policy`) with a policy from `licenses.get_policy(license_id)`.
+  **Route matters:** `GET /policies/{id}` authorizes on `policy.read`, which is *not* in the
+  license-token permission set (`tamga-api/src/shared/authz/mod.rs:236-261`), so `policies.get`
+  403s under license-key auth; `GET /licenses/{id}/policy` authorizes on `license.read`, which is,
+  so `licenses.get_policy` works. Do not schedule off a response's `next_heartbeat_at`: it is
+  computed from whichever window the answering query joined, so create / ping-heartbeat /
+  reset-heartbeat / `PATCH /machines/{id}` all use the 600s fallback while `GET /machines/{id}`,
+  the machine list, check-out and offline-proof use the policy — and nothing on the wire says
+  which kind you are holding.
 - **The heartbeat loop must not stop on any status.** State the rule as the general one:
   `HeartbeatScheduler.run_forever` pings until `stop()`, until the runtime cancels it, or until
   the ping raises. It reads nothing off the response to decide whether to continue. Do not
@@ -244,8 +300,11 @@ wrong — these replace it.
   `NOT_STARTED` fallback for unrecognized values) onto the `MachineResource` that
   `MachineFile.verify` returns. So the enum member is live, not forward-compatibility ballast —
   never delete it or the `heartbeat_status` field. (`generate_offline_proof` resolves the machine
-  the same way, but this SDK returns only a `ProofResult` from it. `GET /machines/{id}` and the
-  machine list would also report it; neither is exposed yet — M11/M36.) `run_forever` used to
+  the same way, but this SDK returns only a `ProofResult` from it. `machines.get` and
+  `machines.list` are reads too and report it truthfully. `PATCH /machines/{id}` is the awkward
+  middle case: it writes, but never to `last_heartbeat_at`, so it *can* say `DEAD` — except its
+  `UPDATE ... RETURNING` does not join `policies`, so it judges against the 600s fallback.)
+  `run_forever` used to
   `break` on a `DEAD` response: unreachable on the ping route, and catastrophic if it ever had
   fired, since the break was permanent with nothing to restart the loop. A `DEAD` reading from
   *any* source still means only "last ping older than the window", never "row deleted" —
@@ -261,12 +320,18 @@ wrong — these replace it.
   is byte-identical either way. This SDK never sends `Origin` — keep it that way, and never add
   it to a non-cookie transport. When the write must happen, use `POST validate`
   (`validate_by_id`), which has no `Origin` branch.
-- **The auto-update / upgrade-check endpoint works.** `GET /releases/actions/upgrade` routes to a
-  live, public handler: `204 No Content` when already current, otherwise a `releases` resource.
-  The artifact download route exists too, though it is currently walled off by a permission gap.
-  The old note here claimed the endpoint 500s and forbade building against it — that was wrong.
-  There is still no `releases` sub-client (out of scope for this release, not impossible), and
-  RFC 9421 response signing genuinely is dead code.
+- **`204` from the upgrade check means two things, and the SDK must not collapse them.**
+  `GET /releases/actions/upgrade` is a live `OptionalAuth` handler taking four **required** query
+  params — `product`, `platform`, `filetype` (one word), `version` — plus optional `channel` and
+  `constraint`. It answers `204 No Content` both when nothing newer exists
+  (`upgrade_release.rs:62-63`) *and* when something newer exists that this license is not entitled
+  to (`:92-100`); the server's own comment says a denial in the second case would leak "a newer
+  release exists but you can't have it". `releases.check_for_upgrade` returns `None` for both and
+  documents it as *no update is available to you*, never "you are up to date" — there is no
+  client-side way to separate them and there should not be. A **suspended** license is a distinct
+  `403` (`:77-81`), not an ambiguous `204`. The artifact download route exists too, though it is
+  currently walled off by a permission gap. An older note here claimed the endpoint 500s and
+  forbade building against it — that was wrong. RFC 9421 response signing genuinely is dead code.
 - **`http://` hosts are preserved.** `build_base_url` upgrades a bare host to `https` but keeps an
   explicit `http://` scheme — a self-hosted deployment may serve plain HTTP, and rewriting the
   scheme made it unreachable with no useful diagnostic.

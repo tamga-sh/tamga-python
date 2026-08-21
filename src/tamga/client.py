@@ -72,8 +72,11 @@ T = TypeVar("T")
 #: Recommended machine heartbeat ping interval — roughly 1/3 of the server's
 #: *default* 600s heartbeat window. The window is not a constant: it comes from
 #: the license's ``policy.heartbeat_duration`` and only falls back to 600s when
-#: that column is unset, so a policy with a short window needs a
-#: correspondingly shorter interval passed explicitly to ``HeartbeatScheduler``.
+#: that column is unset, so a policy with a short window needs a correspondingly
+#: shorter interval. Do not compute one by hand — read the policy with
+#: ``TamgaClient.licenses.get_policy`` and build the scheduler with
+#: ``HeartbeatScheduler.for_policy``, which applies the same 1/3 rule to the
+#: window the policy actually sets.
 MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL: timedelta = timedelta(seconds=200)
 
 #: Recommended process heartbeat ping interval — well inside the server's
