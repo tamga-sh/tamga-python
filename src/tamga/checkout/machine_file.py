@@ -14,9 +14,37 @@ from license checkout (``tamga.checkout.license_file``):
    machine it was issued for. Both file types derive their key with
    HKDF-SHA256 (``tamga.crypto.hkdf``); they differ only in salt and
    ``info`` — here the ``info`` is the fingerprint.
-3. Machine-file ``alg`` values carry no ``+v2`` suffix. The format-v2 gate
-   and signed-``exp`` enforcement described in
-   ``tamga.checkout.license_file`` apply to ``.lic`` files only.
+3. An **encrypted** machine file's ``enc`` is ``"<nonce_b64>.<cipher_b64>"``:
+   two *separately* base64-encoded halves joined by a literal ``.``, not one
+   base64 blob of ``nonce ‖ ciphertext ‖ tag``. License files use the single
+   blob; machine files do not, so the two decryptors are not interchangeable.
+   See the "wire format" note below.
+
+**Format v2.** Machine-file ``alg`` values carry the same mandatory ``+v2``
+suffix license files do — ``base64+ed25519+v2``, ``aes-256-gcm+ecdsa-p256+v2``
+and so on — and a file whose ``alg`` lacks it is rejected with no fallback
+path. v1 machine files predate the signed ``meta`` claims, so their requested
+``ttl`` lived only in the JSON:API envelope *around* the certificate and a
+short-lived file stayed cryptographically valid forever. The signed
+``iat``/``exp``/``jti``/``kid`` claims are now inside the signature, and
+:meth:`MachineFile.verify` **enforces** ``exp`` exactly as
+``tamga.checkout.license_file`` does — same
+``CLOCK_SKEW_TOLERANCE_SECONDS``, same trusted-timestamp escape hatch, and an
+expiry surfaces as :class:`MachineFileExpired`, a subclass of
+``LicenseFileExpired`` so one ``except`` clause covers both file types.
+``exp`` is optional by design: a checkout made without a ``ttl`` produces a
+file with no ``exp`` that genuinely never expires, so an absent claim is not
+an error.
+
+⚠️ **Wire format of an encrypted ``enc``** (server:
+``src/shared/crypto/machine_file.rs`` -> ``FieldEncryption::encrypt``): the
+nonce and the ciphertext are base64-encoded *independently* and joined with a
+``.``; the ciphertext half already carries the appended 16-byte GCM tag. The
+signature covers the whole ``enc`` **string**, dot included, so the order is
+always: verify the signature, *then* split, *then* decode, *then* decrypt —
+never decode attacker-controlled bytes before authenticating them. Which
+branch to take is decided by ``alg``'s encoding prefix, never by whether a
+``.`` happens to be present.
 
 ⚠️ **``alg`` is not covered by the signature** (security-review note, Section
 F): the signature covers only ``enc``'s ASCII bytes (see the signing-message
@@ -39,18 +67,29 @@ never from this certificate's own unauthenticated ``alg`` string or any
 other untrusted input. Feeding an attacker-influenced ``scheme`` value in
 could force verification down a mismatched key-family path (the dispatch
 table itself is a closed, safe mapping — see ``_VERIFIERS`` — but only if
-``scheme`` itself is trustworthy).
+``scheme`` itself is trustworthy). ``alg``'s signing suffix cannot stand in
+for it even in principle: the server emits the identical ``rsa-sha256``
+suffix for both ``RSA_2048_PKCS1_SIGN`` and ``RSA_2048_JWT_RS256``, so the
+suffix does not identify a scheme. It is only ever cross-checked *against*
+the caller-supplied ``scheme`` — never used to select a verifier.
 """
 
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidSignature
 
 from tamga.checkout._envelope import parse_certificate_envelope
+from tamga.checkout.license_file import (
+    LicenseFileClaims,
+    LicenseFileExpired,
+    _enforce_expiry,
+    _parse_claims,
+)
 from tamga.crypto.aes_gcm import decrypt as aes_gcm_decrypt
 from tamga.crypto.ecdsa import verify_p256
 from tamga.crypto.ed25519 import verify as ed25519_verify
@@ -71,19 +110,35 @@ _GCM_TAG_LENGTH = 16
 
 _ENC_PREFIX_PLAIN = "base64"
 _ENC_PREFIX_ENCRYPTED = "aes-256-gcm"
-_SIGNING_SUFFIXES = frozenset({"ed25519", "rsa-sha256", "rsa-pss-sha256", "ecdsa-p256"})
+_ENC_SEPARATOR = "."
+_ALG_V2_MARKER = "v2"
+
+#: Server-side scheme -> ``alg`` signing-suffix mapping. **Not invertible**:
+#: the server maps `RSA_2048_JWT_RS256` to the same `rsa-sha256` suffix as
+#: `RSA_2048_PKCS1_SIGN`, which is precisely why a file's own `alg` can never
+#: identify its scheme and the caller must supply one.
+_SCHEME_TO_ALG_SUFFIX: dict[LicenseScheme, str] = {
+    LicenseScheme.ED25519_SIGN: "ed25519",
+    LicenseScheme.RSA_2048_PKCS1_SIGN: "rsa-sha256",
+    LicenseScheme.RSA_2048_PKCS1_PSS_SIGN: "rsa-pss-sha256",
+    LicenseScheme.ECDSA_P256_SIGN: "ecdsa-p256",
+}
+
+_SIGNING_SUFFIXES = frozenset(_SCHEME_TO_ALG_SUFFIX.values())
 
 #: Closed set of `alg` values the server can actually produce for a machine
-#: file (`{enc_prefix}+{signing_suffix}`, matching the server's own machine-file
-#: encoder and its scheme-to-`alg`-suffix mapping). Security-review finding M-1:
-#: `MachineFile.parse` previously accepted any `alg` string and `verify()`
-#: branched on a loose `"aes-256-gcm" in self.alg` substring check — both
-#: are now validated against this closed set at parse time, mirroring
-#: `LicenseFile`'s stricter `VALID_ALGORITHMS` check, so a corrupted `alg`
-#: (which is NOT covered by the signature — see module docstring) fails
-#: fast with a clear typed error instead of an opaque crypto exception.
+#: file (`{enc_prefix}+{signing_suffix}+v2`, matching the server's own
+#: machine-file encoder and its scheme-to-`alg`-suffix mapping).
+#: Security-review finding M-1: `MachineFile.parse` previously accepted any
+#: `alg` string and `verify()` branched on a loose `"aes-256-gcm" in self.alg`
+#: substring check — both are now validated against this closed set at parse
+#: time, mirroring `LicenseFile`'s stricter `VALID_ALGORITHMS` check, so a
+#: corrupted `alg` (which is NOT covered by the signature — see module
+#: docstring) fails fast with a clear typed error instead of an opaque crypto
+#: exception. The `+v2` marker is part of every member: the set previously
+#: omitted it, which rejected every file the server actually emits.
 VALID_ALGORITHMS: frozenset[str] = frozenset(
-    f"{prefix}+{suffix}"
+    f"{prefix}+{suffix}+{_ALG_V2_MARKER}"
     for prefix in (_ENC_PREFIX_PLAIN, _ENC_PREFIX_ENCRYPTED)
     for suffix in _SIGNING_SUFFIXES
 )
@@ -96,17 +151,97 @@ _VERIFIERS = {
 }
 
 
+class MachineFileExpired(LicenseFileExpired):
+    """The machine file's signature verified, but its signed ``exp`` has passed.
+
+    Subclasses ``tamga.checkout.license_file.LicenseFileExpired`` on purpose:
+    both offline file types carry the same signed ``meta.exp`` claim and a
+    caller wants the same reaction to it — "fetch a fresh one", as opposed to
+    the "forged or corrupt" reaction an ``InvalidSignature``/``ValueError``
+    calls for. A single ``except LicenseFileExpired:`` therefore covers both,
+    while the distinct type is still available for callers that want to tell
+    which file expired.
+    """
+
+    def __init__(self, exp: int) -> None:
+        """Initialize with the signed ``exp`` claim (Unix timestamp) that failed the check."""
+        super().__init__(exp, file_kind="machine file")
+
+
+def _validate_alg(alg: str) -> tuple[str, str]:
+    """Validate a machine-file ``alg`` and split it into its parts.
+
+    The encoding prefix is everything before the **first** ``+`` and the
+    ``v2`` marker is everything after the **last** one; whatever sits between
+    them is the signing suffix. Splitting any other way mis-reads the two
+    hyphenated encoding prefixes and suffixes the server emits
+    (``aes-256-gcm``, ``rsa-pss-sha256``, ``ecdsa-p256``).
+
+    Args:
+        alg: The raw ``alg`` string from the certificate's outer envelope.
+
+    Returns:
+        ``(encoding_prefix, signing_suffix)``, both known-good members of the
+        closed ``VALID_ALGORITHMS`` vocabulary.
+
+    Raises:
+        ValueError: If ``alg`` lacks the mandatory ``+v2`` marker (a pre-v2
+            file, refused with no fallback) or is outside
+            ``VALID_ALGORITHMS``.
+    """
+    prefix, first_sep, remainder = alg.partition("+")
+    suffix, last_sep, marker = remainder.rpartition("+")
+    if not first_sep or not last_sep or marker != _ALG_V2_MARKER:
+        raise ValueError(
+            f"unsupported machine file algorithm: {alg!r} — missing the mandatory "
+            f"'+{_ALG_V2_MARKER}' marker (this looks like a pre-v2 file, which is "
+            "refused because its expiry was never covered by the signature)"
+        )
+    if alg not in VALID_ALGORITHMS:
+        raise ValueError(
+            f"unsupported machine file algorithm: {alg!r} "
+            f"(expected one of {sorted(VALID_ALGORITHMS)})"
+        )
+    return prefix, suffix
+
+
+def _b64decode_strict(value: str, what: str) -> bytes:
+    """Base64-decode one already-authenticated piece of ``enc``.
+
+    Strict about the alphabet (so a stray ``.`` or whitespace is an error
+    rather than silently skipped, which is how a dot-separated ``enc`` fed to
+    a single non-validating decode turns into plausible-looking garbage), but
+    tolerant of absent ``=`` padding.
+
+    Args:
+        value: The base64 text to decode.
+        what: Name of the piece, used in the error message.
+
+    Returns:
+        The decoded bytes.
+
+    Raises:
+        ValueError: If ``value`` is not valid base64.
+    """
+    padding = "=" * (-len(value) % 4)
+    try:
+        return base64.b64decode(value + padding, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"malformed machine file: {what} is not valid base64") from exc
+
+
 @dataclass(frozen=True)
 class MachineFile:
     """A parsed (but not yet verified) machine file.
 
     Attributes:
-        enc: The base64 payload string (signing-message gotcha applies here
-            exactly as it does for ``LicenseFile`` — see
-            ``tamga.checkout.license_file``).
+        enc: The payload string (signing-message gotcha applies here exactly
+            as it does for ``LicenseFile`` — see
+            ``tamga.checkout.license_file``). Base64 for a plain file;
+            ``"<nonce_b64>.<cipher_b64>"`` for an encrypted one.
         sig: The base64-decoded raw signature bytes.
-        alg: Algorithm string, e.g. ``"base64+ed25519"`` or an
-            RSA/ECDSA-flavored equivalent.
+        alg: Algorithm string, e.g. ``"base64+ed25519+v2"`` or an
+            RSA/ECDSA-flavored equivalent. Always carries the ``+v2`` marker.
     """
 
     enc: str
@@ -129,18 +264,15 @@ class MachineFile:
 
         Raises:
             ValueError: On malformed markers, invalid base64/JSON, or an
-                ``alg`` value outside ``VALID_ALGORITHMS`` (security-review
+                ``alg`` value outside ``VALID_ALGORITHMS`` — including one
+                missing the mandatory ``+v2`` marker (security-review
                 hardening — see module docstring's "``alg`` is not covered
                 by the signature" note). At verify time, an
                 unrecognized/rejected ``scheme`` instead raises
                 ``tamga.errors.SchemeNotSupportedError``.
         """
         enc, sig_bytes, alg = parse_certificate_envelope(certificate, PEM_HEADER, PEM_FOOTER)
-        if alg not in VALID_ALGORITHMS:
-            raise ValueError(
-                f"unsupported machine file algorithm: {alg!r} "
-                f"(expected one of {sorted(VALID_ALGORITHMS)})"
-            )
+        _validate_alg(alg)
         return cls(enc=enc, sig=sig_bytes, alg=alg)
 
     def verify(
@@ -149,6 +281,7 @@ class MachineFile:
         scheme: LicenseScheme,
         license_key: str | None = None,
         fingerprint: str | None = None,
+        now: int | None = None,
     ) -> MachineResource:
         """Run the full verification pipeline and return the embedded machine.
 
@@ -164,11 +297,24 @@ class MachineFile:
         If the file is encrypted, both ``license_key`` and ``fingerprint``
         are required to derive the HKDF-based decryption key.
 
+        The signed ``meta.exp`` claim is enforced once the signature passes —
+        that enforcement is not opt-in. An authentic file whose ``exp`` has
+        gone by raises :class:`MachineFileExpired` rather than returning a
+        resource, so "expired, fetch a fresh one" stays distinguishable from
+        "forged or corrupt".
+
         Args:
             public_key: Public key bytes/PEM matching ``scheme``'s algorithm family.
             scheme: The license's signing scheme, driving verifier dispatch.
+                Must come from an authenticated response, never from this
+                file's own ``alg`` — see the module docstring.
             license_key: Required only if the file is encrypted.
             fingerprint: Required only if the file is encrypted.
+            now: Current Unix timestamp, used for the ``exp`` check. Defaults
+                to the system clock. Pass a server-supplied timestamp instead
+                if you are defending against a user winding their clock back
+                to revive an expired file — the same escape hatch
+                ``LicenseFile.verify`` offers, for the same reason.
 
         Returns:
             The verified, embedded ``MachineResource``. Note its
@@ -185,7 +331,53 @@ class MachineFile:
                 ``RSA_2048_JWT_RS256`` or otherwise unrecognized.
             cryptography.exceptions.InvalidSignature: If signature verification fails.
             cryptography.exceptions.InvalidTag: If AES-256-GCM authentication fails.
+            MachineFileExpired: If the file is authentic but its signed
+                ``exp`` claim has passed (beyond the 60s skew tolerance).
+            ValueError: If ``alg`` is corrupt, the file is encrypted but no
+                ``license_key``/``fingerprint`` was supplied, or the payload
+                is malformed / missing its signed ``meta`` claims.
         """
+        machine, _ = self._verify(public_key, scheme, license_key, fingerprint, now)
+        return machine
+
+    def verify_with_claims(
+        self,
+        public_key: bytes,
+        scheme: LicenseScheme,
+        license_key: str | None = None,
+        fingerprint: str | None = None,
+        now: int | None = None,
+    ) -> tuple[MachineResource, LicenseFileClaims]:
+        """As :meth:`verify`, also returning the signed claims.
+
+        Use this when you want ``jti`` for replay detection or ``kid`` for
+        key-rotation bookkeeping. Expiry is enforced either way — it is not
+        opt-in. The claims are the same ``LicenseFileClaims`` shape the
+        ``.lic`` path returns; the server builds both from one struct.
+
+        Args:
+            public_key: Public key bytes/PEM matching ``scheme``'s algorithm family.
+            scheme: The license's signing scheme, driving verifier dispatch.
+            license_key: Required only if the file is encrypted.
+            fingerprint: Required only if the file is encrypted.
+            now: Current Unix timestamp; see :meth:`verify`.
+
+        Returns:
+            ``(machine, claims)`` — the verified ``MachineResource`` and the
+            signed ``iat``/``exp``/``jti``/``kid`` claims that travelled
+            inside the signature.
+        """
+        return self._verify(public_key, scheme, license_key, fingerprint, now)
+
+    def _verify(
+        self,
+        public_key: bytes,
+        scheme: LicenseScheme,
+        license_key: str | None,
+        fingerprint: str | None,
+        now: int | None,
+    ) -> tuple[MachineResource, LicenseFileClaims]:
+        """Shared verification pipeline behind :meth:`verify`/:meth:`verify_with_claims`."""
         # Reject up front, before touching any parsing/crypto — never let
         # RSA_2048_JWT_RS256 fall through to a different verifier.
         verifier = _VERIFIERS.get(scheme)
@@ -196,34 +388,36 @@ class MachineFile:
                 detail=f"scheme {scheme!r} is not supported for machine file checkout",
             )
 
+        # Re-validate rather than trusting `parse()` to have run: this
+        # dataclass is constructible directly.
+        enc_prefix, alg_suffix = _validate_alg(self.alg)
+
+        # Cross-check only, in the safe direction: scheme -> expected suffix.
+        # Never suffix -> scheme; `rsa-sha256` maps back to two schemes, so
+        # that direction does not exist. `scheme` stays authoritative.
+        if alg_suffix != _SCHEME_TO_ALG_SUFFIX[scheme]:
+            raise ValueError(
+                f"machine file algorithm {self.alg!r} does not match the license's "
+                f"scheme {scheme.value} (expected signing suffix "
+                f"{_SCHEME_TO_ALG_SUFFIX[scheme]!r}, got {alg_suffix!r})"
+            )
+
         # ⚠️ Same signing-message gotcha as LicenseFile.verify: the ASCII
-        # STRING bytes of `enc`, never its decoded bytes.
+        # STRING bytes of `enc`, never its decoded bytes. This runs BEFORE
+        # any split/decode/decrypt — nothing attacker-controlled is decoded
+        # until it has been authenticated.
         message_bytes = self.enc.encode("ascii")
         if not verifier(public_key, message_bytes, self.sig):
             raise InvalidSignature("machine file signature verification failed")
 
-        payload_bytes = base64.b64decode(self.enc)
-
-        # Exact prefix match against the closed alg vocabulary validated in
-        # `parse()` — no longer a bare substring check (security-review
-        # hardening, finding M-1).
-        if self.alg.startswith(f"{_ENC_PREFIX_ENCRYPTED}+"):
-            if license_key is None or fingerprint is None:
-                raise ValueError(
-                    "license_key and fingerprint are both required to decrypt "
-                    "an encrypted machine file"
-                )
-            if len(payload_bytes) < _NONCE_LENGTH + _GCM_TAG_LENGTH:
-                raise ValueError(
-                    "malformed encrypted machine file payload: too short to "
-                    f"contain a {_NONCE_LENGTH}-byte nonce and {_GCM_TAG_LENGTH}-byte GCM tag"
-                )
-            nonce = payload_bytes[:_NONCE_LENGTH]
-            ciphertext_and_tag = payload_bytes[_NONCE_LENGTH:]
-            key = derive_machine_file_key(license_key, fingerprint)
-            plaintext = aes_gcm_decrypt(key, nonce, ciphertext_and_tag)
+        # Exact prefix match against the closed alg vocabulary validated
+        # above — no longer a bare substring check (security-review
+        # hardening, finding M-1). Branch on the prefix, never on whether a
+        # `.` happens to appear in `enc`.
+        if enc_prefix == _ENC_PREFIX_ENCRYPTED:
+            plaintext = self._decrypt(license_key, fingerprint)
         else:
-            plaintext = payload_bytes
+            plaintext = _b64decode_strict(self.enc, "payload")
 
         # SECURITY/robustness: same class of gap as license_file.py's verify()
         # -- without this wrapping, a malformed plaintext leaks a raw
@@ -237,6 +431,18 @@ class MachineFile:
             data = parsed["data"]
         except (KeyError, TypeError) as exc:
             raise ValueError("malformed machine file: payload is missing the 'data' key") from exc
+        # Without this, a `data` that is a list/string reaches `data.get(...)`
+        # below and raises AttributeError -- outside every documented `Raises:`
+        # on verify(). Found by the security-reviewer pass.
+        if not isinstance(data, dict):
+            raise ValueError("malformed machine file: payload's 'data' is not a JSON object")
+
+        # The signature only establishes that the file is authentic. Without
+        # this, verifying it would say nothing about whether it is still
+        # valid — the v1 behaviour format v2 exists to close.
+        claims = _parse_claims(parsed, file_kind="machine file")
+        _enforce_expiry(claims, now, expired_error=MachineFileExpired)
+
         attributes = data.get("attributes", {})
 
         # SECURITY/robustness: an unrecognized heartbeat_status (a future
@@ -252,7 +458,7 @@ class MachineFile:
         except ValueError:
             heartbeat_status = HeartbeatStatus.NOT_STARTED
 
-        return MachineResource(
+        machine = MachineResource(
             id=data["id"],
             fingerprint=attributes.get("fingerprint", ""),
             name=attributes.get("name"),
@@ -265,3 +471,39 @@ class MachineFile:
             metadata=attributes.get("metadata", {}) or {},
             heartbeat_status=heartbeat_status,
         )
+        return machine, claims
+
+    def _decrypt(self, license_key: str | None, fingerprint: str | None) -> bytes:
+        """Split, decode and AES-256-GCM-open an already-authenticated ``enc``.
+
+        ``enc`` is ``"<nonce_b64>.<cipher_b64>"``: two independently
+        base64-encoded halves, with the 16-byte GCM tag already appended to
+        the ciphertext half. Decoding the whole string in one pass and
+        slicing 12 bytes off the front is the mis-reading this format
+        invites — Python's non-validating base64 decoder silently drops the
+        ``.`` and yields convincing garbage instead of failing.
+        """
+        if license_key is None or fingerprint is None:
+            raise ValueError(
+                "license_key and fingerprint are both required to decrypt an encrypted machine file"
+            )
+        nonce_b64, separator, cipher_b64 = self.enc.partition(_ENC_SEPARATOR)
+        if not separator or _ENC_SEPARATOR in cipher_b64:
+            raise ValueError(
+                "malformed encrypted machine file payload: expected exactly one "
+                f"{_ENC_SEPARATOR!r}-separated '<nonce_b64>.<ciphertext_b64>' pair"
+            )
+        nonce = _b64decode_strict(nonce_b64, "nonce")
+        ciphertext_and_tag = _b64decode_strict(cipher_b64, "ciphertext")
+        if len(nonce) != _NONCE_LENGTH:
+            raise ValueError(
+                f"malformed encrypted machine file payload: nonce is {len(nonce)} bytes, "
+                f"expected {_NONCE_LENGTH}"
+            )
+        if len(ciphertext_and_tag) < _GCM_TAG_LENGTH:
+            raise ValueError(
+                "malformed encrypted machine file payload: ciphertext is too short to "
+                f"contain a {_GCM_TAG_LENGTH}-byte GCM tag"
+            )
+        key = derive_machine_file_key(license_key, fingerprint)
+        return aes_gcm_decrypt(key, nonce, ciphertext_and_tag)

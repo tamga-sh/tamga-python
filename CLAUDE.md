@@ -97,11 +97,34 @@ individually; see `.github/workflows/ci.yml` for the exact order
   zero-pad/truncate license-file transform and the `crypto/naive_key.py` module that implemented
   it are **removed, not deprecated** — do not reintroduce either, and treat any doc or comment
   still describing a "naive"/non-KDF license-file key as stale.
-- **Format v2 only (license checkout).** `alg` must be `base64+ed25519+v2` or
-  `aes-256-gcm+ed25519+v2`; `LicenseFile.parse` rejects anything else, and `LicenseFile.verify`
-  enforces the signed `meta.exp` claim with a 60s clock-skew tolerance. There is deliberately no
-  v1 fallback — accepting a v1 file would restore the bug v2 exists to close (the requested TTL
-  lived outside the signature, so a trial file was valid forever).
+- **Format v2 only — for BOTH file types.** License checkout: `alg` must be
+  `base64+ed25519+v2` or `aes-256-gcm+ed25519+v2`. Machine checkout: `alg` must be
+  `{base64|aes-256-gcm}+{ed25519|ecdsa-p256|rsa-sha256|rsa-pss-sha256}+v2` — eight values, and
+  the `+v2` marker is mandatory there too. Both `parse`s reject anything else and both `verify`s
+  enforce the signed `meta.exp` claim through the *same* `_enforce_expiry` and the *same*
+  `CLOCK_SKEW_TOLERANCE_SECONDS` (60s); do not define a second constant, or the two file types
+  silently drift to different grace periods. Machine-file expiry raises `MachineFileExpired`,
+  a subclass of `LicenseFileExpired` so one `except` covers both. There is deliberately no v1
+  fallback — accepting a v1 file would restore the bug v2 exists to close (the requested TTL
+  lived outside the signature, so a trial file was valid forever). `exp` itself is optional: a
+  checkout made without a `ttl` produces a file with no `exp` that never expires, and an absent
+  claim is not an error.
+- **`alg` parsing: split at the FIRST `+` and the LAST `+`.** The encoding prefix
+  (`aes-256-gcm`) and two of the four signing suffixes (`rsa-pss-sha256`, `ecdsa-p256`) contain
+  hyphens, and both bracket a `+v2` marker, so a fixed index or a `split_once`-then-compare gets
+  it wrong. **The signing suffix cannot identify the scheme**: the server emits `rsa-sha256` for
+  both `RSA_2048_PKCS1_SIGN` and `RSA_2048_JWT_RS256`. `scheme` comes from the license via an
+  authenticated response and is authoritative; `alg` is only ever cross-checked against it.
+- **An encrypted machine file's `enc` is `"<nonce_b64>.<cipher_b64>"`.** Two *separately*
+  base64'd halves joined by a literal `.`; the ciphertext half already includes the 16-byte GCM
+  tag. A `.lic` file is the other layout — one `base64(nonce ‖ ciphertext ‖ tag)` blob — so the
+  two decryptors are not interchangeable, and the server's own doc comment on
+  `machine_file.rs:59` describing the blob layout for machine files is **stale and wrong**
+  (reported upstream as `tamga-api-internal#2`; trust the code at `:79-84`). Python hid this for
+  two years: `base64.b64decode` silently drops the `.` and `nonce_b64` is always 16 chars — a
+  whole number of 4-char blocks — so the single-blob decode happened to produce the same bytes.
+  Decode each half strictly (`validate=True`) and check its length. Order is load-bearing:
+  verify the signature, *then* split, *then* decode, *then* decrypt.
 - **Byte-exact serialization (offline proof).** The RSA signature over an offline-proof payload
   covers `{"account":{...},"machine":{...},"dataset":...}` serialized in exactly that key order.
   Field *presence* matching isn't enough — reordering the same fields into valid-but-different JSON
@@ -263,6 +286,14 @@ wrong — these replace it.
 - The three crypto-bearing areas — license checkout, machine checkout, offline proof — require a
   **mandatory, non-skippable** `security-reviewer` pass before merge. A `python-reviewer`-only pass
   is not sufficient for them.
+- **Never prove a wire format with a fixture this SDK generated.** `tests/fixtures/machine_files/`
+  holds certificates produced by the *server's* `encode_machine_file`, indexed by a
+  `manifest.json` that `tests/test_machine_file_fixtures.py` iterates — add a fixture by dropping
+  the file and its manifest entry in, not by editing tests. Machine-file verification was broken
+  in all eight SDKs for two years precisely because every repo round-tripped through its own
+  encoder, so CI stayed green while nothing the server emitted could be opened. Self-signed
+  certificates remain fine for *post-authentication* robustness tests (see
+  `tests/test_checkout_hardening.py`) — a different question from "does the wire format match".
 - Golden-byte/known-answer tests matter more than structural-equality tests for the crypto paths —
   e.g. the offline-proof payload test must assert an exact expected byte string, and the HKDF
   derivation test must assert an exact 32-byte key for a fixed input, not just "produces 32 bytes".

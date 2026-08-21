@@ -25,6 +25,17 @@ from tamga.crypto.hkdf import derive_machine_file_key
 from tamga.errors import SchemeNotSupportedError, TtlInvalidError
 from tamga.models.policy import LicenseScheme
 
+#: The signed `meta` claims a format-v2 certificate carries. `exp` is absent
+#: on purpose -- a checkout made without a `ttl` produces a file that never
+#: expires -- so these round-trip tests stay about signatures and key
+#: derivation. Expiry enforcement is exercised against the server-produced
+#: fixtures in test_machine_file_fixtures.py.
+V2_CLAIMS = {
+    "iat": 1700000000,
+    "jti": "018f2f3a-0000-7000-8000-0000000000bb",
+    "kid": "0123456789abcdef",
+}
+
 MACHINE_DATA = {
     "data": {
         "id": "018f2f3a-0000-7000-8000-000000000040",
@@ -33,7 +44,8 @@ MACHINE_DATA = {
             "fingerprint": "test-machine-fingerprint-abc123",
             "heartbeat_status": "NOT_STARTED",
         },
-    }
+    },
+    "meta": V2_CLAIMS,
 }
 
 
@@ -76,6 +88,8 @@ def _public_key_bytes(scheme: LicenseScheme, public_key) -> bytes:  # type: igno
 #: Maps a scheme to its `alg` signing-suffix, matching the server's own
 #: scheme-to-`alg`-suffix mapping — needed so test fixtures produce an `alg`
 #: value MachineFile.parse's closed `VALID_ALGORITHMS` set actually accepts.
+#: Note `rsa-sha256` is what the server emits for RSA_2048_JWT_RS256 too, so
+#: this mapping is not invertible — see MachineFile's module docstring.
 _ALG_SUFFIX = {
     LicenseScheme.ED25519_SIGN: "ed25519",
     LicenseScheme.RSA_2048_PKCS1_SIGN: "rsa-sha256",
@@ -89,7 +103,7 @@ def _make_plain_certificate(scheme: LicenseScheme, private_key, payload: dict) -
     enc = base64.b64encode(payload_json.encode("utf-8")).decode("ascii")
     sig_bytes = _SIGNERS[scheme](private_key, enc.encode("ascii"))
     sig = base64.b64encode(sig_bytes).decode("ascii")
-    cert = {"enc": enc, "sig": sig, "alg": f"base64+{_ALG_SUFFIX[scheme]}"}
+    cert = {"enc": enc, "sig": sig, "alg": f"base64+{_ALG_SUFFIX[scheme]}+v2"}
     body = base64.b64encode(json.dumps(cert).encode("utf-8")).decode("ascii")
     return f"{PEM_HEADER}\n{body}\n{PEM_FOOTER}"
 
@@ -102,10 +116,16 @@ def _make_encrypted_certificate(
     aesgcm = AESGCM(key)
     nonce = os.urandom(12)
     ciphertext_and_tag = aesgcm.encrypt(nonce, payload_json.encode("utf-8"), None)
-    enc = base64.b64encode(nonce + ciphertext_and_tag).decode("ascii")
+    # `<nonce_b64>.<cipher_b64>` -- two separately base64-encoded halves, the
+    # format the server's FieldEncryption::encrypt actually emits. NOT
+    # base64(nonce || ciphertext || tag), which is the license-file layout.
+    enc = (
+        f"{base64.b64encode(nonce).decode('ascii')}."
+        f"{base64.b64encode(ciphertext_and_tag).decode('ascii')}"
+    )
     sig_bytes = _SIGNERS[scheme](private_key, enc.encode("ascii"))
     sig = base64.b64encode(sig_bytes).decode("ascii")
-    cert = {"enc": enc, "sig": sig, "alg": f"aes-256-gcm+{_ALG_SUFFIX[scheme]}"}
+    cert = {"enc": enc, "sig": sig, "alg": f"aes-256-gcm+{_ALG_SUFFIX[scheme]}+v2"}
     body = base64.b64encode(json.dumps(cert).encode("utf-8")).decode("ascii")
     return f"{PEM_HEADER}\n{body}\n{PEM_FOOTER}"
 
@@ -174,7 +194,11 @@ def test_parse_rejects_alg_outside_closed_vocabulary() -> None:
     should fail fast with a clear `ValueError`, not an opaque crypto
     exception surfaced later from `verify()`.
     """
-    cert = {"enc": "abc", "sig": base64.b64encode(b"sig").decode(), "alg": "base64+not-a-real-alg"}
+    cert = {
+        "enc": "abc",
+        "sig": base64.b64encode(b"sig").decode(),
+        "alg": "base64+not-a-real-alg+v2",
+    }
     body = base64.b64encode(json.dumps(cert).encode()).decode()
     certificate = f"{PEM_HEADER}\n{body}\n{PEM_FOOTER}"
     with pytest.raises(ValueError, match="unsupported machine file algorithm"):
@@ -281,7 +305,7 @@ def test_client_check_out_post_variant_returns_structured_resource(
                         "certificate": (
                             "-----BEGIN MACHINE FILE-----\n...\n-----END MACHINE FILE-----"
                         ),
-                        "algorithm": "base64+ed25519",
+                        "algorithm": "base64+ed25519+v2",
                         "includes": [],
                         "ttl": None,
                         "expiry": None,
@@ -294,7 +318,7 @@ def test_client_check_out_post_variant_returns_structured_resource(
     client = make_client(handler)
     result = client.machines.check_out(MACHINE_ID)
     assert not isinstance(result, bytes)
-    assert result.algorithm == "base64+ed25519"
+    assert result.algorithm == "base64+ed25519+v2"
 
 
 def test_client_check_out_get_variant_returns_raw_bytes(

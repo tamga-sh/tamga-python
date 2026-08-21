@@ -68,11 +68,23 @@ class LicenseFileExpired(ValueError):
     Distinct from a signature failure on purpose: a caller that cannot tell
     "expired" from "forged" either warns the user about tampering when their
     trial merely ended, or treats a forgery as a renewal prompt.
+
+    Machine files carry the same signed ``meta.exp`` claim and reuse this
+    outcome through the
+    ``tamga.checkout.machine_file.MachineFileExpired`` subclass, so a single
+    ``except LicenseFileExpired:`` covers both offline file types.
     """
 
-    def __init__(self, exp: int) -> None:
-        """Initialize with the signed ``exp`` claim (Unix timestamp) that failed the check."""
-        super().__init__(f"license file expired at unix timestamp {exp}")
+    def __init__(self, exp: int, *, file_kind: str = "license file") -> None:
+        """Initialize with the signed ``exp`` claim (Unix timestamp) that failed the check.
+
+        Args:
+            exp: The signed ``exp`` claim that failed the check.
+            file_kind: Human-readable file type used in the message. Only the
+                ``MachineFileExpired`` subclass overrides it; the default
+                keeps this class's own message unchanged.
+        """
+        super().__init__(f"{file_kind} expired at unix timestamp {exp}")
         self.exp = exp
 
 
@@ -299,19 +311,33 @@ class LicenseFile:
         return expiry_dt < reference
 
 
-def _parse_claims(parsed: object) -> LicenseFileClaims:
+def _parse_claims(parsed: object, *, file_kind: str = "license file") -> LicenseFileClaims:
     """Pull the signed ``meta`` claims out of a decoded payload.
 
     A payload with no ``meta`` is a v1 file. The ``alg`` gate should have
     caught it already; this is the second line, so a file cannot reach the
     expiry check with nothing to check.
+
+    Shared with ``tamga.checkout.machine_file``: the server builds a machine
+    file's ``meta`` from the very same ``LicenseFileClaims`` struct, so both
+    file types parse identically and only the wording of the error differs.
+
+    Args:
+        parsed: The decoded (and already signature-verified) payload.
+        file_kind: Human-readable file type used in error messages.
+
+    Returns:
+        The parsed claims.
+
+    Raises:
+        ValueError: If ``meta`` is absent or malformed.
     """
     if not isinstance(parsed, dict):
-        raise ValueError("malformed license file: payload is not a JSON object")
+        raise ValueError(f"malformed {file_kind}: payload is not a JSON object")
     meta = parsed.get("meta")
     if not isinstance(meta, dict):
         raise ValueError(
-            "malformed license file: payload is missing the signed 'meta' claims "
+            f"malformed {file_kind}: payload is missing the signed 'meta' claims "
             "(this looks like a pre-v2 file)"
         )
     try:
@@ -321,14 +347,35 @@ def _parse_claims(parsed: object) -> LicenseFileClaims:
             kid=str(meta["kid"]),
             exp=int(meta["exp"]) if meta.get("exp") is not None else None,
         )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"malformed license file: bad 'meta' claims ({exc})") from exc
+    # OverflowError is in the tuple because json.loads accepts the non-standard
+    # `Infinity`/`-Infinity` tokens by default, and int(float("inf")) raises it
+    # rather than ValueError -- which would escape every documented `Raises:
+    # ValueError` on the two verify() methods. (NaN already lands on ValueError.)
+    # Found by the security-reviewer pass on the machine-file v2 work.
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"malformed {file_kind}: bad 'meta' claims ({exc})") from exc
 
 
-def _enforce_expiry(claims: LicenseFileClaims, now: int | None) -> None:
-    """Reject a file whose signed ``exp`` has passed."""
+def _enforce_expiry(
+    claims: LicenseFileClaims,
+    now: int | None,
+    *,
+    expired_error: type[LicenseFileExpired] = LicenseFileExpired,
+) -> None:
+    """Reject a file whose signed ``exp`` has passed.
+
+    ``exp`` is optional by design — a checkout made without a ``ttl`` produces
+    a file that genuinely never expires — so an absent claim is not an error.
+
+    Args:
+        claims: The signed claims taken from the verified payload.
+        now: Caller-supplied Unix timestamp, or ``None`` to read the local
+            clock. The local clock is attacker-controlled, hence the hatch.
+        expired_error: Which ``LicenseFileExpired`` (sub)class to raise, so
+            machine files surface the same outcome under their own name.
+    """
     if claims.exp is None:
         return
     reference = now if now is not None else int(datetime.now(timezone.utc).timestamp())
     if reference - CLOCK_SKEW_TOLERANCE_SECONDS > claims.exp:
-        raise LicenseFileExpired(claims.exp)
+        raise expired_error(claims.exp)

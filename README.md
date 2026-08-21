@@ -164,9 +164,41 @@ print(claims.iat, claims.exp, claims.jti, claims.kid)
 
 Machine files use the same `{enc, sig, alg}` envelope but dispatch signature verification on the
 license's own `scheme` (`ED25519_SIGN`, `RSA_2048_PKCS1_SIGN`, `RSA_2048_PKCS1_PSS_SIGN`,
-`ECDSA_P256_SIGN`) via `src/tamga/checkout/machine_file.py::MachineFile.verify`, and they are not
-part of the `+v2` `alg` vocabulary. `src/tamga/proof.py::ProofResult.verify` covers the lighter
-air-gapped machine offline proof.
+`ECDSA_P256_SIGN`) via `src/tamga/checkout/machine_file.py::MachineFile.verify`.
+
+```python
+from tamga.checkout import MachineFile
+from tamga.checkout.machine_file import MachineFileExpired
+from tamga.models.policy import LicenseScheme
+
+machine_file = MachineFile.parse(certificate)
+try:
+    machine, claims = machine_file.verify_with_claims(
+        ACCOUNT_PUBLIC_KEY,
+        LicenseScheme.ED25519_SIGN,  # from the license, never from the file's own `alg`
+        license_key="YOUR-LICENSE-KEY",  # encrypted files only
+        fingerprint=THIS_MACHINE_FINGERPRINT,  # encrypted files only
+    )
+except MachineFileExpired as exc:
+    ...  # authentic but lapsed -> check out a fresh one; `exc.exp` says when
+print(machine.heartbeat_status, claims.jti, claims.kid)
+```
+
+Machine files are format v2 as well:
+
+- **`alg` carries the mandatory `+v2` suffix** — `base64+ed25519+v2`,
+  `aes-256-gcm+rsa-pss-sha256+v2`, and the six other combinations of encoding prefix and signing
+  suffix. A file without it is rejected with no fallback, for the same reason a v1 `.lic` is.
+- **`meta.exp` is enforced**, sharing `CLOCK_SKEW_TOLERANCE_SECONDS` with the `.lic` path and
+  raising `MachineFileExpired` — a subclass of `LicenseFileExpired`, so one `except` clause covers
+  both file types. `exp` is optional by design: a checkout made without a `ttl` produces a file
+  that genuinely never expires. Pass `verify(..., now=<server-supplied timestamp>)` when
+  defending against a rewound clock.
+- **An encrypted machine file's `enc` is `"<nonce_b64>.<cipher_b64>"`** — two *separately*
+  base64-encoded halves, not the single `base64(nonce ‖ ciphertext ‖ tag)` blob a `.lic` uses.
+  The signature covers the whole `enc` string, so verification happens before the split.
+
+`src/tamga/proof.py::ProofResult.verify` covers the lighter air-gapped machine offline proof.
 
 ## Security notes
 

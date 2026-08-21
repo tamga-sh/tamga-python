@@ -25,6 +25,30 @@ from tamga.crypto.hkdf import derive_machine_file_key
 from tamga.models.machine import HeartbeatStatus
 from tamga.models.policy import LicenseScheme
 
+#: The signed `meta` claims every format-v2 certificate carries. `exp` is
+#: deliberately absent: a checkout made without a `ttl` produces a file that
+#: never expires, which keeps these hardening tests about malformed payloads
+#: rather than about the clock.
+V2_CLAIMS = {
+    "iat": 1700000000,
+    "jti": "018f2f3a-0000-7000-8000-0000000000aa",
+    "kid": "0123456789abcdef",
+}
+
+
+def _cert_from_enc_string(private_key, enc: str, alg: str, header: str, footer: str) -> str:
+    """Build a {enc, sig, alg} PEM certificate around an already-built `enc` string.
+
+    The signature covers `enc`'s ASCII bytes, so this is the lowest-level
+    builder: it makes no assumption about whether `enc` is a single base64
+    blob (plain, and encrypted `.lic`) or the `"<nonce_b64>.<cipher_b64>"`
+    pair an encrypted *machine* file uses.
+    """
+    sig = base64.b64encode(private_key.sign(enc.encode("ascii"))).decode("ascii")
+    cert = {"enc": enc, "sig": sig, "alg": alg}
+    body = base64.b64encode(json.dumps(cert).encode("utf-8")).decode("ascii")
+    return f"{header}\n{body}\n{footer}"
+
 
 def _cert_with_raw_enc_bytes(
     private_key, enc_payload: bytes, alg: str, header: str, footer: str
@@ -38,10 +62,7 @@ def _cert_with_raw_enc_bytes(
     content is deliberately not valid JSON, or valid JSON missing "data".
     """
     enc = base64.b64encode(enc_payload).decode("ascii")
-    sig = base64.b64encode(private_key.sign(enc.encode("ascii"))).decode("ascii")
-    cert = {"enc": enc, "sig": sig, "alg": alg}
-    body = base64.b64encode(json.dumps(cert).encode("utf-8")).decode("ascii")
-    return f"{header}\n{body}\n{footer}"
+    return _cert_from_enc_string(private_key, enc, alg, header, footer)
 
 
 # ---------------------------------------------------------------------------
@@ -65,11 +86,12 @@ def test_unrecognized_heartbeat_status_falls_back_to_not_started(ed25519_keypair
                 "fingerprint": "fp",
                 "heartbeat_status": "SOME_FUTURE_STATUS_NOT_YET_MODELED",
             },
-        }
+        },
+        "meta": V2_CLAIMS,
     }
     enc_payload = json.dumps(payload).encode("utf-8")
     cert = _cert_with_raw_enc_bytes(
-        private_key, enc_payload, "base64+ed25519", MACHINE_PEM_HEADER, MACHINE_PEM_FOOTER
+        private_key, enc_payload, "base64+ed25519+v2", MACHINE_PEM_HEADER, MACHINE_PEM_FOOTER
     )
 
     machine_file = MachineFile.parse(cert)
@@ -112,7 +134,7 @@ def test_license_file_json_missing_data_key_raises_clear_value_error(ed25519_key
 def test_machine_file_non_json_plaintext_raises_clear_value_error(ed25519_keypair) -> None:  # type: ignore[no-untyped-def]
     private_key, public_key = ed25519_keypair
     cert = _cert_with_raw_enc_bytes(
-        private_key, b"not json at all", "base64+ed25519", MACHINE_PEM_HEADER, MACHINE_PEM_FOOTER
+        private_key, b"not json at all", "base64+ed25519+v2", MACHINE_PEM_HEADER, MACHINE_PEM_FOOTER
     )
     machine_file = MachineFile.parse(cert)
 
@@ -125,7 +147,7 @@ def test_machine_file_json_missing_data_key_raises_clear_value_error(ed25519_key
     cert = _cert_with_raw_enc_bytes(
         private_key,
         json.dumps({"not_data": {}}).encode("utf-8"),
-        "base64+ed25519",
+        "base64+ed25519+v2",
         MACHINE_PEM_HEADER,
         MACHINE_PEM_FOOTER,
     )
@@ -148,10 +170,17 @@ def test_encrypted_machine_file_decrypted_non_json_raises_clear_value_error(
 
     nonce = os.urandom(12)
     ciphertext_and_tag = aesgcm.encrypt(nonce, b"not json at all", None)
-    cert = _cert_with_raw_enc_bytes(
+    # An encrypted machine file's `enc` is two separately-base64'd halves
+    # joined by a dot -- NOT base64(nonce || ciphertext || tag), which is the
+    # license-file layout.
+    enc = (
+        f"{base64.b64encode(nonce).decode('ascii')}."
+        f"{base64.b64encode(ciphertext_and_tag).decode('ascii')}"
+    )
+    cert = _cert_from_enc_string(
         private_key,
-        nonce + ciphertext_and_tag,
-        "aes-256-gcm+ed25519",
+        enc,
+        "aes-256-gcm+ed25519+v2",
         MACHINE_PEM_HEADER,
         MACHINE_PEM_FOOTER,
     )
@@ -164,6 +193,207 @@ def test_encrypted_machine_file_decrypted_non_json_raises_clear_value_error(
             license_key=sample_license_key,
             fingerprint=fingerprint,
         )
+
+
+# ---------------------------------------------------------------------------
+# Encrypted machine-file `enc` is "<nonce_b64>.<cipher_b64>" -- two separately
+# base64'd halves, not one blob. Python hid this: base64.b64decode() silently
+# drops characters outside the alphabet (the "." included), and nonce_b64 is
+# always exactly 16 chars, a whole number of 4-char blocks -- so decoding the
+# whole string in one pass and slicing 12 bytes off the front happens to
+# reconstruct nonce||ciphertext byte-for-byte. It only works by that
+# coincidence, and it silently accepts input it should refuse.
+# ---------------------------------------------------------------------------
+
+
+def _encrypted_machine_cert(private_key, enc: str) -> str:
+    """Sign an arbitrary `enc` string as an encrypted machine-file certificate."""
+    return _cert_from_enc_string(
+        private_key, enc, "aes-256-gcm+ed25519+v2", MACHINE_PEM_HEADER, MACHINE_PEM_FOOTER
+    )
+
+
+def _encrypt_machine_payload(license_key: str, fingerprint: str) -> tuple[bytes, bytes]:
+    """AES-256-GCM-encrypt a minimal valid v2 payload, returning (nonce, ciphertext+tag)."""
+    import os
+
+    payload = {
+        "data": {
+            "id": "018f2f3a-0000-7000-8000-000000000042",
+            "type": "machines",
+            "attributes": {"fingerprint": fingerprint},
+        },
+        "meta": V2_CLAIMS,
+    }
+    aesgcm = AESGCM(derive_machine_file_key(license_key, fingerprint))
+    nonce = os.urandom(12)
+    return nonce, aesgcm.encrypt(nonce, json.dumps(payload).encode("utf-8"), None)
+
+
+def test_encrypted_machine_file_enc_with_junk_characters_is_rejected(
+    ed25519_keypair, sample_license_key: str
+) -> None:  # type: ignore[no-untyped-def]
+    """The strongest symptom of the single-blob misreading.
+
+    A non-validating `base64.b64decode` drops every character outside the alphabet, so
+    an `enc` peppered with junk decodes to exactly the same bytes and the file opens as
+    if nothing were wrong. Decoding each half strictly refuses it instead.
+    """
+    private_key, public_key = ed25519_keypair
+    fingerprint = "fp-junk-characters"
+    nonce, ciphertext_and_tag = _encrypt_machine_payload(sample_license_key, fingerprint)
+    cipher_b64 = base64.b64encode(ciphertext_and_tag).decode("ascii")
+    enc = f"{base64.b64encode(nonce).decode('ascii')}.{cipher_b64[:8]}*! \n{cipher_b64[8:]}"
+    machine_file = MachineFile.parse(_encrypted_machine_cert(private_key, enc))
+
+    with pytest.raises(ValueError, match="not valid base64"):
+        machine_file.verify(
+            public_key.public_bytes_raw(),
+            LicenseScheme.ED25519_SIGN,
+            license_key=sample_license_key,
+            fingerprint=fingerprint,
+        )
+
+
+def test_encrypted_machine_file_enc_with_two_separators_is_rejected(
+    ed25519_keypair, sample_license_key: str
+) -> None:  # type: ignore[no-untyped-def]
+    private_key, public_key = ed25519_keypair
+    fingerprint = "fp-two-separators"
+    nonce, ciphertext_and_tag = _encrypt_machine_payload(sample_license_key, fingerprint)
+    cipher_b64 = base64.b64encode(ciphertext_and_tag).decode("ascii")
+    enc = f"{base64.b64encode(nonce).decode('ascii')}.{cipher_b64[:8]}.{cipher_b64[8:]}"
+    machine_file = MachineFile.parse(_encrypted_machine_cert(private_key, enc))
+
+    with pytest.raises(ValueError, match="exactly one"):
+        machine_file.verify(
+            public_key.public_bytes_raw(),
+            LicenseScheme.ED25519_SIGN,
+            license_key=sample_license_key,
+            fingerprint=fingerprint,
+        )
+
+
+def test_encrypted_machine_file_enc_with_wrong_length_nonce_is_rejected(
+    ed25519_keypair, sample_license_key: str
+) -> None:  # type: ignore[no-untyped-def]
+    """A short nonce half must be named as such, not silently re-sliced off the payload."""
+    private_key, public_key = ed25519_keypair
+    fingerprint = "fp-short-nonce"
+    nonce, ciphertext_and_tag = _encrypt_machine_payload(sample_license_key, fingerprint)
+    enc = (
+        f"{base64.b64encode(nonce[:6]).decode('ascii')}."
+        f"{base64.b64encode(ciphertext_and_tag).decode('ascii')}"
+    )
+    machine_file = MachineFile.parse(_encrypted_machine_cert(private_key, enc))
+
+    with pytest.raises(ValueError, match="nonce is 6 bytes"):
+        machine_file.verify(
+            public_key.public_bytes_raw(),
+            LicenseScheme.ED25519_SIGN,
+            license_key=sample_license_key,
+            fingerprint=fingerprint,
+        )
+
+
+def test_encrypted_machine_file_ciphertext_too_short_for_a_tag_is_rejected(
+    ed25519_keypair, sample_license_key: str
+) -> None:  # type: ignore[no-untyped-def]
+    """A ciphertext half shorter than the GCM tag cannot be authenticated at all."""
+    private_key, public_key = ed25519_keypair
+    fingerprint = "fp-short-ciphertext"
+    nonce, _ = _encrypt_machine_payload(sample_license_key, fingerprint)
+    enc = f"{base64.b64encode(nonce).decode('ascii')}.{base64.b64encode(b'tiny').decode('ascii')}"
+    machine_file = MachineFile.parse(_encrypted_machine_cert(private_key, enc))
+
+    with pytest.raises(ValueError, match="ciphertext is too short"):
+        machine_file.verify(
+            public_key.public_bytes_raw(),
+            LicenseScheme.ED25519_SIGN,
+            license_key=sample_license_key,
+            fingerprint=fingerprint,
+        )
+
+
+def test_encrypted_machine_file_missing_separator_is_rejected(
+    ed25519_keypair, sample_license_key: str
+) -> None:  # type: ignore[no-untyped-def]
+    """The single-blob layout itself -- the shape every SDK wrongly assumed."""
+    private_key, public_key = ed25519_keypair
+    fingerprint = "fp-single-blob"
+    nonce, ciphertext_and_tag = _encrypt_machine_payload(sample_license_key, fingerprint)
+    enc = base64.b64encode(nonce + ciphertext_and_tag).decode("ascii")
+    machine_file = MachineFile.parse(_encrypted_machine_cert(private_key, enc))
+
+    with pytest.raises(ValueError, match="exactly one"):
+        machine_file.verify(
+            public_key.public_bytes_raw(),
+            LicenseScheme.ED25519_SIGN,
+            license_key=sample_license_key,
+            fingerprint=fingerprint,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Signed-claims edge cases surfaced by the security-reviewer pass. Both are
+# only reachable behind a valid signature (and, for encrypted files, a valid
+# GCM tag), so neither is an auth bypass -- but both escaped the documented
+# `Raises: ValueError` contract, which a caller written as
+# `except (ValueError, LicenseFileExpired):` would not catch.
+# ---------------------------------------------------------------------------
+
+
+def test_machine_file_infinite_exp_claim_raises_clear_value_error(ed25519_keypair) -> None:  # type: ignore[no-untyped-def]
+    """`json.loads` accepts the non-standard `Infinity` token; `int(inf)` is an OverflowError."""
+    private_key, public_key = ed25519_keypair
+    payload = {
+        "data": {"id": "018f2f3a-0000-7000-8000-000000000043", "type": "machines"},
+        "meta": {**V2_CLAIMS, "exp": float("inf")},
+    }
+    cert = _cert_with_raw_enc_bytes(
+        private_key,
+        json.dumps(payload).encode("utf-8"),
+        "base64+ed25519+v2",
+        MACHINE_PEM_HEADER,
+        MACHINE_PEM_FOOTER,
+    )
+    machine_file = MachineFile.parse(cert)
+
+    with pytest.raises(ValueError, match="bad 'meta' claims"):
+        machine_file.verify(public_key.public_bytes_raw(), LicenseScheme.ED25519_SIGN)
+
+
+def test_license_file_infinite_exp_claim_raises_clear_value_error(ed25519_keypair) -> None:  # type: ignore[no-untyped-def]
+    """Same claim parser, same guarantee, on the `.lic` path."""
+    private_key, public_key = ed25519_keypair
+    payload = {
+        "data": {"id": "018f2f3a-0000-7000-8000-000000000044", "type": "licenses"},
+        "meta": {**V2_CLAIMS, "exp": float("-inf")},
+    }
+    cert = _cert_with_raw_enc_bytes(
+        private_key, json.dumps(payload).encode("utf-8"), ALG_PLAIN, PEM_HEADER, PEM_FOOTER
+    )
+    license_file = LicenseFile.parse(cert)
+
+    with pytest.raises(ValueError, match="bad 'meta' claims"):
+        license_file.verify(public_key.public_bytes_raw())
+
+
+def test_machine_file_non_object_data_raises_clear_value_error(ed25519_keypair) -> None:  # type: ignore[no-untyped-def]
+    """A `data` that is present but not an object must not leak an AttributeError."""
+    private_key, public_key = ed25519_keypair
+    payload = {"data": ["not", "an", "object"], "meta": V2_CLAIMS}
+    cert = _cert_with_raw_enc_bytes(
+        private_key,
+        json.dumps(payload).encode("utf-8"),
+        "base64+ed25519+v2",
+        MACHINE_PEM_HEADER,
+        MACHINE_PEM_FOOTER,
+    )
+    machine_file = MachineFile.parse(cert)
+
+    with pytest.raises(ValueError, match="'data' is not a JSON object"):
+        machine_file.verify(public_key.public_bytes_raw(), LicenseScheme.ED25519_SIGN)
 
 
 # ---------------------------------------------------------------------------
