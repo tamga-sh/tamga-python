@@ -220,23 +220,37 @@ wrong — these replace it.
   `filter[q]` is a substring `ILIKE` over `name`/`hostname`/`fingerprint`, truncated to 200
   characters, so `machines.find_by_fingerprint` narrows with it and then compares exactly in
   Python — both approximations run toward a superset, so it never returns the wrong machine.
-  It searches account-wide by default because `machine_uniqueness_strategy` may be
-  `UNIQUE_PER_POLICY`/`UNIQUE_PER_ACCOUNT`, which puts the conflicting machine on another license;
-  and `MachineResource` serializes no `license_id` and no `relationships`, so a listed machine
-  cannot be attributed to a license from its own fields. The scan is bounded three ways
-  (`max_pages`, the server's `totalPages`, an empty page) and written as a `range`, not a `while`.
+  `license_id` is a **required** argument, not an optional narrowing: `MachineResource` serializes
+  no `license_id` and no `relationships`, so `filter[license]` is the only thing scoping the
+  result and there is nothing on the resource to verify it against — an unscoped hit is a row the
+  caller cannot attribute. (`filter[license]` is genuinely applied, unlike `page[after]` on
+  entitlements: `queries.rs:257` → `any_uuid("m.license_id", …)` → a bound `= ANY($n)` at
+  `list_filter.rs:256-263`.) The scan is bounded three ways (`max_pages`, the server's
+  `totalPages`, an empty page) and written as a `range`, not a `while`.
 - **Never omit `limit` on a keyset list call.** The server defaults to 25 and exposes no `links`
   or `meta.page` there, so an omitted page size makes truncation indistinguishable from
   completion. Send `MAX_PAGE_SIZE` and derive the cursor from that known value. `machines.list`
   sends an explicit page size too, but for a different reason: `total` already makes truncation
   visible, so it is about predictability rather than detection.
-- **`409 FINGERPRINT_TAKEN` is a re-activation, not a failure.** The server checks uniqueness
-  *before* the quota limits precisely so a repeat activation reports the conflict rather than
-  `MACHINE_LIMIT_EXCEEDED`; its comment reads "already activated, carry on".
+- **`409 FINGERPRINT_TAKEN` is a re-activation, not a failure — *within one license*.** The
+  server checks uniqueness *before* the quota limits precisely so a repeat activation reports the
+  conflict rather than `MACHINE_LIMIT_EXCEEDED`; its comment reads "already activated, carry on".
   `machines.activate_machine_idempotent` catches it and recovers the machine via
-  `find_by_fingerprint`. **That path must never validate-and-roll-back**: `activate_machine`
-  deletes the machine it created on an over-limit verdict, and doing that to a pre-existing row
-  would destroy a seat the caller never asked to touch.
+  `find_by_fingerprint(..., license_id=...)`. Two rules on that path, both load-bearing:
+  - **Never validate-and-roll-back.** `activate_machine` deletes the machine it created on an
+    over-limit verdict; doing that to a pre-existing row would destroy a seat the caller never
+    asked to touch.
+  - **Never recover across licenses.** All three strategies' `EXISTS` checks
+    (`service.rs:52-84`) include the caller's own license — `UNIQUE_PER_LICENSE` binds
+    `license_id = $2`, `UNIQUE_PER_POLICY` joins `l.policy_id = $2` where `$2` is *this license's*
+    policy (`create_machine.rs:88-102`), `UNIQUE_PER_ACCOUNT` covers the account — so a genuine
+    same-license re-activation always conflicts and is always found by a license-scoped lookup.
+    An empty lookup therefore means the conflict came from **another** license, and that machine
+    is not ours to hand back: the client would heartbeat and check it out while this license's
+    `machines_count` stayed at zero, which is the seat-sharing `service.rs:47-50` says the wider
+    scopes exist to prevent, and the caller could not detect it because the resource carries no
+    license id. Re-raise the conflict. (tamga-js ships the same behaviour; a divergence between
+    two SDKs on one 409 is worse than either choice alone.)
 - **Nothing reaps process rows.** `DELETE /processes/{id}` exists and returns `204`; no scheduled
   job calls anything equivalent, so a process that stops pinging holds its `max_processes` slot
   forever. `processes.delete` is the raw route and `ProcessHeartbeatScheduler.dispose` pairs it

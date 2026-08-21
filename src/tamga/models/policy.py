@@ -111,10 +111,13 @@ AUTHENTICATION_STRATEGIES: frozenset[str] = frozenset({"TOKEN", "LICENSE", "MIXE
 #: registered against *this* license; ``UNIQUE_PER_POLICY`` widens that to every
 #: license sharing the policy, and ``UNIQUE_PER_ACCOUNT`` to the whole account.
 #:
-#: This is why ``MachinesClient.find_by_fingerprint`` searches account-wide by
-#: default: under the two wider scopes the machine that caused the conflict may
-#: belong to a different license than the one being activated, and the machine
-#: resource carries no license id to tell them apart with.
+#: All three scopes include the caller's own license in the duplicate check, so a
+#: repeat activation of the same license and fingerprint conflicts under every
+#: one of them and is always recoverable by a license-scoped lookup. What the two
+#: wider scopes add is the *cross-license* conflict — one fingerprint registered
+#: against a second license — and that is a rejection to respect, not to recover
+#: from: it is the seat-sharing those scopes exist to prevent. See
+#: ``MachinesClient.activate_machine_idempotent``.
 MACHINE_UNIQUENESS_STRATEGIES: frozenset[str] = frozenset(
     {"UNIQUE_PER_LICENSE", "UNIQUE_PER_POLICY", "UNIQUE_PER_ACCOUNT"}
 )

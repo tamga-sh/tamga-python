@@ -1334,10 +1334,10 @@ class MachinesClient:
         self,
         fingerprint: str,
         *,
-        license_id: UUID | None = None,
+        license_id: UUID,
         max_pages: int = MAX_MACHINE_SEARCH_PAGES,
     ) -> MachineResource | None:
-        """Find an already-registered machine by its exact fingerprint.
+        """Find a machine already registered to ``license_id`` by exact fingerprint.
 
         There is **no exact fingerprint filter server-side.** The nearest thing
         is the free-text ``filter[q]`` term, which is a case-insensitive
@@ -1357,37 +1357,43 @@ class MachinesClient:
         whose cursor turned out to be inert, growing its result list until the
         process ran out of memory.
 
+        **``license_id`` is required, and that is a correctness constraint rather
+        than caution.** A machine resource carries no license id and no
+        relationships, so the only thing tying a listed machine to a license is
+        this filter — an unscoped search returns rows the caller cannot attribute
+        and must not act on. See ``activate_machine_idempotent`` for why handing
+        one back would be actively wrong. A deliberate account-wide search is
+        still possible through ``list(search=...)``, where it is explicit.
+
+        Scoping costs nothing in recall for the case this exists to serve. All
+        three machine-uniqueness strategies include the caller's own license in
+        their duplicate check — ``UNIQUE_PER_LICENSE`` matches it exactly,
+        ``UNIQUE_PER_POLICY`` joins on the policy that license already belongs
+        to, and ``UNIQUE_PER_ACCOUNT`` covers everything — so a genuine
+        re-activation of the same license and fingerprint is found here under
+        every strategy.
+
         Args:
             fingerprint: The exact fingerprint to find. Must not be blank —
                 a blank term is *ignored* by the server rather than matching
-                nothing, which would turn this into an unfiltered scan of every
-                machine in the account.
-            license_id: Optionally restrict the search to one license. Leave it
-                unset — the default — when recovering from a ``409
-                FINGERPRINT_TAKEN``: under ``UNIQUE_PER_POLICY`` or
-                ``UNIQUE_PER_ACCOUNT`` the machine that caused the conflict may
-                sit on a *different* license, and filtering by the license being
-                activated would hide exactly the row being looked for.
+                nothing, which would widen the search rather than narrow it.
+            license_id: The license to search within, sent as
+                ``filter[license]``. Required; see above.
             max_pages: Hard ceiling on pages walked. Each page holds up to 100
                 machines.
 
         Returns:
             The matching machine, or ``None`` if the scan completed without an
-            exact match.
+            exact match on this license.
 
         Raises:
             ValueError: If ``fingerprint`` is empty or whitespace-only.
-
-        Warning:
-            The machine resource carries no license id, so a returned machine
-            cannot be attributed to a license from its own fields. If that
-            matters, pass ``license_id`` and accept the narrowing.
         """
         if not fingerprint.strip():
             raise ValueError(
                 "fingerprint must be a non-empty string — the server ignores a blank "
-                "search term, which would scan every machine in the account instead "
-                "of matching none"
+                "search term, which would widen this search to the whole license "
+                "instead of matching none"
             )
         for page_number in range(1, max_pages + 1):
             page = self.list(
@@ -1418,12 +1424,34 @@ class MachinesClient:
            ``FingerprintTakenError`` passes straight through, including
            ``MachineOverLimitError``.
         2. On ``FingerprintTakenError``, look the machine up by exact
-           fingerprint with ``find_by_fingerprint`` and return it.
-        3. If the lookup finds nothing, re-raise the original conflict — with
-           the lookup failure chained onto it — because there is nothing
-           truthful to return. That happens if the credential lacks
-           ``machine.read``, or if the machine was deleted in the window between
-           the two calls.
+           fingerprint **within this license** and return it.
+        3. If the lookup finds nothing, re-raise the conflict — with the
+           original chained onto it — because there is nothing truthful to
+           return.
+
+        **Step 3 is the interesting one, and the scoping in step 2 is
+        deliberate.** A machine on this license with this fingerprint trips the
+        conflict under all three uniqueness strategies:
+        ``UNIQUE_PER_LICENSE`` checks this license's rows exactly,
+        ``UNIQUE_PER_POLICY`` joins licenses on the policy this one already
+        belongs to, and ``UNIQUE_PER_ACCOUNT`` covers the account. So a genuine
+        re-activation is always recoverable here. The only way the lookup comes
+        back empty is that the conflict came from *another* license under one of
+        the two wider scopes — and that machine must not be returned.
+
+        Returning it would hand the caller a machine this license does not own,
+        which it would then heartbeat and check out while this license's
+        ``machines_count`` stayed at zero: exactly the seat-sharing the wider
+        uniqueness scopes exist to prevent, per the server's own note that "a
+        customer could register one fingerprint against N licenses and share
+        seats". The caller could not even detect it, since the machine resource
+        carries no license id. The conflict is the honest answer, so the
+        conflict is what is raised.
+
+        (An empty lookup can also mean the credential lacks ``machine.read``, or
+        that the row was deleted between the two calls. All three cases are
+        reported the same way, because all three leave this method with no
+        machine it can honestly return.)
 
         **The recovery path deliberately does not validate the license.**
         ``activate_machine`` deletes the machine it just created when validation
@@ -1447,23 +1475,28 @@ class MachinesClient:
             conflict.
 
         Raises:
-            tamga.errors.FingerprintTakenError: If the machine could not be
-                recovered after the conflict.
+            tamga.errors.FingerprintTakenError: If no machine with this
+                fingerprint exists on this license — most often because the
+                conflict came from another license under a wider uniqueness
+                scope, which is a rejection to respect rather than recover from.
             tamga.errors.MachineOverLimitError: As ``activate_machine``, on the
                 creation path only.
         """
         try:
             return self.activate_machine(license_id, fingerprint, **attrs)
         except FingerprintTakenError as conflict:
-            existing = self.find_by_fingerprint(fingerprint)
+            existing = self.find_by_fingerprint(fingerprint, license_id=license_id)
             if existing is not None:
                 return existing
             raise FingerprintTakenError(
                 status=conflict.status,
                 code=conflict.code,
                 detail=(
-                    f"{conflict.detail} — and the existing machine could not be "
-                    f"recovered by fingerprint, so its id is unavailable"
+                    f"{conflict.detail} — and no machine with this fingerprint is "
+                    f"registered to this license, so the conflict came from another "
+                    f"license under a wider machine-uniqueness scope. That machine is "
+                    f"deliberately not returned: this license does not own it, and "
+                    f"using it would consume a seat the license never paid for"
                 ),
                 pointer=conflict.pointer,
             ) from conflict

@@ -362,10 +362,20 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
   with a different fingerprint, but it costs a scan rather than a lookup.
 - **A listed machine cannot be attributed to a license.** The machine resource carries no
   `license_id` and no `relationships` object, so `filter[license]` on `machines.list` is the only
-  way to tie machines to a license. That matters for re-activation recovery: under
-  `UNIQUE_PER_POLICY` or `UNIQUE_PER_ACCOUNT` the machine behind a `409 FINGERPRINT_TAKEN` may
-  sit on a *different* license, which is why `find_by_fingerprint` searches account-wide by
-  default.
+  thing that ties a machine to a license — there is nothing on the resource to check the answer
+  against. `find_by_fingerprint` therefore *requires* a `license_id` rather than defaulting to an
+  account-wide scan: an unscoped result is a row the caller cannot attribute and must not act on.
+  A deliberate account-wide search is still available through `machines.list(search=...)`, where
+  it is explicit.
+- **A cross-license `409 FINGERPRINT_TAKEN` is not recoverable, deliberately.** All three
+  `machine_uniqueness_strategy` values include the caller's own license in the duplicate check —
+  `UNIQUE_PER_LICENSE` matches its rows exactly, `UNIQUE_PER_POLICY` joins on the policy that
+  license already belongs to, `UNIQUE_PER_ACCOUNT` covers everything — so a genuine re-activation
+  of the same license and fingerprint is always found and returned. What the two wider scopes add
+  is the *cross-license* conflict, and `activate_machine_idempotent` re-raises rather than
+  returning that machine: it belongs to another license, the caller would heartbeat and check it
+  out while this license's `machines_count` stayed at zero, and that is precisely the seat-sharing
+  the wider scopes exist to prevent.
 - **`GET /policies/{id}` always fails under license-key auth.** It authorizes on the `policy.read`
   permission, which is not in the license-token permission set. Read the policy through
   `licenses.get_policy(license_id)` instead — same resource, but a route gated on `license.read`,

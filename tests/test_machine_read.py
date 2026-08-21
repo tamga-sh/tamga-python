@@ -235,7 +235,7 @@ def test_find_by_fingerprint_matches_exactly_and_discards_substring_hits(
         )
 
     client = make_client(handler)
-    found = client.machines.find_by_fingerprint(FINGERPRINT)
+    found = client.machines.find_by_fingerprint(FINGERPRINT, license_id=LICENSE_ID)
     assert found is not None
     assert found.id == MACHINE_ID
 
@@ -253,20 +253,29 @@ def test_find_by_fingerprint_returns_none_when_no_exact_match_exists(
         )
 
     client = make_client(handler)
-    assert client.machines.find_by_fingerprint(FINGERPRINT) is None
+    assert client.machines.find_by_fingerprint(FINGERPRINT, license_id=LICENSE_ID) is None
 
 
-def test_find_by_fingerprint_does_not_filter_by_license_unless_asked(
+def test_find_by_fingerprint_always_scopes_the_search_to_one_license(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
 ) -> None:
-    """Wider uniqueness scopes put the conflicting machine on another license."""
+    """A machine carries no license id, so this filter is the only thing that scopes it."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert "filter[license]" not in request.url.params
+        assert request.url.params["filter[license]"] == str(LICENSE_ID)
         return httpx.Response(200, json={"data": [], "meta": _page_meta(1, 0)})
 
     client = make_client(handler)
-    assert client.machines.find_by_fingerprint(FINGERPRINT) is None
+    assert client.machines.find_by_fingerprint(FINGERPRINT, license_id=LICENSE_ID) is None
+
+
+def test_find_by_fingerprint_requires_a_license(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """An unscoped search returns rows the caller cannot attribute, so it is unexpressible."""
+    client = make_client(lambda request: httpx.Response(200, json={"data": []}))
+    with pytest.raises(TypeError, match="license_id"):
+        client.machines.find_by_fingerprint(FINGERPRINT)  # type: ignore[call-arg]
 
 
 def test_find_by_fingerprint_walks_pages_until_the_server_says_it_is_done(
@@ -291,7 +300,7 @@ def test_find_by_fingerprint_walks_pages_until_the_server_says_it_is_done(
         )
 
     client = make_client(handler)
-    found = client.machines.find_by_fingerprint(FINGERPRINT)
+    found = client.machines.find_by_fingerprint(FINGERPRINT, license_id=LICENSE_ID)
     assert found is not None
     assert found.id == MACHINE_ID
     assert requested_pages == ["1", "2"]
@@ -316,7 +325,9 @@ def test_find_by_fingerprint_cannot_loop_forever_on_dishonest_page_metadata(
         )
 
     client = make_client(handler)
-    assert client.machines.find_by_fingerprint(FINGERPRINT, max_pages=3) is None
+    assert (
+        client.machines.find_by_fingerprint(FINGERPRINT, license_id=LICENSE_ID, max_pages=3) is None
+    )
     assert calls == 3
 
 
@@ -333,7 +344,7 @@ def test_find_by_fingerprint_rejects_a_blank_fingerprint(
 
     client = make_client(handler)
     with pytest.raises(ValueError, match="non-empty"):
-        client.machines.find_by_fingerprint("   ")
+        client.machines.find_by_fingerprint("   ", license_id=LICENSE_ID)
     assert calls == 0
 
 
@@ -377,6 +388,7 @@ def test_idempotent_activation_recovers_the_existing_machine_after_a_conflict(
                 409,
                 json={"errors": [{"code": "FINGERPRINT_TAKEN", "detail": "already activated"}]},
             )
+        assert request.url.params["filter[license]"] == str(LICENSE_ID)
         return httpx.Response(200, json={"data": [_machine_data()], "meta": _page_meta(1, 1)})
 
     client = make_client(handler)
@@ -404,15 +416,32 @@ def test_idempotent_activation_never_deletes_the_machine_it_recovered(
     assert client.machines.activate_machine_idempotent(LICENSE_ID, FINGERPRINT).id == MACHINE_ID
 
 
-def test_idempotent_activation_reraises_the_conflict_when_recovery_finds_nothing(
+def test_idempotent_activation_reraises_a_cross_license_conflict(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
 ) -> None:
+    """The conflicting machine is on another license, so it must not be handed back.
+
+    All three uniqueness strategies include the caller's own license in their
+    duplicate check, so an empty license-scoped lookup after a 409 means the
+    conflict came from a *different* license under `UNIQUE_PER_POLICY` or
+    `UNIQUE_PER_ACCOUNT`. Returning that machine would let this license
+    heartbeat and check out a seat it never paid for, with `machines_count`
+    staying at zero — the exact seat-sharing those wider scopes exist to
+    prevent — and the caller could not detect it, since the resource carries no
+    license id.
+    """
+    license_filters: list[str] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
             return httpx.Response(
                 409,
                 json={"errors": [{"code": "FINGERPRINT_TAKEN", "detail": "taken"}]},
             )
+        # The machine exists in the account — just not on this license, so a
+        # server honouring `filter[license]` returns nothing.
+        license_filters.append(request.url.params["filter[license]"])
+        assert request.url.params["filter[q]"] == FINGERPRINT
         return httpx.Response(200, json={"data": [], "meta": _page_meta(1, 0)})
 
     client = make_client(handler)
@@ -420,8 +449,9 @@ def test_idempotent_activation_reraises_the_conflict_when_recovery_finds_nothing
         client.machines.activate_machine_idempotent(LICENSE_ID, FINGERPRINT)
 
     assert excinfo.value.code == "FINGERPRINT_TAKEN"
-    assert "could not be recovered" in excinfo.value.detail
+    assert "another" in excinfo.value.detail
     assert isinstance(excinfo.value.__cause__, FingerprintTakenError)
+    assert license_filters == [str(LICENSE_ID)]
 
 
 def test_idempotent_activation_lets_a_limit_rejection_through_untouched(
