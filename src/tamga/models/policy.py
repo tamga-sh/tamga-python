@@ -161,9 +161,15 @@ class CheckInInterval(str, Enum):
     The four storable values are ``daily``/``weekly``/``monthly``/``yearly``,
     pinned twice over: ``policies/enums.rs:27`` lists exactly those, and the
     column's own ``CHECK`` constraint
-    (``migrations/20240101000005:153-155``) rejects anything else. Combined
-    with ``check_in_interval_count`` they read as "every N periods" — count 2
-    plus ``weekly`` is every two weeks.
+    (``migrations/20240101000005:153-155``) rejects anything else.
+
+    This is only half the cadence. The period is multiplied by
+    ``check_in_interval_count`` — count 2 plus ``weekly`` means every two
+    weeks — and that field is emitted by the serializer
+    (``policies/serializer.rs:34``) but **not modelled here**, so this enum
+    on its own does not tell you how often a license must check in. Do not
+    derive a schedule from it. (Moot in practice today for the reason in the
+    note below, but it will stop being moot the day the server is fixed.)
 
     Warning:
         Releases up to 1.0.4 modelled this as ``day``/``week``/``month``/

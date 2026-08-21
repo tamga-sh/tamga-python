@@ -182,6 +182,11 @@ individually; see `.github/workflows/ci.yml` for the exact order
   (`validate_license.rs:394-403`) matches the noun spellings, so no storable value hits an arm and
   `_ => 30` always wins — every cadence is enforced as thirty days. `tamga-api-internal#3`.
   Independent of the SDK bug; fixing this side did not fix that one.
+  **Still missing:** `check_in_interval_count` is emitted (`policies/serializer.rs:34`) and is the
+  multiplier on the period — count 2 plus `weekly` is every two weeks — but `PolicyResource` does
+  not model it, so the cadence this SDK exposes is only half the answer. Harmless while the server
+  ignores both, load-bearing the day `tamga-api-internal#3` is fixed. Not in scope for 1.1.0;
+  needs its own item.
 - **`max_memory` / `max_disk` are write-only server-side, and are no longer `PolicyResource`
   fields.** The columns exist (`policies/model.rs:187-188`, `Option<i64>`) and validation enforces
   them (`allows_memory`/`allows_disk`), and `POST`/`PATCH /policies` accept them in the request
