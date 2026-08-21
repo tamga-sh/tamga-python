@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file. This file i
 [Conventional Commits](https://www.conventionalcommits.org/) history — do not hand-edit entries
 below the `[Unreleased]` header.
 
+## [1.1.1](https://github.com/tamga-sh/tamga-python/compare/v1.1.0...v1.1.1) (2026-08-21)
+
+
+### Bug Fixes
+
+* canonicalise fingerprint components so one machine cannot hold three seats ([d323cb2](https://github.com/tamga-sh/tamga-python/commit/d323cb25eaa951f2bbeb2213636d6ddc789bcc5c))
+* keep a licence's identity intact across rotation, download and activation ([fd8e199](https://github.com/tamga-sh/tamga-python/commit/fd8e19960eace9801e4dc43a93f1794187142f69))
+* read and download artifacts without handing the licence key to storage ([134fa2c](https://github.com/tamga-sh/tamga-python/commit/134fa2c44b9d19ca90f75e221a5891dfbd73f914))
+* verify offline files against the key set their kid names ([4a63ab3](https://github.com/tamga-sh/tamga-python/commit/4a63ab36871bd8efcf6c4fa47d1e592f1b77f445))
+
+
+### Documentation
+
+* record the kid rule, the 403, and the ordering that must not be inverted ([058ade7](https://github.com/tamga-sh/tamga-python/commit/058ade709d92ec1c28cdbc6693585fbffe141792))
+
 ## [1.1.0](https://github.com/tamga-sh/tamga-python/compare/v1.0.4...v1.1.0) (2026-08-21)
 
 
