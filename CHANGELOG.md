@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file. This file i
 [Conventional Commits](https://www.conventionalcommits.org/) history — do not hand-edit entries
 below the `[Unreleased]` header.
 
+## [1.0.4](https://github.com/tamga-sh/tamga-python/compare/v1.0.3...v1.0.4) (2026-08-21)
+
+
+### Bug Fixes
+
+* align SDK with the current tamga-api server contract ([24c1556](https://github.com/tamga-sh/tamga-python/commit/24c15560c89e9a40174eff64c51946f425fd6001))
+* align the SDK with the current tamga-api server contract ([7f3ce1f](https://github.com/tamga-sh/tamga-python/commit/7f3ce1f25bccc8abdab5bcb647ac80b70d789a36))
+* **ci:** run CI on stacked pull requests, not only PRs onto main ([ac9b44c](https://github.com/tamga-sh/tamga-python/commit/ac9b44c1dfea432471151d44a2b1454e87511a10))
+* clamp a non-positive heartbeat interval instead of busy-looping ([0647752](https://github.com/tamga-sh/tamga-python/commit/0647752937df0e89873bb7ede1a0ec2883cb5240))
+* correct the heartbeat guidance to state the rule as never stopping on any status ([f76199a](https://github.com/tamga-sh/tamga-python/commit/f76199a7d8ddc2f57e9654db9c9fd0633eb64265))
+* correct the notes that said these routes were unreachable ([7cc3ed8](https://github.com/tamga-sh/tamga-python/commit/7cc3ed8a04d8fcfc28534040baf3f6157ed45c4d))
+* document that the machine routes are unscoped, and three of them write ([e48e5d6](https://github.com/tamga-sh/tamga-python/commit/e48e5d677e39917ef2ffc9b77d396f40e837ff92))
+* keep __version__ in sync with the released version ([b59fc2c](https://github.com/tamga-sh/tamga-python/commit/b59fc2c17c4956d7c3902a3a3f39292c8d38acd1))
+* model the policy, release and health payloads the SDK could not read ([154477a](https://github.com/tamga-sh/tamga-python/commit/154477aa2b9130c977b8b7f1e7032c7eccaaf9a1))
+* narrow the DEAD guidance — machine checkout does report it ([9ca9245](https://github.com/tamga-sh/tamga-python/commit/9ca9245737d5cae3ecdb5112238637277537944b))
+* raise a typed MachineOverLimitError from activate_machine, keeping ValueError ([eae6130](https://github.com/tamga-sh/tamga-python/commit/eae6130c6fceb67ec01c9be8acea1bdc01ce98be))
+* reach the endpoint surface the SDK was missing ([15dc82c](https://github.com/tamga-sh/tamga-python/commit/15dc82cf44fed1bc146d386e0bf966820f675405))
+* reach the machine, policy, process-delete, upgrade and health routes ([f9e901e](https://github.com/tamga-sh/tamga-python/commit/f9e901e594853692f8950694886ef9fb58029721))
+* read the release resource's productId, which the server camelCases ([5481166](https://github.com/tamga-sh/tamga-python/commit/5481166e63452f14c3760fd4983d0da0331859d6))
+* reject a malformed verified payload instead of crashing on it ([d2b7de7](https://github.com/tamga-sh/tamga-python/commit/d2b7de7707b8d1720edd550e68b1cb7925b22c9e))
+* scope fingerprint recovery to the caller's license and refuse cross-license hits ([178161a](https://github.com/tamga-sh/tamga-python/commit/178161a64bfebc6e4b96b3971c64edd80934aa2b))
+* send flat request bodies to POST /components and POST /processes ([d5cb8df](https://github.com/tamga-sh/tamga-python/commit/d5cb8dfebee35080efcb958c7fc3220e364fdb89))
+* send flat request bodies to POST /components and POST /processes ([2d5ec09](https://github.com/tamga-sh/tamga-python/commit/2d5ec093fe98a07d373eb6dfa98a8ee4c4ffef9b))
+* verify the machine files the server actually emits ([3000f37](https://github.com/tamga-sh/tamga-python/commit/3000f373a643c7a73ed7221a1420eae9cf0b8c4e))
+* verify the machine files the server actually emits ([ee4ffc1](https://github.com/tamga-sh/tamga-python/commit/ee4ffc1641a1bd9d50e57693df57ff2ccc34bf96))
+
 ## [1.0.3](https://github.com/tamga-sh/tamga-python/compare/v1.0.2...v1.0.3) (2026-08-18)
 
 
