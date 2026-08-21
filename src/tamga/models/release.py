@@ -22,9 +22,15 @@ class ReleaseResource:
     ``product_id`` is a plain attribute, which is the only link back to the
     product a release belongs to.
 
+    Wire-casing note: this resource's attributes are serialized **camelCase**
+    server-side, which is unusual — most resources are snake_case. ``product_id``
+    therefore arrives as ``productId``. ``created`` and ``updated`` do *not*
+    follow that rule: they carry explicit serde renames that override it, so
+    they are spelled exactly as they are on every other resource.
+
     Attributes:
         id: Resource UUID.
-        product_id: The owning product's UUID.
+        product_id: The owning product's UUID. Wire key is ``productId``.
         version: The release's version string. Compare it against the caller's
             own current version to decide whether to act — the SDK does not
             parse or order version strings, because the ordering that matters is

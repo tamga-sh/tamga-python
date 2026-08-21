@@ -231,10 +231,32 @@ def _parse_policy_resource(data: dict[str, Any]) -> PolicyResource:
 
 
 def _parse_release_resource(data: dict[str, Any]) -> ReleaseResource:
+    """Parse a JSON:API ``releases`` resource.
+
+    ``releases`` is one of the few resources whose attributes are serialized
+    **camelCase**, so the owning product arrives as ``productId`` — not
+    ``product_id``, which every other resource this SDK reads would use.
+
+    The casing is per-resource, and reading it off a sibling gets it wrong in
+    both directions. ``MachineAttributes``, ``PolicyAttributes``,
+    ``LicenseAttributes``, ``ComponentAttributes`` and ``ProcessAttributes`` are
+    all snake_case; only ``ReleaseAttributes`` and the two file-checkout
+    attribute structs carry ``rename_all = "camelCase"`` — and on those two it
+    happens to be invisible, because every one of their fields is a single word.
+
+    **``created`` and ``updated`` are the exception inside the exception.**
+    Their struct fields are ``created_at``/``updated_at``, so the camelCase rule
+    would make them ``createdAt``/``updatedAt`` — but each carries an explicit
+    ``#[serde(rename)]``, and an explicit rename overrides ``rename_all``. They
+    really are ``created``/``updated`` on the wire, exactly like every other
+    resource. Do not "finish the job" by camelCasing them; that breaks two
+    fields that are already right.
+    """
     attrs = data.get("attributes", {})
     return ReleaseResource(
         id=UUID(str(data["id"])),
-        product_id=UUID(str(attrs["product_id"])),
+        # camelCase: `product_id` on the struct, `productId` on the wire.
+        product_id=UUID(str(attrs["productId"])),
         version=attrs.get("version", ""),
         channel=attrs.get("channel", ""),
         status=attrs.get("status", ""),
@@ -242,6 +264,7 @@ def _parse_release_resource(data: dict[str, Any]) -> ReleaseResource:
         # Absent rather than null when unset — the server skips serializing it.
         tag=attrs.get("tag"),
         metadata=attrs.get("metadata") or {},
+        # Explicit `#[serde(rename)]`, so NOT `createdAt`/`updatedAt`.
         created=_parse_datetime(attrs.get("created")),
         updated=_parse_datetime(attrs.get("updated")),
     )

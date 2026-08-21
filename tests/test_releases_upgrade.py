@@ -6,7 +6,9 @@ and the SDK must not collapse them into "you are up to date".
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
+from pathlib import Path
 from uuid import UUID
 
 import httpx
@@ -20,26 +22,102 @@ ACCOUNT_PATH = "/v1/accounts/018f2f3a-0000-7000-8000-000000000001"
 PRODUCT_ID = UUID("018f2f3a-0000-7000-8000-000000000070")
 RELEASE_ID = UUID("018f2f3a-0000-7000-8000-000000000090")
 
+#: A real upgrade-check response body, keyed exactly as the server emits it.
+#:
+#: The keys were derived mechanically from `ReleaseAttributes` in the server's
+#: own serializer, **not** transcribed from this SDK's `ReleaseResource`. That
+#: distinction is the whole point: the previous inline fixture spelled the
+#: owning product `product_id` because that is what the dataclass field is
+#: called, so it agreed with the parser and disagreed with the server. The test
+#: passed and `check_for_upgrade` raised `KeyError` against every real response.
+#: See the file's own `_provenance` block.
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "releases" / "upgrade_response.json"
+_FIXTURE = json.loads(FIXTURE_PATH.read_text())
+
 
 def _release_data(**extra: object) -> dict:
-    attributes: dict = {
-        "product_id": str(PRODUCT_ID),
-        "name": "1.4.0",
-        "version": "1.4.0",
-        "channel": "stable",
-        "status": "PUBLISHED",
-        "metadata": {"notes": "faster"},
-        "created": "2026-01-02T03:04:05Z",
-        "updated": "2026-01-02T03:04:05Z",
-    }
-    attributes.update(extra)
-    return {"id": str(RELEASE_ID), "type": "releases", "attributes": attributes}
+    """The server-shaped `data` object, optionally overridden per test."""
+    data = json.loads(json.dumps(_FIXTURE["data"]))
+    data["attributes"].update(extra)
+    return data
 
 
 def _check(client: TamgaClient) -> object:
     return client.releases.check_for_upgrade(
         product_id=PRODUCT_ID, platform="darwin-arm64", filetype="dmg", version="1.3.0"
     )
+
+
+def test_release_attributes_are_camel_cased_on_the_wire(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """`releases` is one of the few resources the server serializes camelCase.
+
+    The owning product arrives as `productId`. Reading `product_id` — the
+    spelling every *other* resource this SDK parses uses — raises `KeyError`
+    against a real response, which is what this SDK did until now.
+    """
+    attributes = _FIXTURE["data"]["attributes"]
+    assert "productId" in attributes
+    assert "product_id" not in attributes
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": _FIXTURE["data"]})
+
+    client = make_client(handler)
+    release = _check(client)
+    assert release is not None
+    assert release.product_id == PRODUCT_ID
+
+
+def test_created_and_updated_are_not_camel_cased(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """The exception inside the exception, pinned so it cannot be "fixed".
+
+    The struct fields are `created_at`/`updated_at`, so `rename_all =
+    "camelCase"` would make them `createdAt`/`updatedAt` — but each carries an
+    explicit `#[serde(rename)]`, and an explicit rename wins. Camel-casing these
+    two while fixing `productId` would break two fields that are already right.
+    """
+    attributes = _FIXTURE["data"]["attributes"]
+    assert "created" in attributes and "updated" in attributes
+    assert "createdAt" not in attributes and "updatedAt" not in attributes
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": _FIXTURE["data"]})
+
+    client = make_client(handler)
+    release = _check(client)
+    assert release is not None
+    assert release.created is not None
+    assert release.updated is not None
+    assert release.created.year == 2026
+
+
+def test_camel_cased_timestamps_are_ignored_rather_than_guessed(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """A body carrying `createdAt`/`updatedAt` is not the server's shape.
+
+    If the parser ever started reading those, this would silently start passing
+    and the real `created`/`updated` would be dropped. Asserting `None` keeps
+    the two spellings distinguishable.
+    """
+    attributes = dict(_FIXTURE["data"]["attributes"])
+    attributes.pop("created")
+    attributes.pop("updated")
+    attributes["createdAt"] = "2026-01-02T03:04:05Z"
+    attributes["updatedAt"] = "2026-01-02T03:04:05Z"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {**_FIXTURE["data"], "attributes": attributes}})
+
+    client = make_client(handler)
+    release = _check(client)
+    assert release is not None
+    assert release.created is None
+    assert release.updated is None
 
 
 def test_upgrade_check_request_shape(

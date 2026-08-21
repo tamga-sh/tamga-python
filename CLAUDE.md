@@ -346,6 +346,27 @@ wrong — these replace it.
   `403` (`:77-81`), not an ambiguous `204`. The artifact download route exists too, though it is
   currently walled off by a permission gap. An older note here claimed the endpoint 500s and
   forbade building against it — that was wrong. RFC 9421 response signing genuinely is dead code.
+- **Attribute CASING is per-resource, and `releases` is the one that bites.** Most attribute
+  structs are snake_case; exactly 10 of the server's 67 carry `rename_all = "camelCase"`. Three are
+  SDK-relevant:
+  - `ReleaseAttributes` (`releases/serializer.rs:24`) — **`product_id` goes over the wire as
+    `productId`.** `_parse_release_resource` reads it with a bare subscript, so getting this wrong
+    is a `KeyError` on every real upgrade response, not a silently missing field.
+  - `LicenseFileAttributes` (`licenses/serializer.rs:196`) and `MachineFileAttributes`
+    (`machines/serializer.rs:136`) — also camelCase, but every field is a single word
+    (`certificate`, `algorithm`, `includes`, `ttl`, `expiry`, `issued`), so it is invisible today.
+    A multi-word field added to either would arrive camelCased.
+
+  `MachineAttributes`, `PolicyAttributes`, `LicenseAttributes`, `ComponentAttributes` and
+  `ProcessAttributes` are snake_case, so this cannot be applied as a blanket rule in either
+  direction.
+
+  **The exception inside the exception:** `ReleaseAttributes.created_at`/`updated_at` would become
+  `createdAt`/`updatedAt` under `rename_all`, but each carries an explicit
+  `#[serde(rename = "created")]` / `#[serde(rename = "updated")]` (`serializer.rs:41,43`), and an
+  explicit rename overrides `rename_all`. They are `created`/`updated`, exactly like every other
+  resource. Camel-casing them while fixing `productId` breaks two fields that are already right —
+  `tests/test_releases_upgrade.py` fails in **both** directions on purpose.
 - **`http://` hosts are preserved.** `build_base_url` upgrades a bare host to `https` but keeps an
   explicit `http://` scheme — a self-hosted deployment may serve plain HTTP, and rewriting the
   scheme made it unreachable with no useful diagnostic.
@@ -365,6 +386,13 @@ wrong — these replace it.
 - The three crypto-bearing areas — license checkout, machine checkout, offline proof — require a
   **mandatory, non-skippable** `security-reviewer` pass before merge. A `python-reviewer`-only pass
   is not sufficient for them.
+- **A fixture written from this SDK's own field names proves nothing.** It encodes the same
+  assumption the parser makes, so it agrees with the bug and disagrees with the server.
+  `tests/fixtures/releases/upgrade_response.json` exists because the inline fixture it replaced
+  spelled the owning product `product_id` — the *dataclass* field's name — while the server emits
+  `productId`. The test passed; `check_for_upgrade` raised `KeyError` against every real response.
+  Its keys are derived mechanically from the Rust struct, and the file records that provenance.
+  This is the same rule as the next bullet, on the response-shape axis rather than the crypto one.
 - **Never prove a wire format with a fixture this SDK generated.** `tests/fixtures/machine_files/`
   holds certificates produced by the *server's* `encode_machine_file`, indexed by a
   `manifest.json` that `tests/test_machine_file_fixtures.py` iterates — add a fixture by dropping

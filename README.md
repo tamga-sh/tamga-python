@@ -354,6 +354,12 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
   newer exists that this license is not entitled to. That is deliberate server-side — a denial
   would leak "a newer version exists but you can't have it" — so report `None` as *no update is
   available to you*, never as "you are up to date". A suspended license is a separate `403`.
+- **The `releases` resource is camelCase; almost nothing else is.** `check_for_upgrade` returns a
+  release whose owning product arrives as `productId`, not `product_id` — `ReleaseAttributes` is
+  one of only ten attribute structs on the server that carry `rename_all = "camelCase"`. Its
+  `created`/`updated` are the exception inside the exception: explicit serde renames override the
+  camelCase rule, so those two are spelled as they are everywhere else. Machines, policies,
+  licenses, components and processes are all snake_case.
 - **There is no exact fingerprint filter on `GET /machines`.** The server offers
   `filter[license|owner|group|platform]` and a free-text `filter[q]`, and `filter[q]` is a
   case-insensitive substring match across `name`, `hostname` *and* `fingerprint`, truncated to 200
