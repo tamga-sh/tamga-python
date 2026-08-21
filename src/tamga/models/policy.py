@@ -103,6 +103,35 @@ EXPIRATION_STRATEGIES: frozenset[str] = frozenset(
 #: retryable authentication failure.
 AUTHENTICATION_STRATEGIES: frozenset[str] = frozenset({"TOKEN", "LICENSE", "MIXED", "NONE"})
 
+#: Every legal ``policy.machine_uniqueness_strategy`` value.
+#:
+#: Decides how wide a net ``409 FINGERPRINT_TAKEN`` is cast over on machine
+#: creation. ``UNIQUE_PER_LICENSE`` (the effective default — the server falls
+#: through to it for any unrecognized value) rejects a fingerprint already
+#: registered against *this* license; ``UNIQUE_PER_POLICY`` widens that to every
+#: license sharing the policy, and ``UNIQUE_PER_ACCOUNT`` to the whole account.
+#:
+#: All three scopes include the caller's own license in the duplicate check, so a
+#: repeat activation of the same license and fingerprint conflicts under every
+#: one of them and is always recoverable by a license-scoped lookup. What the two
+#: wider scopes add is the *cross-license* conflict — one fingerprint registered
+#: against a second license — and that is a rejection to respect, not to recover
+#: from: it is the seat-sharing those scopes exist to prevent. See
+#: ``MachinesClient.activate_machine_idempotent``.
+MACHINE_UNIQUENESS_STRATEGIES: frozenset[str] = frozenset(
+    {"UNIQUE_PER_LICENSE", "UNIQUE_PER_POLICY", "UNIQUE_PER_ACCOUNT"}
+)
+
+#: Heartbeat window applied when ``policy.heartbeat_duration`` is unset, in
+#: seconds.
+#:
+#: This is a *fallback*, not the window. The server computes the effective window
+#: as ``heartbeat_duration`` or this value, and the machine-culling job's claim
+#: query uses the same ``COALESCE(p.heartbeat_duration, 600)``. Sizing a ping
+#: interval against this constant is only correct for a policy that leaves the
+#: column null — see ``PolicyResource.effective_heartbeat_window_seconds``.
+DEFAULT_HEARTBEAT_DURATION_SECONDS: int = 600
+
 
 class CheckInInterval(str, Enum):
     """Lowercase — inconsistent with the ``SCREAMING_SNAKE_CASE`` convention above."""
@@ -173,6 +202,25 @@ class PolicyResource:
         max_disk: Disk limit, subject to ``overage_strategy``. Same
             "always ``None`` in practice" caveat as ``max_memory`` — only
             observable via a ``TOO_MUCH_DISK`` validation code.
+        heartbeat_duration: The policy's machine-heartbeat window, in seconds,
+            or ``None`` when the column is unset. **This is the field that
+            decides how often a machine has to ping**; the SDK's 600s default is
+            only what the server falls back to when this is ``None``. Read
+            ``effective_heartbeat_window_seconds`` rather than this field
+            directly, and size a ``HeartbeatScheduler`` from it (see
+            ``tamga.client.heartbeat_interval_for_policy``).
+        require_heartbeat: Whether the culling worker acts on this policy at
+            all. ``False`` by default, and the worker early-returns on a policy
+            where it is false, so under a default policy no machine is ever
+            culled no matter how long its heartbeat has lapsed. A machine can
+            still *report* ``DEAD`` under such a policy — the status is derived
+            purely from ``last_heartbeat_at`` versus the window and never
+            consults this flag.
+        machine_uniqueness_strategy: One of
+            ``MACHINE_UNIQUENESS_STRATEGIES``; see that constant for what each
+            scope means for ``409 FINGERPRINT_TAKEN``. Defaults to
+            ``"UNIQUE_PER_LICENSE"``, which is also what the server treats any
+            unrecognized value as.
     """
 
     id: UUID
@@ -191,6 +239,37 @@ class PolicyResource:
     max_uses: int | None = None
     max_memory: int | None = None
     max_disk: int | None = None
+    heartbeat_duration: int | None = None
+    require_heartbeat: bool = False
+    machine_uniqueness_strategy: str = "UNIQUE_PER_LICENSE"
+
+    @property
+    def effective_heartbeat_window_seconds(self) -> int:
+        """The machine-heartbeat window this policy actually enforces, in seconds.
+
+        ``heartbeat_duration`` when the policy sets it, otherwise
+        ``DEFAULT_HEARTBEAT_DURATION_SECONDS`` (600). Mirrors the server's own
+        ``Policy::effective_heartbeat_duration_secs``, and the same expression
+        the culling job's claim query uses.
+
+        Note:
+            A non-positive ``heartbeat_duration`` is treated as unset and falls
+            back to 600 rather than being propagated. The column is a signed
+            integer with no positivity constraint, and a zero or negative window
+            would otherwise turn a derived ping interval into a busy loop.
+
+            That is no longer the only thing standing between such a policy and
+            a spin — both schedulers hold ``tamga.client.MIN_HEARTBEAT_INTERVAL``
+            themselves — but it does mean this SDK never derives an interval
+            from a zero window at all. Worth knowing when comparing against the
+            server, whose ``COALESCE(p.heartbeat_duration, 600)`` substitutes
+            only for ``NULL``: a stored ``0`` really is a zero-second window
+            server-side, and no ping rate at or above the floor can hold it.
+            See the table in ``tests/test_policy_read.py``.
+        """
+        if self.heartbeat_duration is None or self.heartbeat_duration <= 0:
+            return DEFAULT_HEARTBEAT_DURATION_SECONDS
+        return self.heartbeat_duration
 
     @classmethod
     def from_api(cls, attributes: dict[str, Any]) -> PolicyResource:
@@ -257,6 +336,11 @@ class PolicyResource:
             max_uses=attributes.get("max_uses"),
             max_memory=attributes.get("max_memory"),
             max_disk=attributes.get("max_disk"),
+            heartbeat_duration=attributes.get("heartbeat_duration"),
+            require_heartbeat=bool(attributes.get("require_heartbeat", False)),
+            machine_uniqueness_strategy=attributes.get(
+                "machine_uniqueness_strategy", "UNIQUE_PER_LICENSE"
+            ),
         )
 
 
