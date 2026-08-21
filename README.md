@@ -285,6 +285,82 @@ Machine files are format v2 as well:
 
 `src/tamga/proof.py::ProofResult.verify` covers the lighter air-gapped machine offline proof.
 
+### Surviving a signing-key rotation
+
+An account can rotate its Ed25519 signing key. A `.lic` or machine file signed *before* the
+rotation is still authentic — but verified against the single current key it fails with exactly
+the error a forgery produces, and the caller cannot tell "my keys are stale" from "refuse this
+customer". Every signed file already names the key that signed it, in the `kid` claim.
+
+Verify against a **key set** instead of one key, and the two outcomes separate:
+
+```python
+from cryptography.exceptions import InvalidSignature
+
+from tamga.checkout import (
+    LicenseFile,
+    SigningKeySet,
+    UnknownSigningKeyError,
+    SigningKeyNotPublishedError,
+)
+
+# Either fetch the account's published key set (needs `account.read` — see below) ...
+with TamgaClient(config) as client:
+    key_set = client.accounts.signing_key_set()
+
+# ... or pin the keys into your application, which works with no network at all:
+# Keep the old keys — that is the point.
+key_set = SigningKeySet.from_public_keys(
+    ["CURRENT+ACCOUNT+PUBLIC+KEY+BASE64=", "PREVIOUS+ACCOUNT+PUBLIC+KEY+BASE64="]
+)
+
+try:
+    verified = LicenseFile.parse(certificate).verify_with_key_set(key_set)
+except SigningKeyNotPublishedError:
+    # Narrower, so it goes first: the signing account has no published key at
+    # all, so no key set can ever verify this file. A server-side fix, and
+    # refetching the key set will not help.
+    ...
+except UnknownSigningKeyError as exc:
+    # NOT a forgery: the file names key `exc.kid`, which we do not hold.
+    # Refresh the key set or ship an update.
+    ...
+except InvalidSignature:
+    # The key it names IS in the set and the signature still fails. Forged.
+    ...
+else:
+    print(verified.license.id, verified.claims.jti, verified.key.kid)
+    if verified.key.is_retired:
+        # Authentic, but issued before the last rotation — due a fresh checkout.
+        ...
+```
+
+`MachineFile.verify_with_key_set(key_set, scheme, ...)` is the machine-file counterpart, with one
+caveat: **Ed25519-signed machine files only.** A machine file's signing key is chosen by the
+license's `scheme`, while its `kid` claim is computed from the account's Ed25519 key whatever the
+scheme — so for an RSA- or ECDSA-signed file the claim names a key that had no part in the
+signature, and the endpoint publishes Ed25519 keys only in any case. Those raise
+`SigningKeyNotApplicableError`; verify them with `MachineFile.verify(public_key, scheme, ...)` and
+the account's own key for that algorithm. Nothing is lost — rotation only ever rotates the Ed25519
+key, so no other scheme has a rotation to survive.
+
+Three things worth knowing about `client.accounts.list_signing_keys()` / `signing_key_set()`:
+
+- **It answers `403` under license-key auth.** The route needs `account.read`, which a license
+  credential does not hold, and there is no license-scoped alternative route. An embedded client
+  doing offline verification is precisely the one that cannot call it — pin the keys instead. An
+  offline verifier that only works while it has a network is not offline.
+- **An empty result is normal, not an error.** The key-history table is only written by a
+  rotation, so an account that has never rotated has no rows and the endpoint returns `[]`.
+- **Retired keys are included on purpose.** That is the whole feature: a client holding a file
+  signed months ago needs the key that signed it.
+
+A key's id is a pure function of the key — `key_id(public_key)` is the first eight *bytes* of
+`SHA-256` over the published **base64 string** (not the decoded key bytes), lowercase hex. So a
+caller holding a public key never needs to be told its id; `SigningKey.ed25519(public_key)` derives
+it.
+
+
 ## Security notes
 
 - **Both offline-file AES keys are HKDF-SHA256 derived.** License file:

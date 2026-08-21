@@ -43,20 +43,23 @@ src/tamga/
 │   ├── machine.py        # MachineResource, ComponentResource, ProcessResource, HeartbeatStatus
 │   ├── policy.py         # PolicyResource + policy-derived enums, Entitlement
 │   ├── release.py        # ReleaseResource (auto-update check)
+│   ├── signing_key.py    # SigningKey — one published Ed25519 key, current or retired
 │   └── health.py         # HealthStatus — NOT a JSON:API resource, see below
 ├── crypto/
-│   ├── ed25519.py         # Ed25519 verify (license checkout, one of 4 machine-checkout schemes)
+│   ├── ed25519.py         # Ed25519 verify + `key_id` (the `kid` a signed offline file names)
 │   ├── rsa.py              # RSA-PKCS1v15 + RSA-PSS verify (machine checkout, offline proof)
 │   ├── ecdsa.py            # ECDSA-P256 verify (machine checkout)
 │   ├── aes_gcm.py          # AES-256-GCM decrypt (both checkout flows)
 │   └── hkdf.py              # HKDF-SHA256 key derivation (license file AND machine file)
 └── checkout/
+    ├── key_set.py         # SigningKeySet + kid selection (survives a signing-key rotation)
     ├── license_file.py    # .lic parse + verify pipeline (format v2, enforces signed exp)
     └── machine_file.py    # machine-file parse + multi-scheme verify pipeline
 ```
 
 **Vertical-ish grouping, not one flat client.** `TamgaClient` exposes `.licenses`, `.machines`,
-`.components`, `.processes`, `.entitlements` sub-clients instead of one giant method namespace —
+`.components`, `.processes`, `.entitlements`, `.policies`, `.releases`, `.accounts` sub-clients
+instead of one giant method namespace —
 mirrors the resource grouping in the Tamga API protocol specification, keep new endpoint methods on
 the matching sub-client rather than bolting everything onto `TamgaClient` directly.
 
@@ -207,6 +210,51 @@ individually; see `.github/workflows/ci.yml` for the exact order
   runtime keeps working — verified, along with the fact that typos like `max_machiens` are still
   caught. Do not "fix" the conditional into an unconditional definition, and do not add a
   `# type: ignore` to make it visible.
+- **A `kid` hashes the base64 STRING, never the 32 decoded key bytes.** `key_id`
+  (`crypto/ed25519.py`) mirrors the server's `shared/crypto/license_file.rs:70-77`: the first
+  **eight bytes** of `SHA-256` over the public key's published base64 text, lowercase hex —
+  sixteen characters, not eight. The server takes a `&str` and calls `.as_bytes()` on it, so
+  decoding first gives a plausible-looking but wrong id. Same shape of trap as the signature
+  covering `enc`'s base64 string. Pinned from **both** directions by
+  `tests/fixtures/signing_keys/signing-key-ids.json`, which carries a negative vector
+  (`905f28def18eaac0` correct, `630dcd2966c43366` if you decode first) — a test asserting only the
+  positive does not catch it. Corroborated independently by all twelve server-generated fixtures
+  in `tests/fixtures/machine_files/manifest.json`, whose `kid` reproduces from the
+  `public_key_b64` beside it under the same rule, across all four signing schemes.
+- **`key_id("") == "e3b0c44298fc1c14"` is a real, reachable condition, not a curiosity.** Both
+  checkout handlers build the claim as
+  `key_id(account.ed25519_public_key.as_deref().unwrap_or_default())` (`check_out_license.rs:95`,
+  `check_out_machine.rs:127`), so an account whose column was never populated signs every file
+  with that one id. It surfaces as `SigningKeyNotPublishedError`, a subclass of
+  `UnknownSigningKeyError`, because the remedy differs: refetching the key set cannot help and
+  somebody has to rotate the account's key server-side (which backfills the column). Do not fold
+  it back into the generic unknown-key error.
+- **Key-set selection verifies first and reads the `kid` last — do not invert it.** The claim
+  lives *inside* the signed (and possibly encrypted) payload, so resolving by `kid` first would
+  mean parsing attacker-supplied bytes before anything vouched for them, breaking the ordering
+  rule `checkout/machine_file.py`'s module docstring states. `_resolve_signing_key` tries every
+  candidate key against the signature, and reads the `kid` only once all have failed — purely to
+  choose between `UnknownSigningKeyError` ("your set is stale") and `InvalidSignature` ("forged").
+  The happy path never touches the payload unverified, and there is a test that fails if it ever
+  does. ⚠️ `tamga-rust` resolves by `kid` first instead. Both reach the same verdict on every
+  file, but do not "align" this one to that one: this ordering is the one that holds this SDK's
+  own stated invariant, and it additionally tolerates a server that mislabelled a key (selection
+  matches the published `kid` **or** the locally computed one, and `SigningKeySet.inconsistent_keys`
+  reports the disagreement).
+- **A machine file's `kid` is Ed25519-only, whatever signed the file.**
+  `check_out_machine.rs:86-99` picks the signing key by the license's `scheme`, while `:125-129`
+  computes the `kid` from `account.ed25519_public_key` unconditionally — so for an RSA- or
+  ECDSA-signed machine file the claim names a key that had no part in the signature, and
+  `/signing-keys` publishes Ed25519 keys only anyway (`signing_keys.rs` hardcodes `'ed25519'` in
+  both of its inserts). `MachineFile.verify_with_key_set` therefore raises
+  `SigningKeyNotApplicableError` for any recognized non-Ed25519 scheme, and `RSA_2048_JWT_RS256`
+  still raises `SchemeNotSupportedError` ahead of it — rejected, never reclassified. `.lic` files
+  are unaffected: always Ed25519-signed, so their `kid` always names their signing key.
+- **Every new key-set failure is a `ValueError` subclass, and `InvalidSignature` still means
+  forged.** `SigningKeyError(ValueError)` is the base, so a caller written as the documented
+  `except (ValueError, LicenseFileExpired):` keeps catching every rejection — the same contract
+  gap that was a HIGH finding when `data["id"]` leaked `KeyError` past it. "Signature is bad" stays
+  `InvalidSignature` on the new entry points exactly as on the old ones; do not convert it.
 
 ### Server behaviour this SDK has to match
 
@@ -350,6 +398,25 @@ wrong — these replace it.
   `UPDATE`s, so repeating them is safe. Creates stay excluded — retrying `POST /machines` risks
   burning a second seat. When the retry budget is spent the caller gets `errors.RateLimitedError`
   carrying `retry_after`.
+- **`GET /signing-keys` is unreachable with a license key, and an empty result is normal.**
+  `accounts/policy.rs:16-18` gates it on `account.read`, which `Role::LicenseToken`'s fixed
+  permission set does not contain (`shared/authz/mod.rs:241-267`) — and unlike `policies.get` /
+  `licenses.get_policy` there is no second route serving the same resource under a permission it
+  does hold. The embedded client doing offline verification is exactly the one that gets `403`, so
+  `SigningKeySet.from_public_keys` (pin keys at build time) is the documented answer, not a
+  fallback. Separately, `account_signing_keys` is written **only** by `rotate_ed25519`, which
+  backfills the account's current key on its way through, so an account that has never rotated has
+  no rows and the endpoint answers `{"data": []}` — a healthy account, not a failure. Retired keys
+  **are** returned, newest first; that is the whole point of the route.
+- **The signing-key resource `id` IS the `kid`, and `publicKey` is its one camelCase attribute.**
+  `accounts/serializer.rs:119-123` sets `id: k.kid` with a comment saying exactly that, which is
+  why a fetched key needs no local hashing — `key_id` is for the pinned/offline case and
+  `SigningKey.kid_is_self_consistent` is a cross-check, not a requirement. `SigningKeyAttributes`
+  (`:108-117`) is snake_case except for an explicit `#[serde(rename = "publicKey")]`, so it joins
+  `productId` and the two file-resource bags on the short list of camelCase attributes; the
+  spelling is pinned by `tests/fixtures/signing_keys/list_response.json`, whose keys were derived
+  from the Rust struct rather than from this SDK's field names. `retired` is **absent, not null**,
+  while a key is active (`skip_serializing_if`).
 - **`Tamga-Environment` header is not implemented** (gap #7). Don't add it to `transport.py`'s
   request headers even though it's documented as a planned EE feature — no server code path reads
   it yet.
@@ -497,6 +564,13 @@ wrong — these replace it.
   encoder, so CI stayed green while nothing the server emitted could be opened. Self-signed
   certificates remain fine for *post-authentication* robustness tests (see
   `tests/test_checkout_hardening.py`) — a different question from "does the wire format match".
+- **The signing-key vectors are third-party on purpose.**
+  `tests/fixtures/signing_keys/signing-key-ids.json` was generated by an independent SHA-256
+  implementation and confirmed against `tamga-rust`'s committed vector — not by this SDK, the same
+  rule as `tests/fixtures/machine_files/`. Its `negative` entry pins the wrong answer as well as
+  the right one; keep both assertions, because the positive alone does not catch a decode-first
+  implementation. One provenance string in the upstream copy had the generating machine's `id(1)`
+  output shell-substituted into it and was repaired on the way in; no vector value was touched.
 - Golden-byte/known-answer tests matter more than structural-equality tests for the crypto paths —
   e.g. the offline-proof payload test must assert an exact expected byte string, and the HKDF
   derivation test must assert an exact 32-byte key for a fixed input, not just "produces 32 bytes".
