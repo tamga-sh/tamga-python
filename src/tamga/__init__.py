@@ -45,7 +45,10 @@ from tamga.errors import (
     UnknownTamgaError,
 )
 
-__version__ = "0.2.0"
+# Kept in sync by release-please via the `generic` updater and the annotation below.
+# The `python` updater was configured here previously and silently never fired, so this
+# was stranded at 0.2.0 across the 1.0.0, 1.0.1, 1.0.2 and 1.0.3 releases.
+__version__ = "1.0.3"  # x-release-please-version
 
 __all__ = [
     "CheckInNotRequiredError",

@@ -6,7 +6,7 @@
       "package-name": "tamga-sdk",
       "extra-files": [
         {
-          "type": "python",
+          "type": "generic",
           "path": "src/tamga/__init__.py"
         }
       ]
