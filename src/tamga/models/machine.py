@@ -20,32 +20,47 @@ class HeartbeatStatus(str, Enum):
     600 seconds only when that column is unset — it is not a fixed constant, so
     a ping interval sized against 600s is unsafe under a shorter policy.
 
-    **``DEAD`` cannot be observed through any call this SDK makes.** It is a
-    real server-side state, but every route this SDK exposes returns a machine
-    that is definitionally not in it:
+    **Where ``DEAD`` can and cannot come from.** Whether a response can report
+    it depends on whether the server built that response off a *write* it just
+    performed or off a *read* of the stored row.
 
-    - ``ping_heartbeat`` sets ``last_heartbeat_at = NOW()`` and then derives
-      the status from that same timestamp, so the age is ~0 → ``ALIVE`` or
+    Never from these — each one writes the timestamp the status is then derived
+    from, so the verdict is a foregone conclusion:
+
+    - ``machines.ping_heartbeat`` sets ``last_heartbeat_at = NOW()`` and reads
+      the status back off that same timestamp, so the age is ~0 → ``ALIVE`` or
       ``RESURRECTED``.
-    - ``reset_heartbeat`` nulls the timestamp → ``NOT_STARTED``.
+    - ``machines.reset_heartbeat`` nulls the timestamp → ``NOT_STARTED``.
     - ``machines.create`` never sets it → ``NOT_STARTED``.
     - License validation never emits ``ValidationCode.HEARTBEAT_DEAD``.
 
-    ``DEAD`` becomes visible only from a machine *read* (``GET /machines/{id}``
-    or the machine list), which this SDK version does not offer. So do not
-    write code that waits for ``DEAD``, and above all do not treat it as a stop
-    condition — see ``tamga.client.HeartbeatScheduler``, where exactly that
-    branch was both unreachable and, had it fired, unrecoverable.
+    **Genuinely, from machine checkout.** ``machines.check_out`` resolves the
+    machine by id — a read of a row nobody just touched, with the policy joined
+    — so the ``heartbeat_status`` embedded in the signed machine-file payload is
+    a real staleness verdict and can be ``DEAD``. This SDK surfaces it:
+    ``tamga.checkout.machine_file.MachineFile.verify`` parses the field and
+    returns it on the ``MachineResource`` it hands back. That is the path to
+    read if you want to know a machine's true heartbeat state today, and it is
+    why this member exists — it is live, not merely forward-compatible.
 
-    When ``DEAD`` does become readable, it will still mean only "the last ping
-    is older than the window" — never "the row was deleted". The culling worker
-    skips any policy with ``require_heartbeat: false``, which is the default,
-    so under a default policy nothing is culled and a machine past its window
-    keeps its row and its seat indefinitely; the ping is an unconditional
-    ``last_heartbeat_at`` write that revives it. A ``404`` on the ping is the
-    only signal that the row is genuinely gone. Cull/resurrection behavior,
-    where enabled, is described by ``HeartbeatCullStrategy`` and
-    ``HeartbeatResurrectionStrategy`` in ``tamga.models.policy``.
+    (``machines.generate_offline_proof`` resolves the machine the same way, so
+    the status is on the wire there too, but that method returns only a
+    ``tamga.proof.ProofResult`` and does not surface the machine.)
+
+    A machine *read* — ``GET /machines/{id}`` or the machine list — would also
+    report it, but this SDK version exposes neither.
+
+    Whatever the source, ``DEAD`` means only "the last ping is older than the
+    window" — never "the row was deleted". The culling worker skips any policy
+    with ``require_heartbeat: false``, which is the default, so under a default
+    policy nothing is culled and a machine past its window keeps its row and its
+    seat indefinitely; the ping is an unconditional ``last_heartbeat_at`` write
+    that revives it. A ``404`` on the ping is the only signal that the row is
+    genuinely gone. So a ``DEAD`` reading is information, never a reason to stop
+    heartbeating — see ``tamga.client.HeartbeatScheduler``, which stops on no
+    status at all. Cull/resurrection behavior, where enabled, is described by
+    ``HeartbeatCullStrategy`` and ``HeartbeatResurrectionStrategy`` in
+    ``tamga.models.policy``.
     """
 
     NOT_STARTED = "NOT_STARTED"

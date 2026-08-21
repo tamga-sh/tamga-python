@@ -51,11 +51,13 @@ class LicenseScheme(str, Enum):
 class HeartbeatCullStrategy(str, Enum):
     """What happens to a machine once it's ``DEAD`` server-side.
 
-    Describes the culling worker's behavior, not something a client observes:
-    ``DEAD`` is not readable through any route this SDK calls (see
-    ``tamga.models.machine.HeartbeatStatus``). The worker also skips any policy
-    with ``require_heartbeat: false`` — the default — so neither strategy
-    applies at all unless heartbeats are required.
+    Describes the culling worker's behavior, not the client's view. The
+    ``DEAD`` status a client can read — from a checked-out machine file, see
+    ``tamga.models.machine.HeartbeatStatus`` — says nothing about whether
+    either strategy has run. The worker skips any policy with
+    ``require_heartbeat: false``, which is the default, so under a default
+    policy neither strategy applies at all and a machine reported ``DEAD``
+    keeps its row and its seat.
     """
 
     DEACTIVATE_DEAD = "DEACTIVATE_DEAD"

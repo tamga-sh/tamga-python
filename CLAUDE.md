@@ -191,24 +191,29 @@ wrong — these replace it.
   explicit interval. Do not schedule off the ping response's `next_heartbeat_at`: that code path
   does not join the policy. Reading the policy-correct value needs `GET /machines/{id}` or
   `GET /licenses/{id}/policy`, neither of which this SDK exposes yet.
-- **The heartbeat loop must not stop on any status — and `DEAD` is not even observable.** State the
-  rule as the general one: `HeartbeatScheduler.run_forever` pings until `stop()`, until the
-  runtime cancels it, or until the ping raises. It reads nothing off the response to decide
-  whether to continue. `DEAD` is a real server-side state but no route this SDK calls can return
-  it: `ping-heartbeat` writes `last_heartbeat_at = NOW()` and then derives the status from that
-  same timestamp (age ~0 → always `ALIVE` or `RESURRECTED`), `reset-heartbeat` nulls it
-  (`NOT_STARTED`), `POST /machines` never sets it (`NOT_STARTED`), and validation never emits
-  `HEARTBEAT_DEAD`. It becomes readable only from `GET /machines/{id}` or the machine list, which
-  this SDK does not expose yet (M11/M36). `run_forever` used to `break` on a `DEAD` response —
-  a condition the route cannot produce, and one that would have been catastrophic if it ever did,
-  since the break was permanent with nothing to restart the loop. Do not reintroduce a
-  status-based stop condition in any form, do not delete the `DEAD` enum member or the
-  `heartbeat_status` field (both are part of the wire model and go live with a machine read), and
-  do not write `if status == DEAD` branches in examples. The only terminal signal is a `404` from
-  the ping, which propagates to the caller for re-activation. When `DEAD` does become readable it
-  will still mean only "last ping older than the window", never "row deleted" —
-  `require_heartbeat` defaults to `false`, so a default policy culls nothing and the ping revives
-  the machine anyway.
+- **The heartbeat loop must not stop on any status.** State the rule as the general one:
+  `HeartbeatScheduler.run_forever` pings until `stop()`, until the runtime cancels it, or until
+  the ping raises. It reads nothing off the response to decide whether to continue. Do not
+  reintroduce a status-based stop condition in any form. The only terminal signal is a `404` from
+  the ping, which propagates to the caller for re-activation.
+- **Whether `heartbeat_status` can say `DEAD` depends on whether the server wrote or read.** A
+  response the server built off a write it just performed cannot: `ping-heartbeat` writes
+  `last_heartbeat_at = NOW()` and derives the status from that same timestamp (age ~0 → always
+  `ALIVE` or `RESURRECTED`), `reset-heartbeat` nulls it (`NOT_STARTED`), `POST /machines` never
+  sets it (`NOT_STARTED`), and validation never emits `HEARTBEAT_DEAD`. **Machine checkout is a
+  read** — it resolves the row by id, with the policy joined and nothing just written — so the
+  status inside the signed machine-file payload is a genuine staleness verdict and can be `DEAD`.
+  This repo surfaces it: `checkout/machine_file.py` parses `heartbeat_status` (leniently, with a
+  `NOT_STARTED` fallback for unrecognized values) onto the `MachineResource` that
+  `MachineFile.verify` returns. So the enum member is live, not forward-compatibility ballast —
+  never delete it or the `heartbeat_status` field. (`generate_offline_proof` resolves the machine
+  the same way, but this SDK returns only a `ProofResult` from it. `GET /machines/{id}` and the
+  machine list would also report it; neither is exposed yet — M11/M36.) `run_forever` used to
+  `break` on a `DEAD` response: unreachable on the ping route, and catastrophic if it ever had
+  fired, since the break was permanent with nothing to restart the loop. A `DEAD` reading from
+  *any* source still means only "last ping older than the window", never "row deleted" —
+  `require_heartbeat` defaults to `false`, so a default policy culls nothing and the next ping
+  revives the machine anyway.
 - **`reset_heartbeat` and `generate_offline_proof` always 403 under license-key auth.** Both are
   gated on the caller's *role* (admin / developer / product token / environment token), not just a
   permission, and a `LicenseToken` holds none of them — even though it does hold

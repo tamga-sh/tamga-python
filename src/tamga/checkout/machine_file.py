@@ -171,7 +171,14 @@ class MachineFile:
             fingerprint: Required only if the file is encrypted.
 
         Returns:
-            The verified, embedded ``MachineResource``.
+            The verified, embedded ``MachineResource``. Note its
+            ``heartbeat_status``: unlike the ping/reset/create responses — each
+            of which reports a timestamp the same call just wrote — checkout
+            resolves the machine by a *read*, so this field is a genuine
+            staleness verdict and is the one place in this SDK where
+            ``HeartbeatStatus.DEAD`` can actually surface. An unrecognized
+            value falls back to ``NOT_STARTED`` rather than raising after the
+            signature has already passed.
 
         Raises:
             tamga.errors.SchemeNotSupportedError: If ``scheme`` is

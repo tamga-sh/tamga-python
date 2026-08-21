@@ -106,9 +106,10 @@ class ValidationCode(str, Enum):
     """Reachable: ⛔ — declared, never emitted.
 
     Validation does not look at heartbeat state at all, so an over-window
-    machine never shows up here. The machine-side ``DEAD`` status is a real
-    state, but it is not reachable through this code or through any route this
-    SDK calls — see ``tamga.models.machine.HeartbeatStatus``.
+    machine never shows up here. The machine-side ``DEAD`` status is a real,
+    readable state — a checked-out machine file reports it — it simply never
+    reaches the caller through a *validation* code. See
+    ``tamga.models.machine.HeartbeatStatus``.
     """
 
     HEARTBEAT_NOT_STARTED = "HEARTBEAT_NOT_STARTED"

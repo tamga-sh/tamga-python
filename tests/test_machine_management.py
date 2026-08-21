@@ -305,14 +305,15 @@ def test_heartbeat_scheduler_keeps_pinging_after_a_dead_observation(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A defensive test, deliberately mocking a response the real server cannot
-    # send. A ping writes `last_heartbeat_at = NOW()` and derives the status
-    # from that same timestamp, so it always answers ALIVE or RESURRECTED —
-    # DEAD is only reachable from a machine read this SDK does not expose. The
-    # loop used to `break` on DEAD anyway: unreachable in practice, and
-    # permanent if it ever fired, since nothing restarted it. So the rule under
-    # test is the general one — no status ends the loop — and feeding it the
-    # one status that used to be fatal is the sharpest way to hold that.
+    # A defensive test, deliberately mocking a response this particular route
+    # cannot send. A ping writes `last_heartbeat_at = NOW()` and derives the
+    # status from that same timestamp, so it always answers ALIVE or
+    # RESURRECTED. (DEAD itself is perfectly real and readable — a checked-out
+    # machine file reports it — just never from a ping.) The loop used to
+    # `break` on DEAD anyway: unreachable here, and permanent if it ever fired,
+    # since nothing restarted it. So the rule under test is the general one —
+    # no status ends the loop — and feeding it the one status that used to be
+    # fatal is the sharpest way to hold that.
     ping_count = {"n": 0}
     scheduler_box: dict[str, HeartbeatScheduler] = {}
 

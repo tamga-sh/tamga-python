@@ -835,8 +835,12 @@ class MachinesClient:
             **Do not branch on the returned ``heartbeat_status``.** The server
             derives it from the very ``last_heartbeat_at`` this call just set
             to ``NOW()``, so the computed age is ~0 and the answer is always
-            ``ALIVE`` or ``RESURRECTED``. A ping can never report ``DEAD``,
-            and no route this SDK exposes can — see ``HeartbeatStatus``.
+            ``ALIVE`` or ``RESURRECTED``. A ping can never report ``DEAD`` —
+            not because ``DEAD`` is unreachable in general, but because this
+            route's own write rules it out. To read a machine's true heartbeat
+            state, check out a machine file: ``check_out`` resolves the row
+            without writing to it, and the status it embeds can be ``DEAD``
+            (see ``HeartbeatStatus``).
 
         Note:
             The ``next_heartbeat_at`` on this response is computed without
@@ -1221,8 +1225,12 @@ class HeartbeatScheduler:
     Nothing is read off the response to decide whether to continue, and nothing
     should be: the ping's own write makes its ``heartbeat_status`` always
     ``ALIVE`` or ``RESURRECTED`` (see ``MachinesClient.ping_heartbeat``), so a
-    status check here can only ever be dead code or, worse, a stop condition
-    that fires on a value the route cannot produce.
+    status check here is dead code at best.
+
+    Even a ``DEAD`` learned elsewhere — machine checkout does report it
+    truthfully, see ``tamga.models.machine.HeartbeatStatus`` — is not a reason
+    to stop. It means the last ping is older than the window, which is precisely
+    the situation the next ping fixes.
 
     Attributes:
         machine_id: The machine to ping.
@@ -1249,14 +1257,16 @@ class HeartbeatScheduler:
 
         It used to ``break`` when the response reported ``DEAD``, which was
         wrong twice over. Wrong in effect: the break was permanent, nothing
-        restarted the loop, so one bad reading ended heartbeating for the life
+        restarted the loop, so one such reading ended heartbeating for the life
         of the process even though the ping is an unconditional
         ``last_heartbeat_at = NOW()`` write that would have revived the machine
-        on the very next attempt. And wrong in premise: a ping response cannot
-        say ``DEAD`` at all, because the status is computed from the timestamp
-        the same call just wrote. The condition was unreachable *and*
-        catastrophic if reached — so the rule is the general one, not a
-        narrower "don't stop on ``DEAD``": **do not stop on any status.**
+        on the very next attempt. And wrong in premise on this route: a ping
+        response cannot say ``DEAD``, because the status is computed from the
+        timestamp the same call just wrote. (``DEAD`` is real and readable
+        elsewhere — machine checkout reports it — just never here.) The
+        condition was unreachable *and* catastrophic if reached, so the rule is
+        the general one rather than a narrower "don't stop on ``DEAD``": **do
+        not stop on any status.**
 
         The row actually being gone is reported as ``404`` on the ping, not as
         a status: the resulting ``tamga.errors.NotFoundError`` propagates to
