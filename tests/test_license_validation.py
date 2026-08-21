@@ -56,7 +56,7 @@ def test_validate_by_key_sends_key_in_body_and_license_auth_header(
     assert result.license.id == LICENSE_ID
 
 
-def test_validate_by_id_serializes_full_8_field_scope(
+def test_validate_by_id_serializes_the_six_enforced_scope_fields(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
 ) -> None:
     captured: dict[str, httpx.Request] = {}
@@ -88,9 +88,37 @@ def test_validate_by_id_serializes_full_8_field_scope(
     assert sent_scope["environment"] == str(scope.environment)
     assert sent_scope["entitlements"] == ["feature-a", "feature-b"]
     assert sent_scope["fingerprint"] == "fp-abc"
-    assert sent_scope["version"] == "1.2.3"
-    assert sent_scope["checksum"] == "deadbeef"
+    # `version`/`checksum` must NOT go on the wire. The server does not ignore
+    # them: `reject_unenforced_scope` fails the entire call with
+    # `422 SCOPE_NOT_SUPPORTED` before any validation runs, so a caller that
+    # sets one would get no `meta.valid` at all. Dropping them here degrades
+    # that caller to a working validate instead of a hard failure.
+    assert "version" not in sent_scope
+    assert "checksum" not in sent_scope
     assert body["meta"]["skip_touch"] is True
+
+
+def test_a_scope_of_only_version_and_checksum_sends_no_scope_at_all(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    # Nothing enforceable is left once the two rejected keys are dropped, so
+    # the request must not carry an empty `meta.scope` either — the server
+    # rejects on key *presence*, and an empty object is pointless regardless.
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return _validate_response()
+
+    client = make_client(handler)
+    client.licenses.validate_by_id(
+        LICENSE_ID, scope=LicenseScope(version="1.2.3", checksum="deadbeef")
+    )
+
+    import json
+
+    body = json.loads(captured["request"].content or b"{}")
+    assert "scope" not in body.get("meta", {})
 
 
 def test_validate_by_id_skip_touch_false_by_default(

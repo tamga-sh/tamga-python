@@ -8,17 +8,25 @@ import pytest
 
 from tamga.errors import (
     CheckInNotRequiredError,
+    CoreLimitExceededError,
     DatasetInvalidError,
+    DiskLimitExceededError,
     FingerprintTakenError,
     ForbiddenError,
     InternalServerError,
     KeyTakenError,
+    LicenseExpiredError,
     LicenseKeyMissingError,
+    LicenseNotAllowedError,
     LicenseNotEncryptedError,
+    LicenseSuspendedError,
+    MachineLimitExceededError,
+    MemoryLimitExceededError,
     NotFoundError,
     PidTakenError,
     RateLimitedError,
     SchemeNotSupportedError,
+    TooManyProcessesError,
     TtlInvalidError,
     UnauthorizedError,
     UnknownTamgaError,
@@ -50,6 +58,17 @@ def test_parses_json_api_error_envelope(json_api_error_body: dict) -> None:
         ("LICENSE_KEY_MISSING", 422, LicenseKeyMissingError),
         ("SCHEME_NOT_SUPPORTED", 422, SchemeNotSupportedError),
         ("DATASET_INVALID", 422, DatasetInvalidError),
+        # Limit codes: the server enforces machine/core/memory/disk at
+        # creation time, and the process limit at spawn time.
+        ("MACHINE_LIMIT_EXCEEDED", 422, MachineLimitExceededError),
+        ("CORE_LIMIT_EXCEEDED", 422, CoreLimitExceededError),
+        ("MEMORY_LIMIT_EXCEEDED", 422, MemoryLimitExceededError),
+        ("DISK_LIMIT_EXCEEDED", 422, DiskLimitExceededError),
+        ("TOO_MANY_PROCESSES", 422, TooManyProcessesError),
+        # Auth-gate codes: these fail before any endpoint logic runs.
+        ("LICENSE_SUSPENDED", 401, LicenseSuspendedError),
+        ("LICENSE_EXPIRED", 401, LicenseExpiredError),
+        ("LICENSE_NOT_ALLOWED", 401, LicenseNotAllowedError),
     ],
 )
 def test_each_typed_exception_raised_for_its_matching_code(
@@ -131,3 +150,31 @@ def test_malformed_body_does_not_crash() -> None:
     error = parse_error_envelope(500, b"not json at all")
     assert isinstance(error, UnknownTamgaError)
     assert error.status == 500
+
+
+def test_license_not_allowed_is_a_configuration_error_not_a_bad_key() -> None:
+    # 401 LICENSE_NOT_ALLOWED means the policy's authentication_strategy is
+    # TOKEN (the default) or NONE, so license-key auth is switched off. It is
+    # not a wrong-credential error and must never be retried — before this had
+    # its own class it fell through to UnknownTamgaError alongside genuinely
+    # unknown codes.
+    body = json.dumps(
+        {
+            "errors": [
+                {
+                    "id": "e1",
+                    "status": "401",
+                    "code": "LICENSE_NOT_ALLOWED",
+                    "title": "Unauthorized",
+                    "detail": "license authentication is not permitted for this policy",
+                }
+            ]
+        }
+    ).encode("utf-8")
+
+    error = parse_error_envelope(401, body)
+
+    assert isinstance(error, LicenseNotAllowedError)
+    assert not isinstance(error, UnknownTamgaError)
+    assert error.status == 401
+    assert error.code == "LICENSE_NOT_ALLOWED"

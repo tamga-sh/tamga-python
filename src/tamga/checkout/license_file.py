@@ -30,14 +30,13 @@ to verify even though the key and data are both correct.
 
 from __future__ import annotations
 
-import base64
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from cryptography.exceptions import InvalidSignature
 
-from tamga.checkout._envelope import parse_certificate_envelope
+from tamga.checkout._envelope import b64decode_strict, parse_certificate_envelope
 from tamga.crypto.aes_gcm import decrypt as aes_gcm_decrypt
 from tamga.crypto.ed25519 import verify as ed25519_verify
 from tamga.crypto.hkdf import derive_license_file_key
@@ -68,11 +67,23 @@ class LicenseFileExpired(ValueError):
     Distinct from a signature failure on purpose: a caller that cannot tell
     "expired" from "forged" either warns the user about tampering when their
     trial merely ended, or treats a forgery as a renewal prompt.
+
+    Machine files carry the same signed ``meta.exp`` claim and reuse this
+    outcome through the
+    ``tamga.checkout.machine_file.MachineFileExpired`` subclass, so a single
+    ``except LicenseFileExpired:`` covers both offline file types.
     """
 
-    def __init__(self, exp: int) -> None:
-        """Initialize with the signed ``exp`` claim (Unix timestamp) that failed the check."""
-        super().__init__(f"license file expired at unix timestamp {exp}")
+    def __init__(self, exp: int, *, file_kind: str = "license file") -> None:
+        """Initialize with the signed ``exp`` claim (Unix timestamp) that failed the check.
+
+        Args:
+            exp: The signed ``exp`` claim that failed the check.
+            file_kind: Human-readable file type used in the message. Only the
+                ``MachineFileExpired`` subclass overrides it; the default
+                keeps this class's own message unchanged.
+        """
+        super().__init__(f"{file_kind} expired at unix timestamp {exp}")
         self.exp = exp
 
 
@@ -187,13 +198,63 @@ class LicenseFile:
                 supplied, or the payload is malformed / missing its signed
                 ``meta`` claims.
         """
+        license, _ = self._verify(public_key, license_key, now)
+        return license
+
+    def verify_with_claims(
+        self,
+        public_key: bytes,
+        license_key: str | None = None,
+        now: int | None = None,
+    ) -> tuple[LicenseResource, LicenseFileClaims]:
+        """As :meth:`verify`, also returning the signed claims.
+
+        Use this when you want ``jti`` for replay detection or ``kid`` for
+        key-rotation bookkeeping. Expiry is enforced either way — it is not
+        opt-in.
+
+        Args:
+            public_key: The account's raw 32-byte Ed25519 public key.
+            license_key: The license's raw key string. Required only if
+                ``self.alg == ALG_ENCRYPTED``.
+            now: Current Unix timestamp; see :meth:`verify`.
+
+        Returns:
+            ``(license, claims)`` — the verified ``LicenseResource`` and the
+            signed ``iat``/``exp``/``jti``/``kid`` claims that travelled
+            inside the signature.
+        """
+        return self._verify(public_key, license_key, now)
+
+    def _verify(
+        self,
+        public_key: bytes,
+        license_key: str | None,
+        now: int | None,
+    ) -> tuple[LicenseResource, LicenseFileClaims]:
+        """Shared verification pipeline behind :meth:`verify`/:meth:`verify_with_claims`.
+
+        ``verify_with_claims`` used to call ``verify`` and then decode,
+        derive the HKDF key and AES-GCM-open the payload a *second* time to
+        get at the claims — two decrypts and an ``assert license_key is not
+        None`` that ``python -O`` strips, for one file. Running the pipeline
+        once mirrors ``tamga.checkout.machine_file.MachineFile._verify`` and
+        removes both. Flagged LOW by the mandatory security-reviewer pass.
+        """
         # ⚠️ Sign over `self.enc`'s ASCII/UTF-8 STRING bytes, never
         # `base64.b64decode(self.enc)` — see module docstring.
         message_bytes = self.enc.encode("ascii")
         if not ed25519_verify(public_key, message_bytes, self.sig):
             raise InvalidSignature("license file signature verification failed")
 
-        payload_bytes = base64.b64decode(self.enc)
+        # Strict about the alphabet, matching every other decode on these two
+        # paths. Nothing legitimate is lost: the signature covers `enc`'s exact
+        # ASCII bytes, so an `enc` that reaches here has already been proven
+        # byte-identical to what the server emitted — which is plain base64.
+        # The lax decode this replaces silently dropped stray characters, the
+        # same laxity that hid the machine-file `<nonce_b64>.<cipher_b64>`
+        # misreading for two years. Flagged LOW by the security-reviewer pass.
+        payload_bytes = b64decode_strict(self.enc, "payload", file_kind="license file")
 
         if self.alg == ALG_ENCRYPTED:
             if license_key is None:
@@ -228,36 +289,7 @@ class LicenseFile:
         claims = _parse_claims(parsed)
         _enforce_expiry(claims, now)
 
-        return LicenseResource(
-            id=data["id"],
-            type=data["type"],
-            attributes=data.get("attributes", {}),
-            relationships=data.get("relationships", {}),
-        )
-
-    def verify_with_claims(
-        self,
-        public_key: bytes,
-        license_key: str | None = None,
-        now: int | None = None,
-    ) -> tuple[LicenseResource, LicenseFileClaims]:
-        """As :meth:`verify`, also returning the signed claims.
-
-        Use this when you want ``jti`` for replay detection or ``kid`` for
-        key-rotation bookkeeping. Expiry is enforced either way — it is not
-        opt-in.
-        """
-        license = self.verify(public_key, license_key, now)
-        payload_bytes = base64.b64decode(self.enc)
-        if self.alg == ALG_ENCRYPTED:
-            assert license_key is not None  # verify() already enforced this
-            nonce = payload_bytes[:_NONCE_LENGTH]
-            plaintext = aes_gcm_decrypt(
-                derive_license_file_key(license_key), nonce, payload_bytes[_NONCE_LENGTH:]
-            )
-        else:
-            plaintext = payload_bytes
-        return license, _parse_claims(json.loads(plaintext))
+        return _license_resource_from(data), claims
 
     def is_expired(self, as_of: datetime | None = None) -> bool:
         """Check the unsigned ``expiry`` metadata field.
@@ -299,19 +331,79 @@ class LicenseFile:
         return expiry_dt < reference
 
 
-def _parse_claims(parsed: object) -> LicenseFileClaims:
+def _license_resource_from(data: object) -> LicenseResource:
+    """Build a ``LicenseResource`` from an already-verified payload's ``data``.
+
+    Every access here used to be a bare subscript or an unchecked
+    ``.get``: a ``data`` that is not an object raised ``TypeError``, a
+    missing ``id``/``type`` raised ``KeyError``, and a non-object
+    ``attributes``/``relationships`` was stored as-is despite both fields
+    being declared ``dict[str, Any]`` — so the caller's first
+    ``license.attributes[...]`` blew up instead. None of those are in
+    :meth:`LicenseFile.verify`'s documented ``Raises:``, so a caller written
+    as the documented ``except (ValueError, LicenseFileExpired):`` missed
+    the rejection. All of it sits behind a valid signature, so this is a
+    contract gap rather than a bypass; ``tamga.checkout.machine_file``
+    carries the mirror-image guard for the same reason.
+
+    Args:
+        data: The payload's ``data`` member, post signature verification.
+
+    Returns:
+        The parsed resource.
+
+    Raises:
+        ValueError: If ``data`` is not an object, is missing ``id``/``type``,
+            or carries a non-object ``attributes``/``relationships``.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("malformed license file: payload's 'data' is not a JSON object")
+    for key in ("id", "type"):
+        if key not in data:
+            raise ValueError(f"malformed license file: payload's 'data' is missing {key!r}")
+    members = {}
+    for key in ("attributes", "relationships"):
+        value = data.get(key)
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise ValueError(f"malformed license file: payload's 'data.{key}' is not a JSON object")
+        members[key] = value
+    return LicenseResource(
+        id=data["id"],
+        type=data["type"],
+        attributes=members["attributes"],
+        relationships=members["relationships"],
+    )
+
+
+def _parse_claims(parsed: object, *, file_kind: str = "license file") -> LicenseFileClaims:
     """Pull the signed ``meta`` claims out of a decoded payload.
 
     A payload with no ``meta`` is a v1 file. The ``alg`` gate should have
     caught it already; this is the second line, so a file cannot reach the
     expiry check with nothing to check.
+
+    Shared with ``tamga.checkout.machine_file``: the server builds a machine
+    file's ``meta`` from the very same ``LicenseFileClaims`` struct, so both
+    file types parse identically and only the wording of the error differs.
+
+    Args:
+        parsed: The decoded (and already signature-verified) payload.
+        file_kind: Human-readable file type used in error messages.
+
+    Returns:
+        The parsed claims.
+
+    Raises:
+        ValueError: If ``meta`` is absent or malformed.
     """
     if not isinstance(parsed, dict):
-        raise ValueError("malformed license file: payload is not a JSON object")
+        raise ValueError(f"malformed {file_kind}: payload is not a JSON object")
     meta = parsed.get("meta")
     if not isinstance(meta, dict):
         raise ValueError(
-            "malformed license file: payload is missing the signed 'meta' claims "
+            f"malformed {file_kind}: payload is missing the signed 'meta' claims "
             "(this looks like a pre-v2 file)"
         )
     try:
@@ -321,14 +413,35 @@ def _parse_claims(parsed: object) -> LicenseFileClaims:
             kid=str(meta["kid"]),
             exp=int(meta["exp"]) if meta.get("exp") is not None else None,
         )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"malformed license file: bad 'meta' claims ({exc})") from exc
+    # OverflowError is in the tuple because json.loads accepts the non-standard
+    # `Infinity`/`-Infinity` tokens by default, and int(float("inf")) raises it
+    # rather than ValueError -- which would escape every documented `Raises:
+    # ValueError` on the two verify() methods. (NaN already lands on ValueError.)
+    # Found by the security-reviewer pass on the machine-file v2 work.
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"malformed {file_kind}: bad 'meta' claims ({exc})") from exc
 
 
-def _enforce_expiry(claims: LicenseFileClaims, now: int | None) -> None:
-    """Reject a file whose signed ``exp`` has passed."""
+def _enforce_expiry(
+    claims: LicenseFileClaims,
+    now: int | None,
+    *,
+    expired_error: type[LicenseFileExpired] = LicenseFileExpired,
+) -> None:
+    """Reject a file whose signed ``exp`` has passed.
+
+    ``exp`` is optional by design — a checkout made without a ``ttl`` produces
+    a file that genuinely never expires — so an absent claim is not an error.
+
+    Args:
+        claims: The signed claims taken from the verified payload.
+        now: Caller-supplied Unix timestamp, or ``None`` to read the local
+            clock. The local clock is attacker-controlled, hence the hatch.
+        expired_error: Which ``LicenseFileExpired`` (sub)class to raise, so
+            machine files surface the same outcome under their own name.
+    """
     if claims.exp is None:
         return
     reference = now if now is not None else int(datetime.now(timezone.utc).timestamp())
     if reference - CLOCK_SKEW_TOLERANCE_SECONDS > claims.exp:
-        raise LicenseFileExpired(claims.exp)
+        raise expired_error(claims.exp)

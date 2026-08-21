@@ -59,8 +59,9 @@ Runnable end-to-end scripts live in [`examples/`](examples/):
   encrypted, through the full verify pipeline.
 - [`machine_activation_flow.py`](examples/machine_activation_flow.py) — create machine → validate
   → roll back on over-limit.
-- [`heartbeat_scheduler.py`](examples/heartbeat_scheduler.py) — machine (600s window) vs. process
-  (30s window) heartbeat scheduling side by side.
+- [`heartbeat_scheduler.py`](examples/heartbeat_scheduler.py) — machine (window read from the
+  policy, 600s only as a fallback) vs. process (30s window) heartbeat scheduling side by side,
+  including disposing of the process row afterwards.
 - [`offline_proof.py`](examples/offline_proof.py) — air-gapped machine proof generation and
   verification.
 
@@ -99,6 +100,104 @@ opaque strings and do not build prefix-based type detection.
 `licenses.validate_by_key(key)` falls back to `Authorization: License <key>` for the key being
 validated when no `default_auth` is configured, since it already holds the credential
 (`src/tamga/client.py::LicensesClient.validate_by_key`).
+
+**License-key auth must be enabled on the policy.** `Authorization: License <key>` (and the
+`license:<key>` Basic sub-form) is only accepted when the license's policy sets
+`authentication_strategy` to `"LICENSE"` or `"MIXED"`. That column defaults to `"TOKEN"`, and
+`"NONE"` behaves the same way at the auth gate — under either the server answers
+`401 LICENSE_NOT_ALLOWED`, raised as `tamga.errors.LicenseNotAllowedError`. That is a
+configuration precondition to fix on the policy, not a transient failure: retrying the same key
+never succeeds, and it does not mean the key is wrong. Separately, a policy with
+`expiration_strategy: "REVOKE_ACCESS"` stops an expired license from authenticating at all
+(`401 LICENSE_EXPIRED`); the other three expiration strategies still authenticate it and report
+expiry through the validation result instead.
+
+The host may be given with an explicit `http://` scheme for a self-hosted or local deployment —
+it is preserved, not silently upgraded. A bare host defaults to `https`.
+
+## Activating a machine and keeping it alive
+
+```python
+from tamga.client import HeartbeatScheduler
+
+with TamgaClient(config) as client:
+    # Idempotent: a repeat activation of the same fingerprint returns the
+    # machine that already exists instead of raising `409 FINGERPRINT_TAKEN`.
+    machine = client.machines.activate_machine_idempotent(license_id, fingerprint)
+
+    # Size the ping interval from the policy that actually sets the window.
+    # 600s is only what the server falls back to when `heartbeat_duration` is
+    # unset — a 120s policy needs a 40s ping, not the 200s default.
+    policy = client.licenses.get_policy(license_id)
+    HeartbeatScheduler.for_policy(client.machines, machine.id, policy).run_forever()
+```
+
+Read the policy through `licenses.get_policy(license_id)`, not `policies.get(policy_id)`: the
+former is gated on `license.read`, which a license key holds; the latter on `policy.read`, which
+it does not, so it answers `403` under license-key auth.
+
+Both schedulers also accept an `interval` directly, and **that value is not honoured verbatim
+below one second**: a non-positive one becomes the scheduler's recommended default (200s machine,
+10s process) and a positive sub-second one is raised to `MIN_HEARTBEAT_INTERVAL`, so
+`timedelta(milliseconds=500)` pings once a second. Nothing raises. That is a busy-loop guard
+rather than a rounding convenience — `time.sleep` *honours* a sub-second request, so an
+unguarded `timedelta(microseconds=1)` is not a fast heartbeat but roughly 163,000
+`ping-heartbeat` requests a second, each individually valid and correctly authenticated. The
+floor costs nothing a policy can ask for, since `heartbeat_duration` is an integer-**seconds**
+column and the server judges liveness on truncated whole seconds — a machine first reads `DEAD`
+at `window_secs + 1`, so even a 1s window has two seconds of slack at a 1s ping. What it does
+cost is loss tolerance on windows under 3s; the full table is in `tests/test_policy_read.py`.
+
+`machines.get(machine_id)` is the read path where `heartbeat_status` is a genuine staleness
+verdict — the ping/reset/create routes each derive the status from a timestamp they just wrote, so
+they can never report `DEAD`. `DEAD` still never means the row was culled; only a `404` from the
+ping does.
+
+A process is the mirror image, because nothing on the server reaps process rows:
+
+```python
+from tamga.client import ProcessHeartbeatScheduler
+
+with TamgaClient(config) as client:
+    process = client.processes.create(machine.id, pid=str(os.getpid()))
+    # `dispose` on exit stops the loop *and* deletes the row, freeing its slot
+    # against `policy.max_processes` — `stop()` alone would leak it.
+    with ProcessHeartbeatScheduler(client.processes, process.id) as scheduler:
+        scheduler.run_forever()
+```
+
+## Checking for updates
+
+```python
+with TamgaClient(config) as client:
+    release = client.releases.check_for_upgrade(
+        product_id=product_id,
+        platform="darwin-arm64",
+        filetype="dmg",
+        version=__version__,
+    )
+
+if release is None:
+    # NOT "you are up to date". The server answers `204 No Content` both when
+    # nothing newer exists and when something newer exists that this license is
+    # not entitled to, deliberately, so that a denial cannot leak the latter.
+    print("No update is available to you.")
+else:
+    print("Update available:", release.version)
+```
+
+## Diagnosing a misconfigured deployment
+
+```python
+with TamgaClient(config) as client:
+    print(client.health())
+```
+
+`GET /v1/health` is the one route outside `/v1/accounts/{account_id}`, and it is exempt both from
+the auth gate and from the server's `Host`-header allowlist. So if every other call fails with
+`403` and *"The Host header does not match any configured host"* while this one succeeds, the
+problem is the server's `TAMGA_ALLOWED_HOSTS` configuration — not the caller's credential. If this
+one fails too, the server is unreachable and no credential would have helped.
 
 ## Offline verification
 
@@ -150,9 +249,41 @@ print(claims.iat, claims.exp, claims.jti, claims.kid)
 
 Machine files use the same `{enc, sig, alg}` envelope but dispatch signature verification on the
 license's own `scheme` (`ED25519_SIGN`, `RSA_2048_PKCS1_SIGN`, `RSA_2048_PKCS1_PSS_SIGN`,
-`ECDSA_P256_SIGN`) via `src/tamga/checkout/machine_file.py::MachineFile.verify`, and they are not
-part of the `+v2` `alg` vocabulary. `src/tamga/proof.py::ProofResult.verify` covers the lighter
-air-gapped machine offline proof.
+`ECDSA_P256_SIGN`) via `src/tamga/checkout/machine_file.py::MachineFile.verify`.
+
+```python
+from tamga.checkout import MachineFile
+from tamga.checkout.machine_file import MachineFileExpired
+from tamga.models.policy import LicenseScheme
+
+machine_file = MachineFile.parse(certificate)
+try:
+    machine, claims = machine_file.verify_with_claims(
+        ACCOUNT_PUBLIC_KEY,
+        LicenseScheme.ED25519_SIGN,  # from the license, never from the file's own `alg`
+        license_key="YOUR-LICENSE-KEY",  # encrypted files only
+        fingerprint=THIS_MACHINE_FINGERPRINT,  # encrypted files only
+    )
+except MachineFileExpired as exc:
+    ...  # authentic but lapsed -> check out a fresh one; `exc.exp` says when
+print(machine.heartbeat_status, claims.jti, claims.kid)
+```
+
+Machine files are format v2 as well:
+
+- **`alg` carries the mandatory `+v2` suffix** — `base64+ed25519+v2`,
+  `aes-256-gcm+rsa-pss-sha256+v2`, and the six other combinations of encoding prefix and signing
+  suffix. A file without it is rejected with no fallback, for the same reason a v1 `.lic` is.
+- **`meta.exp` is enforced**, sharing `CLOCK_SKEW_TOLERANCE_SECONDS` with the `.lic` path and
+  raising `MachineFileExpired` — a subclass of `LicenseFileExpired`, so one `except` clause covers
+  both file types. `exp` is optional by design: a checkout made without a `ttl` produces a file
+  that genuinely never expires. Pass `verify(..., now=<server-supplied timestamp>)` when
+  defending against a rewound clock.
+- **An encrypted machine file's `enc` is `"<nonce_b64>.<cipher_b64>"`** — two *separately*
+  base64-encoded halves, not the single `base64(nonce ‖ ciphertext ‖ tag)` blob a `.lic` uses.
+  The signature covers the whole `enc` string, so verification happens before the split.
+
+`src/tamga/proof.py::ProofResult.verify` covers the lighter air-gapped machine offline proof.
 
 ## Security notes
 
@@ -181,17 +312,45 @@ air-gapped machine offline proof.
   server answers `429`. `src/tamga/client.py::_retry_delay` prefers the server's `Retry-After`
   but caps it at 60s, otherwise using jittered exponential backoff so a fleet does not reconverge
   into the spike it was backing off from. `src/tamga/client.py::_is_retryable` scopes auto-retry
-  to every `GET` plus exactly five `POST` actions — `validate`, `validate-key`, `check-in`,
-  `check-out`, `ping` — because those are the calls a client makes on a timer. Creates are
+  to every `GET` plus exactly seven `POST` actions — `validate`, `validate-key`, `check-in`,
+  `check-out`, `ping`, `ping-heartbeat`, `reset-heartbeat` — because those are the calls a client
+  makes on a timer. (`ping-heartbeat` does **not** end with `/actions/ping`; that suffix matches
+  only the process route, so it needs its own entry.) Creates are
   deliberately excluded: retrying `POST /machines` risks burning a second seat. Tune with
   `TamgaConfig(max_retries=...)`; `0` disables retries and the raised
   `tamga.errors.RateLimitedError` still carries `retry_after`.
+- **The license read routes are not scoped to the calling license.** `licenses.get(license_id)`
+  and `licenses.get_policy(license_id)` reach `GET /licenses/{id}` and
+  `GET /licenses/{id}/policy`, which authorize on the `license.read` permission and the account
+  resolved from the bearer — and on nothing else. Any license key that authenticates can therefore
+  read *every* license in the same account, including each one's `attributes.key` in plain text.
+  Both methods are exposed because reading your own policy is how the heartbeat window is
+  discovered at all, but do not mistake the surface for a scoped one: never embed a license key in
+  a context where an attacker recovering it should not also be able to enumerate the account's
+  other keys. This is server-side behaviour the SDK cannot fix; it has been reported upstream.
+- **The machine routes are unscoped too, and three of them write.** The server has a
+  `require_license_scope` check that confines a license credential to its own license, and it is
+  applied to exactly five routes: `validate`, `validate-key`, `quick-validate`, and both license
+  check-out variants. It is applied to **no** machine route. A license token's default permissions
+  include `machine.read`, `machine.update` and `machine.delete`, so `machines.list`,
+  `machines.get`, `machines.update` and `machines.delete` all reach every machine in the account —
+  not just the ones on the calling license. Read is the same exposure as the license routes above;
+  update and delete are worse, because they change state. Treat a license key as an
+  account-scoped credential in your threat model, not a license-scoped one. Reported upstream.
 - **Verification failures stay uniform inside a step.** A wrong key, a malformed key, and a
   tampered message all collapse to one `InvalidSignature`
   (`src/tamga/crypto/ed25519.py::verify`). The steps themselves remain distinguishable on
   purpose: `InvalidSignature` (not authentic), `InvalidTag` (authentic but decryption failed),
   `LicenseFileExpired` (authentic but expired), `ValueError` (malformed input that never reached
   a cryptographic operation).
+- **`except TamgaError:` catches everything raised against the server.** That includes
+  `MachineOverLimitError` from `activate_machine`, which reports a licence at its machine / core /
+  memory / disk limit. It also subclasses `ValueError`, deliberately and permanently, because both
+  activation rejection paths used to raise a bare `ValueError` — so existing `except ValueError:`
+  handlers keep working. Do not confuse it with the plain `ValueError`s above: those come from the
+  *offline* parsers and mean "this input is malformed", where failing closed is correct. An
+  over-limit rejection means the server said no, and carries `validation_code` plus a
+  `rolled_back` flag saying whether a machine row was created and then deleted.
 
 Report suspected vulnerabilities privately to **security@tamga.sh** — see
 [`SECURITY.md`](SECURITY.md).
@@ -202,22 +361,103 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
 - **No session-cookie transport.** Browser/portal only, out of scope here.
 - **No `Tamga-Environment` header.** No server code path reads it yet, so the SDK does not send
   it.
-- **No releases/auto-update sub-client.** The upgrade-check endpoint is not usable server-side.
-- **`X-RateLimit-*` response headers are not sent.** `Retry-After` on a `429` is the only
-  server-side rate-limit signal available (`src/tamga/transport.py::parse_retry_after`), and only
-  its delta-seconds form is honored — the HTTP-date form is ignored rather than risking a date
-  being misread as a duration.
-- **10 of the 24 `ValidationCode` members are declared but never emitted today** (`BANNED`,
-  `ENTITLEMENTS_MISSING`, `TOO_MANY_USERS`, `HEARTBEAT_DEAD`, `HEARTBEAT_NOT_STARTED`, the
-  `FINGERPRINT`/`COMPONENTS`/`CHECKSUM`/`VERSION` scope mismatches, and `NOT_FOUND`, which comes
-  back as a raw HTTP 404). Per-member reachability is documented in
-  `src/tamga/models/validation.py`.
-- **Only four `LicenseScope` fields are enforced server-side** — `product`, `policy`, `user`,
-  `environment`. `entitlements`, `fingerprint`, `version`, and `checksum` are sent and silently
-  ignored.
-- **Pagination cursors are inferred.** `components.list`/`entitlements.list` return
-  `next_after=None` unless you pass an explicit `limit`, because the server exposes no cursor
-  metadata (`src/tamga/client.py::_next_after_cursor`).
+- **`204` from the upgrade check has two meanings, and no client can tell them apart.**
+  `releases.check_for_upgrade` returns `None` both when nothing newer exists *and* when something
+  newer exists that this license is not entitled to. That is deliberate server-side — a denial
+  would leak "a newer version exists but you can't have it" — so report `None` as *no update is
+  available to you*, never as "you are up to date". A suspended license is a separate `403`.
+- **The `releases` resource is camelCase; almost nothing else is.** `check_for_upgrade` returns a
+  release whose owning product arrives as `productId`, not `product_id` — `ReleaseAttributes` is
+  one of only ten attribute structs on the server that carry `rename_all = "camelCase"`. Its
+  `created`/`updated` are the exception inside the exception: explicit serde renames override the
+  camelCase rule, so those two are spelled as they are everywhere else. Machines, policies,
+  licenses, components and processes are all snake_case.
+- **There is no exact fingerprint filter on `GET /machines`.** The server offers
+  `filter[license|owner|group|platform]` and a free-text `filter[q]`, and `filter[q]` is a
+  case-insensitive substring match across `name`, `hostname` *and* `fingerprint`, truncated to 200
+  characters. `machines.find_by_fingerprint` therefore narrows with the search and then compares
+  exactly client-side; both approximations run toward a superset, so it never returns a machine
+  with a different fingerprint, but it costs a scan rather than a lookup.
+- **A listed machine cannot be attributed to a license.** The machine resource carries no
+  `license_id` and no `relationships` object, so `filter[license]` on `machines.list` is the only
+  thing that ties a machine to a license — there is nothing on the resource to check the answer
+  against. `find_by_fingerprint` therefore *requires* a `license_id` rather than defaulting to an
+  account-wide scan: an unscoped result is a row the caller cannot attribute and must not act on.
+  A deliberate account-wide search is still available through `machines.list(search=...)`, where
+  it is explicit.
+- **A cross-license `409 FINGERPRINT_TAKEN` is not recoverable, deliberately.** All three
+  `machine_uniqueness_strategy` values include the caller's own license in the duplicate check —
+  `UNIQUE_PER_LICENSE` matches its rows exactly, `UNIQUE_PER_POLICY` joins on the policy that
+  license already belongs to, `UNIQUE_PER_ACCOUNT` covers everything — so a genuine re-activation
+  of the same license and fingerprint is always found and returned. What the two wider scopes add
+  is the *cross-license* conflict, and `activate_machine_idempotent` re-raises rather than
+  returning that machine: it belongs to another license, the caller would heartbeat and check it
+  out while this license's `machines_count` stayed at zero, and that is precisely the seat-sharing
+  the wider scopes exist to prevent.
+- **`GET /policies/{id}` always fails under license-key auth.** It authorizes on the `policy.read`
+  permission, which is not in the license-token permission set. Read the policy through
+  `licenses.get_policy(license_id)` instead — same resource, but a route gated on `license.read`,
+  which a license credential does hold. `policies.get` exists for callers holding a privileged
+  token.
+- **The license read routes are not scoped to the calling license.** `GET /licenses/{id}` and
+  `GET /licenses/{id}/policy` authorize on `license.read` and the account resolved from the
+  bearer, and nothing further — so any license key that authenticates can read every license in
+  the same account, `attributes.key` included, in plain text. Server-side behaviour this SDK
+  cannot fix and does not work around; reported upstream.
+- **`policy.max_memory` and `policy.max_disk` are always `None`.** The server omits both from the
+  policy response even though it enforces them, so the only way to observe either limit is a
+  `TOO_MUCH_MEMORY` / `TOO_MUCH_DISK` validation code.
+- **`machines.update` cannot clear a field.** Every column is applied through
+  `COALESCE(new, existing)` server-side, so an omitted or `None` field means "leave alone", never
+  "set to null". Its response also judges `heartbeat_status`/`next_heartbeat_at` against the 600s
+  fallback rather than the policy window — that query does not join `policies`. Read the machine
+  back with `machines.get` when either field matters.
+- **Whether `heartbeat_status` can say `DEAD` depends on whether the server wrote or read.** The
+  write-shaped routes preclude it by construction: a heartbeat ping reports the timestamp it just
+  wrote (always `ALIVE` or `RESURRECTED`), a reset nulls it (`NOT_STARTED`), and a create never
+  sets it (`NOT_STARTED`). The read paths do not, so `machines.get`, `machines.list` and machine
+  checkout all carry a genuine staleness verdict. `PATCH` sits between the two: it writes, but
+  never to `last_heartbeat_at`, so it *can* report `DEAD` — just judged against the 600s fallback,
+  since that query does not join the policy. A `DEAD` reading still never means the row was
+  deleted, so it is information rather than a stop condition: `HeartbeatScheduler` stops for no
+  status at all — only `stop()`, cancellation, or a `404` from the ping (the row is gone —
+  re-activate) ends the loop.
+- **Request bodies are enveloped on some endpoints and flat on others.** Responses are JSON:API
+  documents throughout, but requests are not: `machines.create` and `machines.update` send
+  `{"data": {"type", "attributes", ...}}`, while `components.create` and `processes.create` send
+  their fields at the top level, because those two handlers deserialize into plain structs. It is
+  a per-endpoint fact with no rule behind it, and normalizing the two to match breaks one of them.
+- **Nothing reaps process rows server-side.** The 30s process window exists but no scheduled job
+  acts on it, so a process that merely stops pinging holds its slot against `policy.max_processes`
+  forever. Deleting it is the application's job: call `processes.delete`, or use
+  `ProcessHeartbeatScheduler.dispose` (or the scheduler as a context manager), which stops the
+  loop and deletes the row together.
+- **`reset_heartbeat` and `generate_offline_proof` always fail under license-key auth.** Both are
+  role-gated (admin / developer / product token / environment token), so a license key gets `403`
+  every time. `ping_heartbeat` is permission-only and works.
+- **`X-RateLimit-*` response headers are not surfaced.** `Retry-After` on a `429` is the only
+  rate-limit signal this SDK reads (`src/tamga/transport.py::parse_retry_after`), and only its
+  delta-seconds form is honored — the HTTP-date form is ignored rather than risking a date being
+  misread as a duration.
+- **8 of the 24 `ValidationCode` members are declared but never emitted today** (`BANNED`,
+  `TOO_MANY_USERS`, `HEARTBEAT_DEAD`, `HEARTBEAT_NOT_STARTED`, `COMPONENTS_SCOPE_MISMATCH`,
+  `NOT_FOUND` — which comes back as a raw HTTP 404 — and the `CHECKSUM`/`VERSION` scope
+  mismatches, whose scope keys are rejected outright rather than evaluated). Per-member
+  reachability is documented in `src/tamga/models/validation.py`.
+- **Six `LicenseScope` fields are enforced** — `product`, `policy`, `user`, `environment`,
+  `entitlements`, and `fingerprint`. `version` and `checksum` are **not** ignored: sending either
+  makes the server reject the entire validate call with `422 SCOPE_NOT_SUPPORTED`, so this SDK
+  deprecates them and does not put them on the wire.
+- **License entitlements cannot be paginated.** The server ignores `page[after]` on
+  `/licenses/{id}/entitlements` (the listing unions direct and policy-inherited rows), so
+  `entitlements.list` always returns `next_after=None` and `list_all` is a single request capped
+  at 100 rows. A license with more than 100 effective entitlements cannot be enumerated in full,
+  which makes a negative `has_entitlement` authoritative only below that ceiling.
+  `components.list` is genuinely keyset-paginated and does page to completion.
+- **`quick_validate` records nothing if the request carries an `Origin` header.** The server skips
+  the `last_validated_at` write and returns a byte-identical response, so a proxy that injects
+  `Origin` silently disables it. This SDK never sends `Origin`; use `validate_by_id` when the
+  write matters.
 - **No CLI.** The package ships a library only.
 
 ## Documentation

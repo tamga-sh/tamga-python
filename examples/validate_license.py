@@ -27,10 +27,12 @@ def main() -> None:
         if result.license is None:
             return
 
-        # 2. Validate by ID with a scope — only product/policy/user/environment
-        #    are actually enforced server-side today (see the Tamga API protocol
-        #    specification section 2);
-        #    the other 4 fields are parsed but silently ignored.
+        # 2. Validate by ID with a scope. Six fields are enforced:
+        #    product/policy/user/environment, plus entitlements (codes,
+        #    case-insensitive) and fingerprint (matches any machine on the
+        #    license — this is the anti-key-sharing check). `version` and
+        #    `checksum` are deprecated and never sent: the server rejects the
+        #    whole call with 422 SCOPE_NOT_SUPPORTED if either is present.
         product_id = os.environ.get("TAMGA_PRODUCT_ID")
         scope = LicenseScope(product=UUID(product_id)) if product_id else None
         scoped_result = client.licenses.validate_by_id(
@@ -39,7 +41,10 @@ def main() -> None:
         print("validate_by_id:", scoped_result.meta.code, scoped_result.meta.detail)
 
         # 3. Quick-validate — a lightweight GET, flat JSON response, no
-        #    embedded license resource.
+        #    embedded license resource. Note the server skips the
+        #    `last_validated_at` write if the request carries an `Origin`
+        #    header (this SDK never sends one, but a proxy might), and the
+        #    response looks identical either way.
         quick_result = client.licenses.quick_validate(result.license.id)
         print("quick_validate:", quick_result.meta.code, quick_result.meta.valid)
 

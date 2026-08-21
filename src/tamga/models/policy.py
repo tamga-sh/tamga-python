@@ -49,7 +49,16 @@ class LicenseScheme(str, Enum):
 
 
 class HeartbeatCullStrategy(str, Enum):
-    """What happens to a machine once it's ``DEAD``."""
+    """What happens to a machine once it's ``DEAD`` server-side.
+
+    Describes the culling worker's behavior, not the client's view. The
+    ``DEAD`` status a client can read — from a checked-out machine file, see
+    ``tamga.models.machine.HeartbeatStatus`` — says nothing about whether
+    either strategy has run. The worker skips any policy with
+    ``require_heartbeat: false``, which is the default, so under a default
+    policy neither strategy applies at all and a machine reported ``DEAD``
+    keeps its row and its seat.
+    """
 
     DEACTIVATE_DEAD = "DEACTIVATE_DEAD"
     """Row is deleted."""
@@ -68,6 +77,60 @@ class HeartbeatResurrectionStrategy(str, Enum):
     TEN_MINUTE_REVIVE = "10_MINUTE_REVIVE"
     FIFTEEN_MINUTE_REVIVE = "15_MINUTE_REVIVE"
     ALWAYS_REVIVE = "ALWAYS_REVIVE"
+
+
+#: Every legal ``policy.expiration_strategy`` value.
+#:
+#: The field stays typed as a plain ``str`` (the server treats it as free text
+#: and branches on literal matches), so this set is for validation and
+#: readability rather than parsing.
+#:
+#: Only ``REVOKE_ACCESS`` changes authentication: an expired license under it
+#: stops authenticating entirely and the server answers ``401 LICENSE_EXPIRED``.
+#: Under the other three an expired license still authenticates, and expiry
+#: surfaces as ``ValidationCode.EXPIRED`` in the validation result instead.
+EXPIRATION_STRATEGIES: frozenset[str] = frozenset(
+    {"RESTRICT_ACCESS", "MAINTAIN_ACCESS", "ALLOW_ACCESS", "REVOKE_ACCESS"}
+)
+
+#: Every legal ``policy.authentication_strategy`` value.
+#:
+#: License-key auth (``Authorization: License <key>``, and the ``license:<key>``
+#: Basic sub-form) is accepted **only** under ``LICENSE`` or ``MIXED``. The
+#: column defaults to ``TOKEN``, and ``NONE`` behaves identically to ``TOKEN``
+#: at this gate — under either the server answers ``401 LICENSE_NOT_ALLOWED``.
+#: Treat that as a configuration precondition to fix on the policy, never as a
+#: retryable authentication failure.
+AUTHENTICATION_STRATEGIES: frozenset[str] = frozenset({"TOKEN", "LICENSE", "MIXED", "NONE"})
+
+#: Every legal ``policy.machine_uniqueness_strategy`` value.
+#:
+#: Decides how wide a net ``409 FINGERPRINT_TAKEN`` is cast over on machine
+#: creation. ``UNIQUE_PER_LICENSE`` (the effective default — the server falls
+#: through to it for any unrecognized value) rejects a fingerprint already
+#: registered against *this* license; ``UNIQUE_PER_POLICY`` widens that to every
+#: license sharing the policy, and ``UNIQUE_PER_ACCOUNT`` to the whole account.
+#:
+#: All three scopes include the caller's own license in the duplicate check, so a
+#: repeat activation of the same license and fingerprint conflicts under every
+#: one of them and is always recoverable by a license-scoped lookup. What the two
+#: wider scopes add is the *cross-license* conflict — one fingerprint registered
+#: against a second license — and that is a rejection to respect, not to recover
+#: from: it is the seat-sharing those scopes exist to prevent. See
+#: ``MachinesClient.activate_machine_idempotent``.
+MACHINE_UNIQUENESS_STRATEGIES: frozenset[str] = frozenset(
+    {"UNIQUE_PER_LICENSE", "UNIQUE_PER_POLICY", "UNIQUE_PER_ACCOUNT"}
+)
+
+#: Heartbeat window applied when ``policy.heartbeat_duration`` is unset, in
+#: seconds.
+#:
+#: This is a *fallback*, not the window. The server computes the effective window
+#: as ``heartbeat_duration`` or this value, and the machine-culling job's claim
+#: query uses the same ``COALESCE(p.heartbeat_duration, 600)``. Sizing a ping
+#: interval against this constant is only correct for a policy that leaves the
+#: column null — see ``PolicyResource.effective_heartbeat_window_seconds``.
+DEFAULT_HEARTBEAT_DURATION_SECONDS: int = 600
 
 
 class CheckInInterval(str, Enum):
@@ -110,11 +173,17 @@ class PolicyResource:
         check_in_interval: See ``CheckInInterval``. ``None`` if check-in isn't required.
         require_check_in: Whether periodic check-in is required at all.
         scheme: See ``LicenseScheme``.
-        expiration_strategy: ``"RESTRICT_ACCESS"`` (default) denies access
-            past expiry; ``"MAINTAIN_ACCESS"``/``"ALLOW_ACCESS"`` permit it.
+        expiration_strategy: One of ``EXPIRATION_STRATEGIES``.
+            ``"RESTRICT_ACCESS"`` (default) denies access past expiry;
+            ``"MAINTAIN_ACCESS"``/``"ALLOW_ACCESS"`` permit it;
+            ``"REVOKE_ACCESS"`` additionally stops the expired license from
+            authenticating at all (``401 LICENSE_EXPIRED``).
         renewal_basis: ``"FROM_EXPIRY"`` (default) vs ``"FROM_NOW"``.
-        authentication_strategy: ``"TOKEN"`` (default);
-            ``"LICENSE"``/``"MIXED"`` permit license-key bearer auth.
+        authentication_strategy: One of ``AUTHENTICATION_STRATEGIES``.
+            ``"TOKEN"`` (default) and ``"NONE"`` both **reject** license-key
+            auth with ``401 LICENSE_NOT_ALLOWED``; only ``"LICENSE"`` and
+            ``"MIXED"`` accept it. Check this before shipping a client that
+            authenticates with a raw license key.
         max_machines: Machine limit, subject to ``overage_strategy``.
         max_cores: Core limit, subject to ``overage_strategy``.
         max_processes: Process limit, subject to ``overage_strategy``.
@@ -133,6 +202,25 @@ class PolicyResource:
         max_disk: Disk limit, subject to ``overage_strategy``. Same
             "always ``None`` in practice" caveat as ``max_memory`` — only
             observable via a ``TOO_MUCH_DISK`` validation code.
+        heartbeat_duration: The policy's machine-heartbeat window, in seconds,
+            or ``None`` when the column is unset. **This is the field that
+            decides how often a machine has to ping**; the SDK's 600s default is
+            only what the server falls back to when this is ``None``. Read
+            ``effective_heartbeat_window_seconds`` rather than this field
+            directly, and size a ``HeartbeatScheduler`` from it (see
+            ``tamga.client.heartbeat_interval_for_policy``).
+        require_heartbeat: Whether the culling worker acts on this policy at
+            all. ``False`` by default, and the worker early-returns on a policy
+            where it is false, so under a default policy no machine is ever
+            culled no matter how long its heartbeat has lapsed. A machine can
+            still *report* ``DEAD`` under such a policy — the status is derived
+            purely from ``last_heartbeat_at`` versus the window and never
+            consults this flag.
+        machine_uniqueness_strategy: One of
+            ``MACHINE_UNIQUENESS_STRATEGIES``; see that constant for what each
+            scope means for ``409 FINGERPRINT_TAKEN``. Defaults to
+            ``"UNIQUE_PER_LICENSE"``, which is also what the server treats any
+            unrecognized value as.
     """
 
     id: UUID
@@ -151,6 +239,37 @@ class PolicyResource:
     max_uses: int | None = None
     max_memory: int | None = None
     max_disk: int | None = None
+    heartbeat_duration: int | None = None
+    require_heartbeat: bool = False
+    machine_uniqueness_strategy: str = "UNIQUE_PER_LICENSE"
+
+    @property
+    def effective_heartbeat_window_seconds(self) -> int:
+        """The machine-heartbeat window this policy actually enforces, in seconds.
+
+        ``heartbeat_duration`` when the policy sets it, otherwise
+        ``DEFAULT_HEARTBEAT_DURATION_SECONDS`` (600). Mirrors the server's own
+        ``Policy::effective_heartbeat_duration_secs``, and the same expression
+        the culling job's claim query uses.
+
+        Note:
+            A non-positive ``heartbeat_duration`` is treated as unset and falls
+            back to 600 rather than being propagated. The column is a signed
+            integer with no positivity constraint, and a zero or negative window
+            would otherwise turn a derived ping interval into a busy loop.
+
+            That is no longer the only thing standing between such a policy and
+            a spin — both schedulers hold ``tamga.client.MIN_HEARTBEAT_INTERVAL``
+            themselves — but it does mean this SDK never derives an interval
+            from a zero window at all. Worth knowing when comparing against the
+            server, whose ``COALESCE(p.heartbeat_duration, 600)`` substitutes
+            only for ``NULL``: a stored ``0`` really is a zero-second window
+            server-side, and no ping rate at or above the floor can hold it.
+            See the table in ``tests/test_policy_read.py``.
+        """
+        if self.heartbeat_duration is None or self.heartbeat_duration <= 0:
+            return DEFAULT_HEARTBEAT_DURATION_SECONDS
+        return self.heartbeat_duration
 
     @classmethod
     def from_api(cls, attributes: dict[str, Any]) -> PolicyResource:
@@ -217,6 +336,11 @@ class PolicyResource:
             max_uses=attributes.get("max_uses"),
             max_memory=attributes.get("max_memory"),
             max_disk=attributes.get("max_disk"),
+            heartbeat_duration=attributes.get("heartbeat_duration"),
+            require_heartbeat=bool(attributes.get("require_heartbeat", False)),
+            machine_uniqueness_strategy=attributes.get(
+                "machine_uniqueness_strategy", "UNIQUE_PER_LICENSE"
+            ),
         )
 
 
@@ -235,6 +359,16 @@ class Entitlement:
         metadata: Arbitrary metadata.
         created: Creation timestamp.
         updated: Last-update timestamp.
+        inherited: ``True`` when the license holds this entitlement through
+            its policy rather than by a direct attachment. ``None`` when the
+            server did not send the flag — it appears only on the
+            license-scoped listing, not on account-, policy-, or
+            release-scoped responses. An inherited entitlement cannot be
+            detached from the license (``403 POLICY_ENTITLEMENT``), cannot be
+            attached again (``422 ENTITLEMENT_ALREADY_INHERITED``), and is
+            **not** resolvable through
+            ``TamgaClient.entitlements.get`` — that route reads only direct
+            attachments and answers ``404`` for it.
     """
 
     id: UUID
@@ -243,3 +377,4 @@ class Entitlement:
     metadata: dict[str, Any] = field(default_factory=dict)
     created: datetime | None = None
     updated: datetime | None = None
+    inherited: bool | None = None

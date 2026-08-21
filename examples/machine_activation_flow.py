@@ -1,10 +1,18 @@
 """Create a machine, then validate the license, handling an over-limit rollback.
 
-This is the documented activation flow (Tamga API protocol specification
-section 5): the server does not check machine/core/memory/disk/process limits
-at *creation* time — only later, on license validation. `activate_machine` implements
-create -> validate -> delete-and-raise-on-over-limit so a caller doesn't
-have to hand-roll the rollback themselves.
+A limit can stop the activation at either of two points, and `activate_machine`
+handles both:
+
+- At creation, with a `422` (`MACHINE_LIMIT_EXCEEDED` and friends) — no row was
+  created, so there is nothing to roll back.
+- At validation, when the policy's overage strategy let the create through — the
+  row exists and is deleted before the error is raised.
+
+Either way the caller sees one `MachineOverLimitError` carrying the equivalent
+`ValidationCode`, so there is one branch to write instead of two, plus a
+`rolled_back` flag saying which of the two happened.
+
+`memory` and `disk`, if reported, are in **megabytes**.
 
 Run:
     TAMGA_ACCOUNT_ID=... TAMGA_HOST=api.tamga.sh TAMGA_LICENSE_ID=... \
@@ -17,7 +25,7 @@ import os
 import platform
 from uuid import UUID
 
-from tamga import TamgaClient, TamgaConfig
+from tamga import MachineOverLimitError, TamgaClient, TamgaConfig
 
 
 def main() -> None:
@@ -35,10 +43,18 @@ def main() -> None:
                 platform=platform.system(),
                 cores=os.cpu_count(),
             )
-        except ValueError as exc:
-            # activate_machine already deleted the just-created machine row
-            # before raising — no manual cleanup needed here.
-            print("Activation rejected (machine row rolled back):", exc)
+        except MachineOverLimitError as exc:
+            # activate_machine has already cleaned up whatever needed cleaning
+            # up: it deletes the machine row when the create succeeded and only
+            # validation rejected it, and skips the delete when the create
+            # itself was refused. No manual cleanup here either way.
+            #
+            # MachineOverLimitError subclasses both TamgaError and ValueError,
+            # so `except TamgaError:` and a legacy `except ValueError:` both
+            # still catch this — but naming it directly is what gives you
+            # `.validation_code` and `.rolled_back`.
+            print("Activation rejected:", exc.validation_code.value)
+            print("  a machine row was created and rolled back:", exc.rolled_back)
             return
 
         print("Machine activated:", machine.id, machine.heartbeat_status)

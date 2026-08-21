@@ -5,6 +5,8 @@ from __future__ import annotations
 from uuid import UUID
 
 from tamga.models.policy import (
+    AUTHENTICATION_STRATEGIES,
+    EXPIRATION_STRATEGIES,
     HeartbeatCullStrategy,
     HeartbeatResurrectionStrategy,
     LicenseScheme,
@@ -81,3 +83,35 @@ def test_policy_parses_real_scheme_value() -> None:
         {"id": str(POLICY_ID), "require_check_in": False, "scheme": "ED25519_SIGN"}
     )
     assert policy.scheme == LicenseScheme.ED25519_SIGN
+
+
+def test_expiration_strategies_include_revoke_access() -> None:
+    # REVOKE_ACCESS is the one expiration strategy that changes *authentication*
+    # rather than just the validation code: an expired license under it stops
+    # authenticating and the server answers 401 LICENSE_EXPIRED.
+    assert sorted(EXPIRATION_STRATEGIES) == [
+        "ALLOW_ACCESS",
+        "MAINTAIN_ACCESS",
+        "RESTRICT_ACCESS",
+        "REVOKE_ACCESS",
+    ]
+
+
+def test_authentication_strategies_include_none() -> None:
+    # NONE behaves like TOKEN at the auth gate: license-key auth is rejected
+    # with 401 LICENSE_NOT_ALLOWED under either. Only LICENSE and MIXED accept
+    # it, and the column defaults to TOKEN — so license-key auth is off unless
+    # someone turned it on.
+    assert sorted(AUTHENTICATION_STRATEGIES) == ["LICENSE", "MIXED", "NONE", "TOKEN"]
+
+
+def test_policy_parses_the_new_strategy_values() -> None:
+    policy = PolicyResource.from_api(
+        {
+            "id": "018f2f3a-0000-7000-8000-0000000000a0",
+            "expiration_strategy": "REVOKE_ACCESS",
+            "authentication_strategy": "NONE",
+        }
+    )
+    assert policy.expiration_strategy == "REVOKE_ACCESS"
+    assert policy.authentication_strategy == "NONE"

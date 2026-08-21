@@ -82,3 +82,34 @@ def parse_certificate_envelope(
         raise ValueError("malformed certificate: 'sig' is not valid base64") from exc
 
     return enc, sig_bytes, alg
+
+
+def b64decode_strict(value: str, what: str, *, file_kind: str) -> bytes:
+    """Base64-decode one already-authenticated piece of a certificate.
+
+    Strict about the alphabet (so a stray ``.`` or whitespace is an error
+    rather than silently skipped, which is how a dot-separated machine-file
+    ``enc`` fed to a single non-validating decode turns into
+    plausible-looking garbage), but tolerant of absent ``=`` padding.
+
+    Shared by both checkout paths so neither can drift back to a lax decode:
+    the machine-file ``<nonce_b64>.<cipher_b64>`` misreading survived two
+    years precisely because ``base64.b64decode`` discards what it does not
+    recognize instead of complaining.
+
+    Args:
+        value: The base64 text to decode.
+        what: Name of the piece, used in the error message.
+        file_kind: Human-readable file type used in the error message.
+
+    Returns:
+        The decoded bytes.
+
+    Raises:
+        ValueError: If ``value`` is not valid base64.
+    """
+    padding = "=" * (-len(value) % 4)
+    try:
+        return base64.b64decode(value + padding, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"malformed {file_kind}: {what} is not valid base64") from exc

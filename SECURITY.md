@@ -36,7 +36,7 @@ Both derivations still take the license key as `ikm`, so an encrypted file's con
 remains bounded by that key's entropy — HKDF removes the trivial cleartext-in-the-key problem,
 it does not add entropy that was never there.
 
-### 1b. Offline license files must be format v2, and `exp` is enforced
+### 1b. Both offline file types must be format v2, and `exp` is enforced
 
 `src/tamga/checkout/license_file.py::LicenseFile.parse` accepts exactly two `alg` values —
 `base64+ed25519+v2` and `aes-256-gcm+ed25519+v2`. Anything else, including every v1-issued
@@ -55,11 +55,56 @@ generous allowance would just be a free extension on every expired file; pass a
 server-supplied timestamp as `verify(..., now=...)` if you are defending against a user
 winding their clock back.
 
+Machine files are held to the same bar: `src/tamga/checkout/machine_file.py::MachineFile.parse`
+requires the same `+v2` marker on its own eight-value `alg` vocabulary
+(`{base64|aes-256-gcm}+{ed25519|ecdsa-p256|rsa-sha256|rsa-pss-sha256}+v2`), and
+`MachineFile.verify` enforces the same signed `meta.exp` through the same `_enforce_expiry` and
+the same `CLOCK_SKEW_TOLERANCE_SECONDS`, raising `MachineFileExpired` (a subclass of
+`LicenseFileExpired`). It takes the same `now=` trusted-timestamp argument for the same reason.
+A machine file whose `exp` claim is absent never expires — the server only writes `exp` when the
+checkout asked for a `ttl` — so an absent claim is not treated as an error.
+
 An expired-but-authentic file raises `LicenseFileExpired`, deliberately distinct from a
 signature failure — see item 5.
 
 `LicenseFile.is_expired()` checks the *unsigned* `expiry` metadata a `POST` checkout echoes
 back. It is advisory only; the signed `exp` above is the enforced one.
+
+### 1c. An encrypted machine file's `enc` is two base64 halves, not one blob
+
+`src/tamga/checkout/machine_file.py::MachineFile.verify` splits an encrypted `enc` on a single
+literal `.` and decodes `<nonce_b64>` and `<cipher_b64>` **independently**; the ciphertext half
+already carries the appended 16-byte GCM tag. That is what the server's
+`FieldEncryption::encrypt` emits. A `.lic` file is different — there the payload really is one
+`base64(nonce ‖ ciphertext ‖ tag)` blob — so the two decryptors are not interchangeable.
+
+This SDK previously decoded the whole string in one non-validating pass and sliced 12 bytes off
+the front. In Python that produced the right bytes by coincidence rather than by design:
+`base64.b64decode` silently discards any character outside the alphabet (including the `.`), and
+`nonce_b64` is always exactly 16 characters, a whole number of 4-character blocks, so the
+concatenation happened to decode to `nonce ‖ ciphertext`. The coincidence also meant an `enc`
+containing arbitrary junk characters, an extra separator, or the single-blob layout was accepted
+without complaint. Each half is now decoded strictly and its length checked.
+
+The order is load-bearing and must not be rearranged: **verify the signature, then split, then
+decode, then decrypt.** The signature covers the whole `enc` string — dot included — so nothing
+attacker-controlled is decoded before it has been authenticated. Which branch to take comes from
+`alg`'s encoding prefix, never from whether a `.` happens to be present.
+
+Both file types now decode through one strict helper,
+`src/tamga/checkout/_envelope.py::b64decode_strict` (alphabet-validating, padding-tolerant), so
+neither can quietly drift back to the lax decode that hid this for two years.
+
+### 1d. A verified payload's shape is checked before it is read
+
+Passing the signature proves a payload is *authentic*, not that it is *well-formed*. Every field
+read out of `data` afterwards is therefore guarded: `data` must be a JSON object, `id` (and, for
+`.lic`, `type`) must be present, and `attributes`/`relationships` must be objects when present —
+an explicit JSON `null` counts as absent, not as an error. Without those guards a `KeyError`,
+`TypeError` or `AttributeError` escapes past the `ValueError` both `verify()` methods document,
+and a caller written to that contract crashes instead of rejecting the file. No attacker without
+the account's signing key can produce such a payload, so this is a robustness and error-contract
+property rather than an authentication one.
 
 ### 2. Offline-proof signatures depend on byte-exact JSON serialization
 

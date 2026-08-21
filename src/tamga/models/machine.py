@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any
 from uuid import UUID
@@ -15,11 +16,59 @@ class HeartbeatStatus(str, Enum):
     window) -> ``DEAD`` (window elapsed) -> ``RESURRECTED`` (a new ping
     arrived after a death event was already recorded).
 
-    The heartbeat window is a **hardcoded 600 seconds (10 min)** server-side,
-    not driven by ``policy.heartbeat_duration`` (see the Tamga API protocol
-    specification, "Known Server-Side Gaps" item 8). Dead-machine handling
-    beyond that depends on the license's policy — see ``HeartbeatCullStrategy``
-    and ``HeartbeatResurrectionStrategy`` in ``tamga.models.policy``.
+    The window is the license policy's ``heartbeat_duration``, falling back to
+    600 seconds only when that column is unset — it is not a fixed constant, so
+    a ping interval sized against 600s is unsafe under a shorter policy.
+
+    **Where ``DEAD`` can and cannot come from.** Whether a response can report
+    it depends on whether the server built that response off a *write* it just
+    performed or off a *read* of the stored row.
+
+    Never from these — each one writes the timestamp the status is then derived
+    from, so the verdict is a foregone conclusion:
+
+    - ``machines.ping_heartbeat`` sets ``last_heartbeat_at = NOW()`` and reads
+      the status back off that same timestamp, so the age is ~0 → ``ALIVE`` or
+      ``RESURRECTED``.
+    - ``machines.reset_heartbeat`` nulls the timestamp → ``NOT_STARTED``.
+    - ``machines.create`` never sets it → ``NOT_STARTED``.
+    - License validation never emits ``ValidationCode.HEARTBEAT_DEAD``.
+
+    **Genuinely, from machine checkout.** ``machines.check_out`` resolves the
+    machine by id — a read of a row nobody just touched, with the policy joined
+    — so the ``heartbeat_status`` embedded in the signed machine-file payload is
+    a real staleness verdict and can be ``DEAD``. This SDK surfaces it:
+    ``tamga.checkout.machine_file.MachineFile.verify`` parses the field and
+    returns it on the ``MachineResource`` it hands back. That is the path to
+    read if you want to know a machine's true heartbeat state today, and it is
+    why this member exists — it is live, not merely forward-compatible.
+
+    (``machines.generate_offline_proof`` resolves the machine the same way, so
+    the status is on the wire there too, but that method returns only a
+    ``tamga.proof.ProofResult`` and does not surface the machine.)
+
+    **Genuinely, from a machine read.** ``TamgaClient.machines.get`` and
+    ``TamgaClient.machines.list`` are plain reads of the stored row with the
+    policy joined, so both report it truthfully as well — and unlike checkout
+    they need no signature verification to get at it.
+
+    ``machines.update`` (``PATCH``) is the awkward middle case: it writes, but
+    never to ``last_heartbeat_at``, so it *can* answer ``DEAD``. Its query does
+    not join the policy, though, so it judges staleness against the 600s
+    fallback rather than the policy's window. Read the machine back with
+    ``get`` when the verdict matters.
+
+    Whatever the source, ``DEAD`` means only "the last ping is older than the
+    window" — never "the row was deleted". The culling worker skips any policy
+    with ``require_heartbeat: false``, which is the default, so under a default
+    policy nothing is culled and a machine past its window keeps its row and its
+    seat indefinitely; the ping is an unconditional ``last_heartbeat_at`` write
+    that revives it. A ``404`` on the ping is the only signal that the row is
+    genuinely gone. So a ``DEAD`` reading is information, never a reason to stop
+    heartbeating — see ``tamga.client.HeartbeatScheduler``, which stops on no
+    status at all. Cull/resurrection behavior, where enabled, is described by
+    ``HeartbeatCullStrategy`` and ``HeartbeatResurrectionStrategy`` in
+    ``tamga.models.policy``.
     """
 
     NOT_STARTED = "NOT_STARTED"
@@ -34,16 +83,36 @@ class MachineResource:
 
     Attributes:
         id: Resource UUID.
-        fingerprint: Unique per ``(account_id, license_id, fingerprint)``.
+        fingerprint: Unique within the policy's machine-uniqueness scope —
+            per license by default, but a policy may widen that to per policy
+            or per account.
         name: Optional display name.
         ip: Optional IP address.
         hostname: Optional hostname.
         platform: Optional platform string.
         cores: Optional core count.
-        memory: Optional memory (bytes or policy-defined unit).
-        disk: Optional disk usage.
+        memory: Optional memory, in **megabytes** — not bytes. The server
+            sums this column across the license's machines and checks it
+            against the policy limit, so reporting bytes inflates the total by
+            ~1e6 and trips ``MEMORY_LIMIT_EXCEEDED`` on the next activation.
+        disk: Optional disk, in **megabytes** — same caveat as ``memory``.
         metadata: Arbitrary caller-supplied metadata.
         heartbeat_status: Current heartbeat state; see ``HeartbeatStatus``.
+        last_heartbeat_at: When the machine last pinged, if ever. The only
+            client-side basis for a liveness decision that does not re-derive
+            ``heartbeat_status``.
+        next_heartbeat_at: Server's own estimate of the next ping deadline.
+            Computed against the policy's window on the routes whose query joins
+            ``policies`` — ``machines.get``, ``machines.list``, check-out and
+            offline-proof — and against the 600s fallback on the ones that do
+            not: ``create``, ``ping_heartbeat``, ``reset_heartbeat`` and
+            ``update``. Two responses for the same machine seconds apart can
+            therefore disagree, and nothing on the wire says which kind you are
+            holding. Do not size a ping interval from it; read the policy and
+            use ``tamga.client.heartbeat_interval_for_policy``.
+        last_check_out_at: When a machine file was last checked out.
+        created: Creation timestamp.
+        updated: Last-update timestamp.
     """
 
     id: UUID
@@ -57,6 +126,11 @@ class MachineResource:
     disk: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     heartbeat_status: HeartbeatStatus = HeartbeatStatus.NOT_STARTED
+    last_heartbeat_at: datetime | None = None
+    next_heartbeat_at: datetime | None = None
+    last_check_out_at: datetime | None = None
+    created: datetime | None = None
+    updated: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +143,8 @@ class ComponentResource:
         fingerprint: Unique per ``(account_id, machine_id, fingerprint)``.
         name: Required display name.
         metadata: Arbitrary caller-supplied metadata.
+        created: Creation timestamp.
+        updated: Last-update timestamp.
     """
 
     id: UUID
@@ -76,6 +152,8 @@ class ComponentResource:
     fingerprint: str
     name: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    created: datetime | None = None
+    updated: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -89,19 +167,26 @@ class ProcessResource:
             mirror the server's typing exactly; do not silently coerce int
             input to str at the call boundary (see ``processes.create``).
         metadata: Arbitrary caller-supplied metadata.
+        last_heartbeat_at: When the process last pinged. Always present on
+            the wire — a process is ``ALIVE`` from creation.
+        created: Creation timestamp.
+        updated: Last-update timestamp.
 
     Note:
         Unlike machines (which start ``NOT_STARTED``), processes start
         ``ALIVE`` immediately at creation — the heartbeat timestamp is set
         then. The process heartbeat window is a hardcoded **30 seconds**
-        (much shorter than the 600s machine window) with no resurrection
-        grace period: a dead process row is deleted immediately.
+        (much shorter than the machine window) with no resurrection
+        grace period.
     """
 
     id: UUID
     machine_id: UUID
     pid: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    last_heartbeat_at: datetime | None = None
+    created: datetime | None = None
+    updated: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +198,13 @@ class MachineFileResource:
     shape (``certificate``/``algorithm``/``includes``/``ttl``/``expiry``/
     ``issued``), just wrapping a machine-file certificate instead of a
     license-file one.
+
+    Wire-casing note: this resource's attributes carry ``rename_all =
+    "camelCase"`` server-side, like ``releases`` — but unlike ``releases`` it
+    makes no difference here, because every field is a single word. Should a
+    multi-word field ever be added to it, it will arrive camelCased. Do not
+    "correct" the existing six to snake_case, and do not assume the next one is
+    snake_case by analogy with ``machines``/``licenses``/``policies``, which are.
 
     Attributes:
         certificate: The full machine-file PEM-style wrapper string. Parse

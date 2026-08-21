@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 import httpx
@@ -27,21 +27,77 @@ def _process_data() -> dict:
     }
 
 
-def test_create_process_with_string_pid(
+def test_create_process_sends_a_flat_body_with_a_string_pid(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
 ) -> None:
+    """The handler takes `CreateProcessBody { machine_id, pid, metadata }`.
+
+    Asserted as whole-body equality rather than field-by-field lookups. The
+    previous version read `body["data"]["attributes"]["pid"]`, which passed
+    against an enveloped body the server rejects with 422 — the test pinned the
+    bug instead of catching it. An exact match cannot do that.
+    """
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
         assert request.url.path == f"{ACCOUNT_PATH}/processes"
         body = json.loads(request.content)
-        assert body["data"]["attributes"]["pid"] == "12345"
-        assert isinstance(body["data"]["attributes"]["pid"], str)
+        assert body == {"machine_id": str(MACHINE_ID), "pid": "12345"}
+        # The pid stays a string on the wire, at the top level.
+        assert isinstance(body["pid"], str)
         return httpx.Response(201, json={"data": _process_data()})
 
     client = make_client(handler)
     process = client.processes.create(MACHINE_ID, "12345")
     assert process.pid == "12345"
     assert isinstance(process.pid, str)
+
+
+def test_create_process_never_nests_fields_under_a_data_key(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """`machine_id` and `pid` have no serde default, so an envelope 422s."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert "data" not in body, "re-enveloped: every create would 422"
+        assert "attributes" not in body
+        return httpx.Response(201, json={"data": _process_data()})
+
+    client = make_client(handler)
+    client.processes.create(MACHINE_ID, "12345")
+
+
+def test_create_process_forwards_metadata_at_the_top_level(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content) == {
+            "machine_id": str(MACHINE_ID),
+            "pid": "12345",
+            "metadata": {"role": "worker"},
+        }
+        return httpx.Response(201, json={"data": _process_data()})
+
+    client = make_client(handler)
+    client.processes.create(MACHINE_ID, "12345", metadata={"role": "worker"})
+
+
+def test_create_process_response_is_still_enveloped(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """Flat request, enveloped response. Matching the two directions up breaks one."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "data" not in json.loads(request.content)
+        return httpx.Response(201, json={"data": _process_data()})
+
+    client = make_client(handler)
+    process = client.processes.create(MACHINE_ID, "12345")
+    # Parsed out of `data`: a flat decode would leave these empty/zeroed.
+    assert process.id == PROCESS_ID
+    assert process.pid == "12345"
+    assert process.machine_id == MACHINE_ID
 
 
 def test_create_process_rejects_non_string_pid(
@@ -98,6 +154,110 @@ def test_process_heartbeat_scheduler_default_interval_is_10_seconds(
     assert scheduler.interval == timedelta(seconds=10)
 
 
+@pytest.mark.parametrize("interval", [timedelta(0), timedelta(seconds=-30)])
+def test_process_heartbeat_scheduler_clamps_a_non_positive_interval_to_the_default(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    interval: timedelta,
+) -> None:
+    # This scheduler has no `for_policy` equivalent -- the process window is a
+    # hardcoded server-side 30s, not policy-derived -- so hand construction is
+    # the *only* way to build one and there was no guard anywhere. A zero
+    # interval turns `run_forever` into an unthrottled `ping` loop against the
+    # licensing server.
+    client = make_client(lambda r: httpx.Response(200, json={"data": _process_data()}))
+    scheduler = ProcessHeartbeatScheduler(
+        processes=client.processes, process_id=PROCESS_ID, interval=interval
+    )
+    assert scheduler.interval == timedelta(seconds=10)
+
+
+def test_process_heartbeat_scheduler_does_not_busy_loop_on_a_zero_interval(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+    ping_count = {"n": 0}
+    scheduler_box: dict[str, ProcessHeartbeatScheduler] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ping_count["n"] += 1
+        if ping_count["n"] >= 2:
+            scheduler_box["scheduler"].stop()
+        return httpx.Response(200, json={"data": _process_data()})
+
+    client = make_client(handler)
+    scheduler = ProcessHeartbeatScheduler(
+        processes=client.processes, process_id=PROCESS_ID, interval=timedelta(0)
+    )
+    scheduler_box["scheduler"] = scheduler
+    monkeypatch.setattr("tamga.client.time.sleep", lambda seconds: slept.append(seconds))
+    scheduler.run_forever()
+
+    assert slept == [10.0, 10.0], "a hand-built zero interval must not become sleep(0)"
+
+
+def test_process_heartbeat_scheduler_raises_a_500ms_interval_to_one_second(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    # NOT verbatim -- see the machine-side test of the same name for the
+    # measurement that settles it. Sub-second buys nothing against this window
+    # in particular: it is a hardcoded 30s, so the one-second floor still fits
+    # thirty pings inside it against the three the 10s default plans for.
+    client = make_client(lambda r: httpx.Response(200, json={"data": _process_data()}))
+    scheduler = ProcessHeartbeatScheduler(
+        processes=client.processes, process_id=PROCESS_ID, interval=timedelta(milliseconds=500)
+    )
+    assert scheduler.interval == timedelta(seconds=1)
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (timedelta(microseconds=1), timedelta(seconds=1)),
+        (timedelta(milliseconds=500), timedelta(seconds=1)),
+        (timedelta(milliseconds=999), timedelta(seconds=1)),
+        (timedelta(seconds=1), timedelta(seconds=1)),
+        (timedelta(milliseconds=1001), timedelta(milliseconds=1001)),
+        (timedelta(seconds=10), timedelta(seconds=10)),
+    ],
+)
+def test_process_heartbeat_scheduler_floors_every_positive_sub_second_interval(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    requested: timedelta,
+    expected: timedelta,
+) -> None:
+    client = make_client(lambda r: httpx.Response(200, json={"data": _process_data()}))
+    scheduler = ProcessHeartbeatScheduler(
+        processes=client.processes, process_id=PROCESS_ID, interval=requested
+    )
+    assert scheduler.interval == expected
+
+
+def test_process_heartbeat_scheduler_does_not_spin_on_a_sub_second_interval(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+    ping_count = {"n": 0}
+    scheduler_box: dict[str, ProcessHeartbeatScheduler] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ping_count["n"] += 1
+        if ping_count["n"] >= 2:
+            scheduler_box["scheduler"].stop()
+        return httpx.Response(200, json={"data": _process_data()})
+
+    client = make_client(handler)
+    scheduler = ProcessHeartbeatScheduler(
+        processes=client.processes, process_id=PROCESS_ID, interval=timedelta(milliseconds=500)
+    )
+    scheduler_box["scheduler"] = scheduler
+    monkeypatch.setattr("tamga.client.time.sleep", lambda seconds: slept.append(seconds))
+    scheduler.run_forever()
+
+    assert slept == [1.0, 1.0], "a hand-built 500ms interval must not become sleep(0.5)"
+
+
 def test_process_heartbeat_scheduler_stops_when_signalled(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
     monkeypatch: pytest.MonkeyPatch,
@@ -120,3 +280,34 @@ def test_process_heartbeat_scheduler_stops_when_signalled(
     monkeypatch.setattr("tamga.client.time.sleep", fake_sleep)
     scheduler.run_forever()
     assert ping_count["n"] == 3
+
+
+def test_process_timestamps_are_parsed(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    # `last_heartbeat_at` is NOT NULL server-side (a process is ALIVE from
+    # creation) and was dropped entirely by the parser.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "id": str(PROCESS_ID),
+                    "type": "processes",
+                    "attributes": {
+                        "pid": "12345",
+                        "machine_id": str(MACHINE_ID),
+                        "last_heartbeat_at": "2024-01-01T00:00:10Z",
+                        "created": "2024-01-01T00:00:00Z",
+                        "updated": "2024-01-01T00:00:10Z",
+                    },
+                }
+            },
+        )
+
+    client = make_client(handler)
+    process = client.processes.ping(PROCESS_ID)
+
+    assert process.last_heartbeat_at == datetime(2024, 1, 1, 0, 0, 10, tzinfo=timezone.utc)
+    assert process.created == datetime(2024, 1, 1, tzinfo=timezone.utc)
+    assert process.updated == datetime(2024, 1, 1, 0, 0, 10, tzinfo=timezone.utc)

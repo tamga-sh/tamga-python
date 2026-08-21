@@ -22,23 +22,33 @@ if TYPE_CHECKING:
 class LicenseScope:
     """The ``meta.scope`` object accepted by ``POST .../licenses/{id}/actions/validate``.
 
-    All 8 fields are optional. Only ``product``, ``policy``, ``user``, and
-    ``environment`` are actually enforced by the server today —
-    ``entitlements``, ``fingerprint``, ``version``, and ``checksum`` are
-    parsed but silently ignored server-side. They're modeled here for
-    forward-compatibility (and because the request builder needs to be able
-    to send them once the server catches up), but must not be advertised as
-    functioning constraints yet.
+    Six of the eight fields are enforced. ``version`` and ``checksum`` are
+    **rejected**: the server refuses the whole call with ``422
+    SCOPE_NOT_SUPPORTED`` (pointer ``/meta/scope``) the moment either key is
+    present, before any validation runs, so the caller gets no ``meta.valid``
+    at all. Both are therefore deprecated and this SDK **does not send them**
+    — setting one degrades to a working validate rather than a hard failure.
+    They remain on the dataclass because removing a public field would be a
+    breaking change.
 
     Attributes:
         product: Enforced. Product UUID to scope validation to.
         policy: Enforced. Policy UUID to scope validation to.
         user: Enforced. User UUID to scope validation to.
         environment: Enforced. Environment UUID to scope validation to.
-        entitlements: Not enforced server-side yet. Entitlement codes.
-        fingerprint: Not enforced server-side yet. Machine fingerprint.
-        version: Not enforced server-side yet. Client/app version string.
-        checksum: Not enforced server-side yet. Client-computed checksum.
+        entitlements: **Enforced.** Entitlement *codes* (the developer-facing
+            strings — not the UUIDs used by attach/detach). Compared
+            case-insensitively and de-duplicated, and satisfied by both direct
+            and policy-inherited entitlements. An empty list asserts nothing.
+            A shortfall yields ``ValidationCode.ENTITLEMENTS_MISSING``.
+        fingerprint: **Enforced.** Matches against *any* machine registered to
+            the license, regardless of that machine's heartbeat status. A
+            mismatch yields ``ValidationCode.FINGERPRINT_SCOPE_MISMATCH``.
+            This is the anti-key-sharing check — pass the activating machine's
+            fingerprint here.
+        version: **Deprecated, not sent.** Setting it has no effect; the
+            server would reject the entire call with ``SCOPE_NOT_SUPPORTED``.
+        checksum: **Deprecated, not sent.** Same as ``version``.
     """
 
     product: UUID | None = None
@@ -116,6 +126,13 @@ class LicenseResource:
 @dataclass(frozen=True)
 class LicenseFileResource:
     """The JSON:API ``license-files`` resource returned by the ``POST`` checkout variant.
+
+    Wire-casing note: this resource's attributes carry ``rename_all =
+    "camelCase"`` server-side, like ``releases`` — but unlike ``releases`` it
+    makes no difference here, because every field is a single word. Should a
+    multi-word field ever be added to it, it will arrive camelCased. Do not
+    "correct" the existing six to snake_case, and do not assume the next one is
+    snake_case by analogy with ``machines``/``licenses``/``policies``, which are.
 
     Attributes:
         certificate: The full ``.lic`` PEM-style wrapper string. Parse and
