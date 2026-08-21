@@ -163,6 +163,50 @@ individually; see `.github/workflows/ci.yml` for the exact order
   string is a valid member of `OverageStrategy`/`HeartbeatResurrectionStrategy`. Both silently
   behave as `NO_OVERAGE`/`NO_REVIVE` server-side — `PolicyResource` parsing must apply that
   fallback, not trust the field name's implication that access is denied by default.
+- **`check_in_interval` is adverbial (`daily`), never a noun (`day`).** `policies/enums.rs:27`
+  lists `["daily","weekly","monthly","yearly"]` and the column's `CHECK` constraint
+  (`migrations/20240101000005:153-155`) rejects everything else. This SDK shipped the noun
+  spellings through 1.0.4 *and* constructed the enum strictly, so every policy with a cadence
+  configured raised `ValueError` out of `licenses.get_policy` / `policies.get` — the whole policy
+  read, not just the cadence. It stayed invisible because every test used a policy with
+  `require_check_in=false` and a null column; the fixture at `tests/test_policy_read.py:44` now
+  carries a real `"daily"` and there is a parametrized test over all four values. **Do not
+  re-narrow `CheckInInterval` and do not move the leniency into `from_api`.** It lives in
+  `CheckInInterval._missing_` so every construction path gets it, the noun spellings are aliases
+  (`DAY is DAILY`) so 1.0.x call sites keep matching, and `_missing_` scans members rather than
+  re-entering `cls(...)`, which would recurse forever on an unknown value. An unknown cadence
+  raising is also deliberate: `check_in_interval=None` already means "no cadence configured", so
+  softening to `None` (tamga-swift's `init(rawValue:)` behaviour) would report no schedule on a
+  license that has one.
+  **The server does not honour the field either.** `check_in_interval_days`
+  (`validate_license.rs:394-403`) matches the noun spellings, so no storable value hits an arm and
+  `_ => 30` always wins — every cadence is enforced as thirty days. `tamga-api-internal#3`.
+  Independent of the SDK bug; fixing this side did not fix that one.
+  **Still missing:** `check_in_interval_count` is emitted (`policies/serializer.rs:34`) and is the
+  multiplier on the period — count 2 plus `weekly` is every two weeks — but `PolicyResource` does
+  not model it, so the cadence this SDK exposes is only half the answer. Harmless while the server
+  ignores both, load-bearing the day `tamga-api-internal#3` is fixed. Not in scope for 1.1.0;
+  needs its own item.
+- **`max_memory` / `max_disk` are write-only server-side, and are no longer `PolicyResource`
+  fields.** The columns exist (`policies/model.rs:187-188`, `Option<i64>`) and validation enforces
+  them (`allows_memory`/`allows_disk`), and `POST`/`PATCH /policies` accept them in the request
+  body — but **no serializer emits them**. `PolicyAttributes` (`policies/serializer.rs:22-53`) is
+  the only response shape for the resource and it carries `max_machines`/`max_cores` and stops.
+  Grep confirms it: every other hit is a query, a request body, or a test. So a read-only client
+  can never populate them, which is why the two fields carried "always `None`" docstrings for as
+  long as they existed. Removed from the dataclass in 1.1.0.
+  **Two things not to undo.** (1) `PolicyResource.__getattr__` is a deliberate deprecation shim:
+  it returns `None` for exactly those two names with a `DeprecationWarning` and re-raises
+  `AttributeError` for everything else, so a `^1.0` consumer that auto-upgrades into 1.1.0 and
+  reads `policy.max_memory` gets the same `None` it always got instead of a crash. Delete it in
+  2.0.0 — not before, and not as tidying. (2) It is defined under `if not TYPE_CHECKING:` on
+  purpose. A type-checker-visible `__getattr__` makes mypy accept *any* attribute name on the
+  class, which would erase this dataclass's whole reason to exist and would give a caller no
+  signal at all until the shim vanished under them. Hidden, mypy reports
+  `"PolicyResource" has no attribute "max_memory"` at the caller's own line today while the
+  runtime keeps working — verified, along with the fact that typos like `max_machiens` are still
+  caught. Do not "fix" the conditional into an unconditional definition, and do not add a
+  `# type: ignore` to make it visible.
 
 ### Server behaviour this SDK has to match
 

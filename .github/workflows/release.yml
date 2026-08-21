@@ -35,7 +35,12 @@ jobs:
         id: release
         with:
           token: ${{ steps.app-token.outputs.token }}
-          release-type: python
+          # NOTE: `release-type` is deliberately NOT passed here. Supplying it
+          # alongside `config-file` puts the action in standalone mode, where the
+          # config file — and therefore its `extra-files` — is ignored. That is why
+          # `src/tamga/__init__.py` was never bumped by any release: 1.0.1 through
+          # 1.0.4 all left it stranded. The release type lives in the config file.
+          # tamga-c and tamga-go pass config-file alone and their extra-files do update.
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 

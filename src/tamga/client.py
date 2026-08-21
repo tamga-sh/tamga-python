@@ -919,9 +919,9 @@ class LicensesClient:
             license_id: The license whose policy to read.
 
         Returns:
-            The policy resource. ``max_memory`` and ``max_disk`` are always
-            ``None`` — the server omits both from this response even though it
-            enforces them.
+            The policy resource. It carries no ``max_memory``/``max_disk``:
+            the server omits both from every policy response even though it
+            enforces them, so there was never a value to model.
 
         Raises:
             tamga.errors.NotFoundError: If the license, or its policy, does not
@@ -2118,8 +2118,8 @@ class PoliciesClient:
             policy_id: The policy to read.
 
         Returns:
-            The policy resource. ``max_memory`` and ``max_disk`` are always
-            ``None``; the server omits both.
+            The policy resource. It carries no ``max_memory``/``max_disk``;
+            the server omits both from every policy response.
 
         Raises:
             tamga.errors.ForbiddenError: If the credential lacks ``policy.read``

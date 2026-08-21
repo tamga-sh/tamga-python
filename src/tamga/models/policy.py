@@ -6,10 +6,11 @@ just the validation code — see the Tamga API protocol specification section 10
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 
@@ -133,13 +134,117 @@ MACHINE_UNIQUENESS_STRATEGIES: frozenset[str] = frozenset(
 DEFAULT_HEARTBEAT_DURATION_SECONDS: int = 600
 
 
-class CheckInInterval(str, Enum):
-    """Lowercase — inconsistent with the ``SCREAMING_SNAKE_CASE`` convention above."""
+#: Attribute names removed from :class:`PolicyResource` in 1.1.0, still served
+#: at runtime by its ``__getattr__`` shim so a ``^1.0`` consumer that reads one
+#: keeps working. Scheduled for deletion in 2.0.0.
+_REMOVED_PHANTOM_LIMITS: frozenset[str] = frozenset({"max_memory", "max_disk"})
 
-    DAY = "day"
-    WEEK = "week"
-    MONTH = "month"
-    YEAR = "year"
+#: Version that deletes the ``__getattr__`` shim above.
+_PHANTOM_LIMIT_REMOVAL_VERSION: str = "2.0.0"
+
+
+#: The noun spellings this SDK modelled as the whole vocabulary up to 1.0.4,
+#: mapped onto the adverbial values the server actually stores. Consulted by
+#: ``CheckInInterval._missing_`` so an old spelling resolves wherever it turns
+#: up, not just in ``PolicyResource.from_api``.
+_LEGACY_CHECK_IN_INTERVALS: dict[str, str] = {
+    "day": "daily",
+    "week": "weekly",
+    "month": "monthly",
+    "year": "yearly",
+}
+
+
+class CheckInInterval(str, Enum):
+    """How often a license must check in. Lowercase, and **adverbial**.
+
+    The four storable values are ``daily``/``weekly``/``monthly``/``yearly``,
+    pinned twice over: ``policies/enums.rs:27`` lists exactly those, and the
+    column's own ``CHECK`` constraint
+    (``migrations/20240101000005:153-155``) rejects anything else.
+
+    This is only half the cadence. The period is multiplied by
+    ``check_in_interval_count`` — count 2 plus ``weekly`` means every two
+    weeks — and that field is emitted by the serializer
+    (``policies/serializer.rs:34``) but **not modelled here**, so this enum
+    on its own does not tell you how often a license must check in. Do not
+    derive a schedule from it. (Moot in practice today for the reason in the
+    note below, but it will stop being moot the day the server is fixed.)
+
+    Warning:
+        Releases up to 1.0.4 modelled this as ``day``/``week``/``month``/
+        ``year`` — spellings the server cannot emit and the database will not
+        store — and constructed the enum strictly. Every policy with a
+        cadence configured therefore raised ``ValueError`` out of
+        ``licenses.get_policy`` and ``policies.get``, taking the whole policy
+        read down with it, ``heartbeat_duration`` included. Fixed in 1.1.0.
+
+    The noun spellings are kept as **aliases** rather than deleted, so
+    ``CheckInInterval.DAY`` still resolves and still compares equal to a
+    policy parsed from a real ``"daily"`` response — ``DAY is DAILY``. Their
+    ``.value`` is now the adverbial spelling, because that is the only form
+    the server accepts; code that round-tripped ``.value`` back to the API
+    was already sending something the ``CHECK`` constraint rejected.
+    ``_missing_`` accepts the noun spellings on the wire too.
+
+    A cadence outside the four still raises ``ValueError``, deliberately.
+    Softening that to ``None`` — as tamga-swift's ``init(rawValue:)`` path
+    does — would report "no check-in cadence" for a license that has one,
+    and ``require_check_in`` sits on a separate field, so the caller would
+    have every reason to believe there was no schedule to keep and would let
+    the license lapse. A closed set enforced by a database constraint is the
+    one place where failing loudly beats guessing.
+
+    Note:
+        The server does not honour this field. ``check_in_interval_days``
+        (``validate_license.rs:394-403``) matches on ``day``/``week``/
+        ``month``/``year`` — the same wrong vocabulary this SDK carried — so
+        no storable value matches any arm and ``_ => 30`` always wins: every
+        configured cadence is enforced as thirty days. Filed upstream as
+        ``tamga-api-internal#3``. The two bugs are independent; this SDK
+        reading the field correctly does not make the server act on it.
+    """
+
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    YEARLY = "yearly"
+
+    # Aliases, not distinct members: each shares its adverbial member's value,
+    # so `CheckInInterval.DAY is CheckInInterval.DAILY`. Kept for source
+    # compatibility with code written against 1.0.x.
+    DAY = "daily"
+    WEEK = "weekly"
+    MONTH = "monthly"
+    YEAR = "yearly"
+
+    @classmethod
+    def _missing_(cls, value: object) -> CheckInInterval | None:
+        """Resolve a wire value no member carries verbatim.
+
+        Lives on the enum rather than at the one call site that parses a
+        policy, so every construction path — a caller's own
+        ``CheckInInterval(raw)`` included — gets the same leniency.
+
+        Args:
+            value: Whatever ``CheckInInterval(...)`` was called with.
+
+        Returns:
+            The matching member for a legacy noun spelling or for casing and
+            whitespace noise, or ``None`` to let ``Enum`` raise ``ValueError``
+            for a cadence that is genuinely not one of the four.
+        """
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().lower()
+        normalized = _LEGACY_CHECK_IN_INTERVALS.get(normalized, normalized)
+        # Deliberately a scan rather than `cls(normalized)`: re-entering the
+        # constructor with a still-unknown value would recurse into here
+        # forever.
+        for member in cls:
+            if member.value == normalized:
+                return member
+        return None
 
 
 @dataclass(frozen=True)
@@ -156,10 +261,6 @@ class PolicyResource:
     - ``heartbeat_resurrection_strategy`` may similarly be
       ``"NO_RESURRECTION"`` — not a real variant, falls back to
       ``NO_REVIVE`` semantics.
-    - The ``GET`` response for a policy **omits ``max_memory`` and
-      ``max_disk``** even though both are enforced during validation. This
-      SDK cannot introspect those two limits client-side; it can only
-      observe ``TOO_MUCH_MEMORY``/``TOO_MUCH_DISK`` if validation fails.
 
     Free-text fields with no backing enum (branched by literal string match
     server-side; treat any value outside the documented list as
@@ -170,7 +271,11 @@ class PolicyResource:
         overage_strategy: See gotcha above.
         heartbeat_cull_strategy: See ``HeartbeatCullStrategy``.
         heartbeat_resurrection_strategy: See gotcha above.
-        check_in_interval: See ``CheckInInterval``. ``None`` if check-in isn't required.
+        check_in_interval: See ``CheckInInterval``. ``None`` when the column is
+            unset, which is not the same as "check-in isn't required" — read
+            ``require_check_in`` for that. Wire values are adverbial
+            (``daily``, not ``day``); the enum accepts either spelling and
+            reports the adverbial one.
         require_check_in: Whether periodic check-in is required at all.
         scheme: See ``LicenseScheme``.
         expiration_strategy: One of ``EXPIRATION_STRATEGIES``.
@@ -188,20 +293,6 @@ class PolicyResource:
         max_cores: Core limit, subject to ``overage_strategy``.
         max_processes: Process limit, subject to ``overage_strategy``.
         max_uses: Use limit — always strict, ``overage_strategy`` does not apply.
-        max_memory: Memory limit, subject to ``overage_strategy``. **Always
-            ``None`` in practice** — the server's ``GET`` response for a
-            policy omits this field even though it's enforced during
-            validation (see the Tamga API protocol specification section 10
-            and "Known Server-Side Gaps" item 9's neighboring note). Modeled
-            here anyway so parsing doesn't break if/when the server starts
-            including it, and so callers have a typed field to check rather
-            than reaching into raw attributes. Do not rely on this being
-            populated — the only
-            way to observe this limit today is a ``TOO_MUCH_MEMORY``
-            validation code.
-        max_disk: Disk limit, subject to ``overage_strategy``. Same
-            "always ``None`` in practice" caveat as ``max_memory`` — only
-            observable via a ``TOO_MUCH_DISK`` validation code.
         heartbeat_duration: The policy's machine-heartbeat window, in seconds,
             or ``None`` when the column is unset. **This is the field that
             decides how often a machine has to ping**; the SDK's 600s default is
@@ -221,6 +312,28 @@ class PolicyResource:
             scope means for ``409 FINGERPRINT_TAKEN``. Defaults to
             ``"UNIQUE_PER_LICENSE"``, which is also what the server treats any
             unrecognized value as.
+
+    Note:
+        **``max_memory`` and ``max_disk`` are not modeled.** Both exist as
+        columns and both are enforced during validation, but no policy
+        serializer ever emits them: the single response shape for this
+        resource (``policies/serializer.rs``'s ``PolicyAttributes``) carries
+        ``max_machines`` and ``max_cores`` and stops there. They are writable
+        through the create/update request bodies and readable nowhere, so a
+        read-only client like this one could never populate them — which is
+        why the fields this SDK used to carry were documented as "always
+        ``None``" for as long as they existed.
+
+        They were dropped from the dataclass in 1.1.0. Reading
+        ``policy.max_memory`` or ``policy.max_disk`` still returns ``None`` at
+        runtime, with a ``DeprecationWarning``, until they are deleted
+        outright in 2.0.0; a type checker reports the attribute as gone today.
+        Passing either name to ``PolicyResource(...)`` is a ``TypeError`` as
+        of 1.1.0 — a dataclass field cannot be removed from the typed surface
+        and kept in the constructor.
+
+        Observing either limit still means watching for a
+        ``ValidationCode.TOO_MUCH_MEMORY`` / ``TOO_MUCH_DISK`` result.
     """
 
     id: UUID
@@ -237,11 +350,50 @@ class PolicyResource:
     max_cores: int | None = None
     max_processes: int | None = None
     max_uses: int | None = None
-    max_memory: int | None = None
-    max_disk: int | None = None
     heartbeat_duration: int | None = None
     require_heartbeat: bool = False
     machine_uniqueness_strategy: str = "UNIQUE_PER_LICENSE"
+
+    # Deliberately invisible to type checkers. `__getattr__` on a class makes
+    # mypy accept *any* attribute name on it, which would erase the very
+    # typing this dataclass exists to provide — and would hand a caller still
+    # reading `policy.max_memory` no signal at all until 2.0.0 deletes the
+    # shim under them. Hiding it inverts that: static analysis reports the
+    # attribute as gone now (the actionable, non-fatal warning Python
+    # otherwise cannot give on a minor), while the runtime keeps serving the
+    # same `None` the field always held.
+    if not TYPE_CHECKING:
+
+        def __getattr__(self, name: str) -> None:
+            """Serve a removed phantom limit, with a deprecation warning.
+
+            Only reached for names normal attribute lookup did not find, so it
+            costs nothing on any real field. Whether a caller sees the warning
+            more than once is the interpreter's default dedup-per-location
+            filtering, not anything this does.
+
+            Args:
+                name: The attribute that was not found on the instance.
+
+            Returns:
+                ``None`` for ``max_memory``/``max_disk`` — the value those
+                fields carried for their whole existence.
+
+            Raises:
+                AttributeError: For every other name, exactly as before.
+            """
+            if name in _REMOVED_PHANTOM_LIMITS:
+                warnings.warn(
+                    f"PolicyResource.{name} is deprecated and will be removed in "
+                    f"tamga-sdk {_PHANTOM_LIMIT_REMOVAL_VERSION}. No policy "
+                    "serializer emits this field, so it was always None and can "
+                    "never be anything else; watch for a TOO_MUCH_MEMORY / "
+                    "TOO_MUCH_DISK validation code instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                return None
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     @property
     def effective_heartbeat_window_seconds(self) -> int:
@@ -311,6 +463,9 @@ class PolicyResource:
             else HeartbeatCullStrategy.DEACTIVATE_DEAD
         )
 
+        # No try/except here on purpose: the both-spellings leniency lives in
+        # `CheckInInterval._missing_`, so it applies to every construction of
+        # the enum rather than to this one call site.
         raw_check_in_interval = attributes.get("check_in_interval")
         check_in_interval = (
             CheckInInterval(raw_check_in_interval) if raw_check_in_interval is not None else None
@@ -334,8 +489,6 @@ class PolicyResource:
             max_cores=attributes.get("max_cores"),
             max_processes=attributes.get("max_processes"),
             max_uses=attributes.get("max_uses"),
-            max_memory=attributes.get("max_memory"),
-            max_disk=attributes.get("max_disk"),
             heartbeat_duration=attributes.get("heartbeat_duration"),
             require_heartbeat=bool(attributes.get("require_heartbeat", False)),
             machine_uniqueness_strategy=attributes.get(

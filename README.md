@@ -404,9 +404,27 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
   bearer, and nothing further — so any license key that authenticates can read every license in
   the same account, `attributes.key` included, in plain text. Server-side behaviour this SDK
   cannot fix and does not work around; reported upstream.
-- **`policy.max_memory` and `policy.max_disk` are always `None`.** The server omits both from the
-  policy response even though it enforces them, so the only way to observe either limit is a
-  `TOO_MUCH_MEMORY` / `TOO_MUCH_DISK` validation code.
+- **`check_in_interval` wire values are adverbial, and the server ignores the field anyway.**
+  The four storable values are `daily`/`weekly`/`monthly`/`yearly` — `policies/enums.rs:27` and
+  the column's own `CHECK` constraint both pin exactly those. Releases up to 1.0.4 modelled them
+  as `day`/`week`/`month`/`year` and constructed the enum strictly, so **any** policy with a
+  cadence configured raised `ValueError` out of `licenses.get_policy` / `policies.get` and took
+  the entire policy read down with it. Fixed in 1.1.0: `CheckInInterval` carries the adverbial
+  values, keeps the noun spellings as aliases (`CheckInInterval.DAY is CheckInInterval.DAILY`),
+  and accepts either spelling on the wire. A cadence outside the four still raises, deliberately —
+  `check_in_interval=None` means "no cadence configured", so guessing it would tell you there is
+  no schedule on a license that has one. Separately, the server does not act on this field at all:
+  `validate_license.rs:394-403` matches the *noun* spellings, so no storable value matches and
+  every cadence is enforced as thirty days (`tamga-api-internal#3`). Read `require_check_in`
+  before scheduling check-ins, and do not assume the interval you set is the one being enforced.
+- **`PolicyResource` does not model `max_memory` / `max_disk`.** The server enforces both during
+  validation but no policy serializer emits either — the one response shape for the resource
+  carries `max_machines` and `max_cores` and stops there. They are writable through the
+  create/update request bodies and readable nowhere, so the only way to observe either limit is a
+  `TOO_MUCH_MEMORY` / `TOO_MUCH_DISK` validation code. Both fields were dropped from the dataclass
+  in 1.1.0; reading `policy.max_memory` still returns the `None` it always returned, now with a
+  `DeprecationWarning`, until 2.0.0 removes it. A type checker flags it today. Passing either name
+  to `PolicyResource(...)` raises `TypeError` as of 1.1.0.
 - **`machines.update` cannot clear a field.** Every column is applied through
   `COALESCE(new, existing)` server-side, so an omitted or `None` field means "leave alone", never
   "set to null". Its response also judges `heartbeat_status`/`next_heartbeat_at` against the 600s
