@@ -432,6 +432,24 @@ def test_heartbeat_scheduler_does_not_busy_loop_on_a_zero_interval(
     assert slept == [200.0, 200.0], "a hand-built zero interval must not become sleep(0)"
 
 
+def test_heartbeat_scheduler_honours_a_positive_sub_second_interval_verbatim(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    # Pins the boundary of the clamp so it stays deliberate. The guard catches
+    # non-positive only; the one-second floor in `heartbeat_interval_for_policy`
+    # is specific to the policy-derived path, so a sub-second interval passed by
+    # hand still spins. That is not an oversight to quietly widen here:
+    # tamga-go's `NewHeartbeatScheduler` and tamga-java's `Builder.interval`
+    # clamp exactly the same non-positive case and no more, and flooring
+    # sub-second intervals in one SDK alone would make the fleet disagree about
+    # the same input.
+    client = make_client(lambda r: httpx.Response(200, json={"data": _machine_data()}))
+    scheduler = HeartbeatScheduler(
+        machines=client.machines, machine_id=MACHINE_ID, interval=timedelta(microseconds=1)
+    )
+    assert scheduler.interval == timedelta(microseconds=1)
+
+
 def test_heartbeat_scheduler_keeps_pinging_after_a_dead_observation(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
     monkeypatch: pytest.MonkeyPatch,

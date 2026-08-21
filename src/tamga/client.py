@@ -2191,8 +2191,16 @@ class HeartbeatScheduler:
         is read as unset by ``PolicyResource.effective_heartbeat_window_seconds``
         and falls back to 600s, and ``heartbeat_interval_for_policy`` floors what
         is left at one second. Constructing this dataclass directly is an equally
-        supported path and had no such guard, so the same guarantee is applied
-        here rather than only on the way in through ``for_policy``.
+        supported path and had no guard at all, so the non-positive case is
+        caught here too.
+
+        **Non-positive only.** A positive interval is honoured verbatim however
+        short, so the one-second floor above stays specific to the
+        policy-derived path: ``interval=timedelta(microseconds=1)`` still spins.
+        That gap is deliberate here rather than overlooked — tamga-go's
+        ``NewHeartbeatScheduler`` and tamga-java's ``Builder.interval`` clamp
+        exactly the same non-positive case and no more, so flooring sub-second
+        intervals is a fleet-wide decision rather than one this SDK takes alone.
 
         A zero interval is the case worth preventing. It does not make
         ``run_forever`` a fast heartbeat, it makes it an unthrottled one: the
@@ -2322,6 +2330,9 @@ class ProcessHeartbeatScheduler:
         so this scheduler has no ``for_policy`` equivalent and hand construction
         is the *only* way to build one. Nothing else stood between a zero
         ``interval`` and a ``run_forever`` that pings as fast as the loop turns.
+
+        Guards the non-positive case only, for the reason given on
+        ``HeartbeatScheduler.__post_init__``.
 
         Falls back rather than raising, for the reason given on
         ``HeartbeatScheduler.__post_init__``.
