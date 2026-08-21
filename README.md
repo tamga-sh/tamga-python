@@ -316,6 +316,15 @@ Machine files are format v2 as well:
   discovered at all, but do not mistake the surface for a scoped one: never embed a license key in
   a context where an attacker recovering it should not also be able to enumerate the account's
   other keys. This is server-side behaviour the SDK cannot fix; it has been reported upstream.
+- **The machine routes are unscoped too, and three of them write.** The server has a
+  `require_license_scope` check that confines a license credential to its own license, and it is
+  applied to exactly five routes: `validate`, `validate-key`, `quick-validate`, and both license
+  check-out variants. It is applied to **no** machine route. A license token's default permissions
+  include `machine.read`, `machine.update` and `machine.delete`, so `machines.list`,
+  `machines.get`, `machines.update` and `machines.delete` all reach every machine in the account —
+  not just the ones on the calling license. Read is the same exposure as the license routes above;
+  update and delete are worse, because they change state. Treat a license key as an
+  account-scoped credential in your threat model, not a license-scoped one. Reported upstream.
 - **Verification failures stay uniform inside a step.** A wrong key, a malformed key, and a
   tampered message all collapse to one `InvalidSignature`
   (`src/tamga/crypto/ed25519.py::verify`). The steps themselves remain distinguishable on

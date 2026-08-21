@@ -790,10 +790,14 @@ class LicensesClient:
 
         Warning:
             **This route is not scoped to the calling credential's own
-            license.** It authorizes on the ``license.read`` permission and the
-            account resolved from the bearer, and nothing further — so a license
-            key that authenticates successfully can read every license in the
-            same account, including each one's ``attributes.key`` in plain text.
+            license.** The server has a ``require_license_scope`` check that
+            confines a license credential to its own license, and applies it to
+            exactly five routes — validate, validate-key, quick-validate, and
+            both license check-out variants. This is not one of them: it
+            authorizes on the ``license.read`` permission and the account
+            resolved from the bearer, and nothing further, so a license key that
+            authenticates successfully can read every license in the same
+            account, including each one's ``attributes.key`` in plain text.
             That is server-side behaviour this SDK cannot fix and does not work
             around; it is documented here so nobody builds a multi-tenant
             assumption on top of it. Reported upstream.
@@ -1050,6 +1054,12 @@ class MachinesClient:
         revives the machine. The only signal that the row is genuinely gone is a
         ``404`` from the ping itself.
 
+        Warning:
+            Not scoped to the calling credential's license. No machine route
+            applies the server's ``require_license_scope`` check, and a license
+            token's default permissions include ``machine.read``, so any machine
+            id in the account resolves here.
+
         Args:
             machine_id: The machine to read.
 
@@ -1161,6 +1171,14 @@ class MachinesClient:
         ``memory`` and ``disk`` are **megabytes**, the same unit as ``create``,
         and they feed the same license-wide totals that create-time and
         validate-time limit checks compare against.
+
+        Warning:
+            Not scoped to the calling credential's license, and this one
+            **writes**. No machine route applies the server's
+            ``require_license_scope`` check, and a license token's default
+            permissions include ``machine.update``, so a license key can patch
+            any machine in the account — not only the ones on its own license.
+            Reported upstream.
 
         Note:
             The response's ``heartbeat_status`` and ``next_heartbeat_at`` are
