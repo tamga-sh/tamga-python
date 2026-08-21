@@ -30,21 +30,84 @@ def _component_data(component_id: UUID = COMPONENT_ID) -> dict:
     }
 
 
-def test_create_component(
+def test_create_component_sends_a_flat_body_not_a_json_api_envelope(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
 ) -> None:
+    """The handler takes `CreateComponentBody { machine_id, fingerprint, name, metadata }`.
+
+    Asserted as whole-body equality rather than field-by-field lookups. The
+    previous version of this test read `body["data"]["attributes"][...]`, which
+    passed against an enveloped body the server rejects with 422 — the test
+    pinned the bug instead of catching it. An exact match cannot do that:
+    wrapping the fields in anything at all fails here.
+    """
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
         assert request.url.path == f"{ACCOUNT_PATH}/components"
-        body = json.loads(request.content)
-        assert body["data"]["attributes"]["fingerprint"] == "cpu-fp-1"
-        assert body["data"]["attributes"]["name"] == "CPU"
-        assert body["data"]["attributes"]["machine_id"] == str(MACHINE_ID)
+        assert json.loads(request.content) == {
+            "machine_id": str(MACHINE_ID),
+            "fingerprint": "cpu-fp-1",
+            "name": "CPU",
+        }
         return httpx.Response(201, json={"data": _component_data()})
 
     client = make_client(handler)
     component = client.components.create(MACHINE_ID, "cpu-fp-1", "CPU")
     assert component.id == COMPONENT_ID
+    assert component.machine_id == MACHINE_ID
+
+
+def test_create_component_never_nests_fields_under_a_data_key(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """`machine_id`, `fingerprint` and `name` have no serde default, so an
+    envelope fails deserialization on all three and the server answers 422."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert "data" not in body, "re-enveloped: every create would 422"
+        assert "attributes" not in body
+        return httpx.Response(201, json={"data": _component_data()})
+
+    client = make_client(handler)
+    client.components.create(MACHINE_ID, "cpu-fp-1", "CPU")
+
+
+def test_create_component_forwards_metadata_at_the_top_level(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content) == {
+            "machine_id": str(MACHINE_ID),
+            "fingerprint": "cpu-fp-1",
+            "name": "CPU",
+            "metadata": {"slot": 1},
+        }
+        return httpx.Response(201, json={"data": _component_data()})
+
+    client = make_client(handler)
+    client.components.create(MACHINE_ID, "cpu-fp-1", "CPU", metadata={"slot": 1})
+
+
+def test_create_component_response_is_still_enveloped(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """Flat request, enveloped response — the asymmetry is real server behaviour.
+
+    A "tidy-up" that made both directions match would break one of them.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "data" not in json.loads(request.content)
+        return httpx.Response(201, json={"data": _component_data()})
+
+    client = make_client(handler)
+    component = client.components.create(MACHINE_ID, "cpu-fp-1", "CPU")
+    # Parsed out of `data`: a flat decode would leave these empty/zeroed.
+    assert component.id == COMPONENT_ID
+    assert component.fingerprint == "cpu-fp-1"
+    assert component.name == "CPU"
     assert component.machine_id == MACHINE_ID
 
 

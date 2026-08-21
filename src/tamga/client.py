@@ -1686,20 +1686,54 @@ class ComponentsClient:
         name: str,
         metadata: dict[str, Any] | None = None,
     ) -> ComponentResource:
-        """``POST /components``.
+        """``POST /components`` — **flat request body, not a JSON:API envelope**.
+
+        The handler deserializes into a plain struct
+        (``CreateComponentBody { machine_id, fingerprint, name, metadata }``),
+        so the fields go at the top level::
+
+            {"machine_id": "...", "fingerprint": "...", "name": "...", "metadata": {}}
+
+        Note:
+            **The response is still enveloped**, and the asymmetry is real
+            server behaviour rather than an inconsistency to smooth over. The
+            request is flat; the reply is ``{"data": {"id", "type",
+            "attributes"}}`` and is parsed as such. Nor can the request shape be
+            inferred from a sibling endpoint: ``POST /machines`` and
+            ``PATCH /machines/{id}`` genuinely do take an envelope. It is a
+            per-endpoint fact, and the only reliable way to know is the
+            handler's own body struct.
+
+            This SDK previously sent the envelope here. Every call failed
+            deserialization on the three required fields — ``machine_id``,
+            ``fingerprint`` and ``name`` carry no ``serde`` default — so the
+            server answered ``422`` and no component could be created at all.
+
+        Args:
+            machine_id: The machine this component belongs to.
+            fingerprint: Component fingerprint, unique per
+                ``(account_id, machine_id, fingerprint)``.
+            name: Required display name.
+            metadata: Optional metadata. Omitted from the body when ``None``;
+                the server defaults the column rather than rejecting the
+                request.
+
+        Returns:
+            The created component.
 
         Raises:
             tamga.errors.FingerprintTakenError: On ``409 FINGERPRINT_TAKEN``
                 for a duplicate ``(account_id, machine_id, fingerprint)``.
+            tamga.errors.NotFoundError: If the machine does not exist in the
+                account — the handler resolves it before inserting.
         """
-        attributes: dict[str, Any] = {
+        body: dict[str, Any] = {
+            "machine_id": str(machine_id),
             "fingerprint": fingerprint,
             "name": name,
-            "machine_id": str(machine_id),
         }
         if metadata is not None:
-            attributes["metadata"] = metadata
-        body = {"data": {"type": "components", "attributes": attributes}}
+            body["metadata"] = metadata
         data = _send_request(self._http, self._config, "POST", "/components", json_body=body)
         return _parse_component_resource(data)
 
@@ -1742,24 +1776,48 @@ class ProcessesClient:
     def create(
         self, machine_id: UUID, pid: str, metadata: dict[str, Any] | None = None
     ) -> ProcessResource:
-        """``POST /processes``.
+        """``POST /processes`` — **flat request body, not a JSON:API envelope**.
+
+        The handler deserializes into a plain struct
+        (``CreateProcessBody { machine_id, pid, metadata }``), so the fields go
+        at the top level::
+
+            {"machine_id": "...", "pid": "4242", "metadata": {}}
 
         ``pid`` must be a ``str`` on the wire — reject non-string input at
         this boundary rather than silently ``str()``-coercing it, so callers
         don't accidentally build the wrong wire type upstream.
 
+        Note:
+            **The response is still enveloped**, same asymmetry as
+            ``ComponentsClient.create``, and same reason it cannot be inferred
+            from ``POST /machines``, which really does take an envelope.
+
+            This SDK previously sent the envelope here. ``machine_id`` and
+            ``pid`` carry no ``serde`` default, so every call failed
+            deserialization and the server answered ``422``.
+
+        Args:
+            machine_id: The machine this process belongs to.
+            pid: Process ID, as a **string**.
+            metadata: Optional metadata. Omitted from the body when ``None``.
+
+        Returns:
+            The created process.
+
         Raises:
             TypeError: If ``pid`` is not a ``str`` (e.g. an ``int`` was passed).
             tamga.errors.PidTakenError: On ``409 PID_TAKEN`` for a duplicate
                 PID on this machine.
+            tamga.errors.TooManyProcessesError: On ``422 TOO_MANY_PROCESSES``
+                if the license is at its process limit.
         """
         if not isinstance(pid, str):
             raise TypeError(f"pid must be a str, got {type(pid).__name__}: {pid!r}")
 
-        attributes: dict[str, Any] = {"pid": pid, "machine_id": str(machine_id)}
+        body: dict[str, Any] = {"machine_id": str(machine_id), "pid": pid}
         if metadata is not None:
-            attributes["metadata"] = metadata
-        body = {"data": {"type": "processes", "attributes": attributes}}
+            body["metadata"] = metadata
         data = _send_request(self._http, self._config, "POST", "/processes", json_body=body)
         return _parse_process_resource(data)
 

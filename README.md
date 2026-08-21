@@ -404,6 +404,11 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
   deleted, so it is information rather than a stop condition: `HeartbeatScheduler` stops for no
   status at all — only `stop()`, cancellation, or a `404` from the ping (the row is gone —
   re-activate) ends the loop.
+- **Request bodies are enveloped on some endpoints and flat on others.** Responses are JSON:API
+  documents throughout, but requests are not: `machines.create` and `machines.update` send
+  `{"data": {"type", "attributes", ...}}`, while `components.create` and `processes.create` send
+  their fields at the top level, because those two handlers deserialize into plain structs. It is
+  a per-endpoint fact with no rule behind it, and normalizing the two to match breaks one of them.
 - **Nothing reaps process rows server-side.** The 30s process window exists but no scheduled job
   acts on it, so a process that merely stops pinging holds its slot against `policy.max_processes`
   forever. Deleting it is the application's job: call `processes.delete`, or use

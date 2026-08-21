@@ -198,6 +198,30 @@ wrong — these replace it.
   must stay in `activate_machine`: create-time 422 raises without a rollback DELETE (no row
   exists), validate-time over-limit deletes the row first. The uniqueness pre-check runs before
   the limit checks, so a duplicate fingerprint always yields `409 FINGERPRINT_TAKEN`.
+- **Request-body shape is PER-ENDPOINT: some take a JSON:API envelope, some take a flat object.**
+  Responses are enveloped throughout; requests are not, and there is no rule to infer either from.
+  The only reliable source is the handler's own body struct.
+  - **Enveloped** — `POST /machines` (`create_machine.rs`, reads
+    `body.data.relationships.license.data.id`) and `PATCH /machines/{id}`
+    (`update_machine.rs:16-26`, `UpdateMachineRequest { data: { type, attributes } }`).
+  - **Flat** — `POST /components` (`create_component.rs:13-20`,
+    `CreateComponentBody { machine_id, fingerprint, name, metadata }`) and `POST /processes`
+    (`create_process.rs:13-19`, `CreateProcessBody { machine_id, pid, metadata }`). Only
+    `metadata` carries `#[serde(default)]`, so an enveloped body fails deserialization on every
+    other field and axum answers **422** — which is what this SDK did to both endpoints until
+    `fix/component-process-request-shape`. (`application/vnd.api+json` is accepted by axum's
+    `Json` extractor — its suffix is `json` — so the request reaches deserialization rather than
+    being turned away as an unsupported media type. That is why the failure is 422 and not 415.)
+  - **`meta`-wrapped** — `validate` (`{meta:{scope,skip_touch}}`), both check-outs
+    (`{meta:{encrypt,ttl}}`), `generate-offline-proof` (`{meta:{dataset}}`); all optional bodies.
+  - **Bare field** — `validate-key` (`ValidateKeyBody { key }`).
+
+  `tests/test_request_wire_shapes.py` asserts the enveloped and flat cases side by side precisely
+  so "normalize them to match" fails loudly. Never assert a request body with
+  `body["data"]["attributes"][…]` lookups on a flat endpoint: that is how this bug survived — the
+  test pinned the broken shape instead of catching it, the same way tamga-dotnet's fixtures hid
+  the mirror-image defect on the *response* axis for the same two endpoints. Prefer whole-body
+  equality, which cannot pass against an extra wrapper.
 - **`GET /licenses/{id}/entitlements` cannot be paginated.** The listing unions direct and
   policy-inherited rows, so the server accepts `page[after]` and ignores it — every "next page"
   repeats the first. `entitlements.list` must send an explicit `limit` (the SDK sends the server

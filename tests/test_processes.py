@@ -27,21 +27,77 @@ def _process_data() -> dict:
     }
 
 
-def test_create_process_with_string_pid(
+def test_create_process_sends_a_flat_body_with_a_string_pid(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
 ) -> None:
+    """The handler takes `CreateProcessBody { machine_id, pid, metadata }`.
+
+    Asserted as whole-body equality rather than field-by-field lookups. The
+    previous version read `body["data"]["attributes"]["pid"]`, which passed
+    against an enveloped body the server rejects with 422 — the test pinned the
+    bug instead of catching it. An exact match cannot do that.
+    """
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
         assert request.url.path == f"{ACCOUNT_PATH}/processes"
         body = json.loads(request.content)
-        assert body["data"]["attributes"]["pid"] == "12345"
-        assert isinstance(body["data"]["attributes"]["pid"], str)
+        assert body == {"machine_id": str(MACHINE_ID), "pid": "12345"}
+        # The pid stays a string on the wire, at the top level.
+        assert isinstance(body["pid"], str)
         return httpx.Response(201, json={"data": _process_data()})
 
     client = make_client(handler)
     process = client.processes.create(MACHINE_ID, "12345")
     assert process.pid == "12345"
     assert isinstance(process.pid, str)
+
+
+def test_create_process_never_nests_fields_under_a_data_key(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """`machine_id` and `pid` have no serde default, so an envelope 422s."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert "data" not in body, "re-enveloped: every create would 422"
+        assert "attributes" not in body
+        return httpx.Response(201, json={"data": _process_data()})
+
+    client = make_client(handler)
+    client.processes.create(MACHINE_ID, "12345")
+
+
+def test_create_process_forwards_metadata_at_the_top_level(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content) == {
+            "machine_id": str(MACHINE_ID),
+            "pid": "12345",
+            "metadata": {"role": "worker"},
+        }
+        return httpx.Response(201, json={"data": _process_data()})
+
+    client = make_client(handler)
+    client.processes.create(MACHINE_ID, "12345", metadata={"role": "worker"})
+
+
+def test_create_process_response_is_still_enveloped(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """Flat request, enveloped response. Matching the two directions up breaks one."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "data" not in json.loads(request.content)
+        return httpx.Response(201, json={"data": _process_data()})
+
+    client = make_client(handler)
+    process = client.processes.create(MACHINE_ID, "12345")
+    # Parsed out of `data`: a flat decode would leave these empty/zeroed.
+    assert process.id == PROCESS_ID
+    assert process.pid == "12345"
+    assert process.machine_id == MACHINE_ID
 
 
 def test_create_process_rejects_non_string_pid(
