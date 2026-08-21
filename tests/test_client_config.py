@@ -45,6 +45,26 @@ def test_build_base_url_strips_scheme_and_trailing_slash() -> None:
     assert build_base_url("https://api.tamga.sh/", "acct_123") == (
         "https://api.tamga.sh/v1/accounts/acct_123"
     )
-    assert build_base_url("http://api.tamga.sh", "acct_123") == (
+    assert build_base_url("api.tamga.sh", "acct_123") == (
         "https://api.tamga.sh/v1/accounts/acct_123"
     )
+
+
+def test_build_base_url_preserves_an_explicit_http_scheme() -> None:
+    # A self-hosted or local deployment may legitimately serve plain HTTP —
+    # the server's TLS cert/key paths are optional and it allows localhost.
+    # Silently rewriting http:// to https:// made those hosts unreachable with
+    # no diagnostic beyond a TLS error.
+    assert build_base_url("http://localhost:8080", "acct_123") == (
+        "http://localhost:8080/v1/accounts/acct_123"
+    )
+    assert build_base_url("http://127.0.0.1:8080/", "acct_123") == (
+        "http://127.0.0.1:8080/v1/accounts/acct_123"
+    )
+
+
+def test_default_timeout_outlives_the_servers_own_request_timeout() -> None:
+    # The server times a request out at 30s and answers 504 *with* an
+    # X-Request-Id. At an equal 30s the client raced it and usually surfaced a
+    # local timeout carrying no correlation id at all.
+    assert DEFAULT_TIMEOUT_SECONDS > 30.0

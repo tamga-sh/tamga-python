@@ -25,9 +25,17 @@ class ValidationCode(str, Enum):
     Reachable today (✅), in the exact priority order the server evaluates
     them for the validate-by-ID endpoint: VALID, SUSPENDED, EXPIRED,
     OVERDUE, PRODUCT_SCOPE_MISMATCH, POLICY_SCOPE_MISMATCH,
-    USER_SCOPE_MISMATCH, ENVIRONMENT_SCOPE_MISMATCH, TOO_MANY_MACHINES,
+    USER_SCOPE_MISMATCH, ENVIRONMENT_SCOPE_MISMATCH,
+    FINGERPRINT_SCOPE_MISMATCH, ENTITLEMENTS_MISSING, TOO_MANY_MACHINES,
     TOO_MANY_CORES, TOO_MUCH_MEMORY, TOO_MUCH_DISK, TOO_MANY_PROCESSES,
     TOO_MANY_USES.
+
+    The four over-limit codes have create-time twins on ``POST /machines``,
+    which enforces the same limits and reports them as ``422``
+    ``MACHINE_LIMIT_EXCEEDED`` / ``CORE_LIMIT_EXCEEDED`` /
+    ``MEMORY_LIMIT_EXCEEDED`` / ``DISK_LIMIT_EXCEEDED``. Which of the two a
+    caller sees depends on the policy's overage strategy — see
+    ``tamga.client.MachinesClient.activate_machine``.
     """
 
     VALID = "VALID"
@@ -83,7 +91,13 @@ class ValidationCode(str, Enum):
     """Reachable: ⛔ — declared in the enum, never emitted server-side."""
 
     ENTITLEMENTS_MISSING = "ENTITLEMENTS_MISSING"
-    """Reachable: ⛔ — ``scope.entitlements`` is parsed but not checked."""
+    """``scope.entitlements`` set and not fully held. Reachable: ✅
+
+    Codes are compared case-insensitively and de-duplicated, and are
+    satisfied by policy-inherited entitlements as well as directly attached
+    ones. An empty ``entitlements`` list asserts nothing and never produces
+    this code.
+    """
 
     TOO_MANY_USERS = "TOO_MANY_USERS"
     """Reachable: ⛔ — declared, never emitted."""
@@ -95,16 +109,28 @@ class ValidationCode(str, Enum):
     """Reachable: ⛔ — declared, never emitted."""
 
     FINGERPRINT_SCOPE_MISMATCH = "FINGERPRINT_SCOPE_MISMATCH"
-    """Reachable: ⛔ — ``scope.fingerprint`` is parsed but not checked."""
+    """``scope.fingerprint`` set and matching no machine on the license. Reachable: ✅
+
+    Matches against any machine registered to the license, whatever its
+    heartbeat status.
+    """
 
     COMPONENTS_SCOPE_MISMATCH = "COMPONENTS_SCOPE_MISMATCH"
     """Reachable: ⛔ — declared, never emitted."""
 
     CHECKSUM_SCOPE_MISMATCH = "CHECKSUM_SCOPE_MISMATCH"
-    """Reachable: ⛔ — ``scope.checksum`` is parsed but not checked."""
+    """Reachable: ⛔ — ``scope.checksum`` is *rejected*, not evaluated.
+
+    Sending it fails the whole call with ``422 SCOPE_NOT_SUPPORTED``, so this
+    code can never be reached. ``LicenseScope.checksum`` is deprecated and no
+    longer sent by this SDK.
+    """
 
     VERSION_SCOPE_MISMATCH = "VERSION_SCOPE_MISMATCH"
-    """Reachable: ⛔ — ``scope.version`` is parsed but not checked."""
+    """Reachable: ⛔ — ``scope.version`` is *rejected*, not evaluated.
+
+    Same as ``CHECKSUM_SCOPE_MISMATCH``: ``422 SCOPE_NOT_SUPPORTED``.
+    """
 
     UNKNOWN = "UNKNOWN"
     """Sentinel fallback member for a ``code`` value this SDK version doesn't

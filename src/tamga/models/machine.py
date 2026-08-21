@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any
 from uuid import UUID
@@ -15,11 +16,19 @@ class HeartbeatStatus(str, Enum):
     window) -> ``DEAD`` (window elapsed) -> ``RESURRECTED`` (a new ping
     arrived after a death event was already recorded).
 
-    The heartbeat window is a **hardcoded 600 seconds (10 min)** server-side,
-    not driven by ``policy.heartbeat_duration`` (see the Tamga API protocol
-    specification, "Known Server-Side Gaps" item 8). Dead-machine handling
-    beyond that depends on the license's policy — see ``HeartbeatCullStrategy``
-    and ``HeartbeatResurrectionStrategy`` in ``tamga.models.policy``.
+    The window is the license policy's ``heartbeat_duration``, falling back to
+    600 seconds only when that column is unset — it is not a fixed constant, so
+    a ping interval sized against 600s is unsafe under a shorter policy.
+
+    ``DEAD`` means exactly one thing: the last ping is older than the window.
+    It does **not** mean the machine row was deleted. The culling worker skips
+    any policy with ``require_heartbeat: false`` — the default — so under a
+    default policy nothing is ever culled and a ``DEAD`` machine keeps its row
+    and its seat indefinitely. Keep pinging: the ping is an unconditional
+    ``last_heartbeat_at`` write and revives the machine. A ``404`` on the ping
+    is the only signal that the row is genuinely gone. Cull/resurrection
+    behavior, where enabled, is described by ``HeartbeatCullStrategy`` and
+    ``HeartbeatResurrectionStrategy`` in ``tamga.models.policy``.
     """
 
     NOT_STARTED = "NOT_STARTED"
@@ -34,16 +43,30 @@ class MachineResource:
 
     Attributes:
         id: Resource UUID.
-        fingerprint: Unique per ``(account_id, license_id, fingerprint)``.
+        fingerprint: Unique within the policy's machine-uniqueness scope —
+            per license by default, but a policy may widen that to per policy
+            or per account.
         name: Optional display name.
         ip: Optional IP address.
         hostname: Optional hostname.
         platform: Optional platform string.
         cores: Optional core count.
-        memory: Optional memory (bytes or policy-defined unit).
-        disk: Optional disk usage.
+        memory: Optional memory, in **megabytes** — not bytes. The server
+            sums this column across the license's machines and checks it
+            against the policy limit, so reporting bytes inflates the total by
+            ~1e6 and trips ``MEMORY_LIMIT_EXCEEDED`` on the next activation.
+        disk: Optional disk, in **megabytes** — same caveat as ``memory``.
         metadata: Arbitrary caller-supplied metadata.
         heartbeat_status: Current heartbeat state; see ``HeartbeatStatus``.
+        last_heartbeat_at: When the machine last pinged, if ever. The only
+            client-side basis for a liveness decision that does not re-derive
+            ``heartbeat_status``.
+        next_heartbeat_at: Server's own estimate of the next ping deadline.
+            Trustworthy on the machine *read* routes, which join the policy —
+            **not** on the ping response, which does not.
+        last_check_out_at: When a machine file was last checked out.
+        created: Creation timestamp.
+        updated: Last-update timestamp.
     """
 
     id: UUID
@@ -57,6 +80,11 @@ class MachineResource:
     disk: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     heartbeat_status: HeartbeatStatus = HeartbeatStatus.NOT_STARTED
+    last_heartbeat_at: datetime | None = None
+    next_heartbeat_at: datetime | None = None
+    last_check_out_at: datetime | None = None
+    created: datetime | None = None
+    updated: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +97,8 @@ class ComponentResource:
         fingerprint: Unique per ``(account_id, machine_id, fingerprint)``.
         name: Required display name.
         metadata: Arbitrary caller-supplied metadata.
+        created: Creation timestamp.
+        updated: Last-update timestamp.
     """
 
     id: UUID
@@ -76,6 +106,8 @@ class ComponentResource:
     fingerprint: str
     name: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    created: datetime | None = None
+    updated: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -89,19 +121,26 @@ class ProcessResource:
             mirror the server's typing exactly; do not silently coerce int
             input to str at the call boundary (see ``processes.create``).
         metadata: Arbitrary caller-supplied metadata.
+        last_heartbeat_at: When the process last pinged. Always present on
+            the wire — a process is ``ALIVE`` from creation.
+        created: Creation timestamp.
+        updated: Last-update timestamp.
 
     Note:
         Unlike machines (which start ``NOT_STARTED``), processes start
         ``ALIVE`` immediately at creation — the heartbeat timestamp is set
         then. The process heartbeat window is a hardcoded **30 seconds**
-        (much shorter than the 600s machine window) with no resurrection
-        grace period: a dead process row is deleted immediately.
+        (much shorter than the machine window) with no resurrection
+        grace period.
     """
 
     id: UUID
     machine_id: UUID
     pid: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    last_heartbeat_at: datetime | None = None
+    created: datetime | None = None
+    updated: datetime | None = None
 
 
 @dataclass(frozen=True)

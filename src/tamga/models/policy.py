@@ -70,6 +70,31 @@ class HeartbeatResurrectionStrategy(str, Enum):
     ALWAYS_REVIVE = "ALWAYS_REVIVE"
 
 
+#: Every legal ``policy.expiration_strategy`` value.
+#:
+#: The field stays typed as a plain ``str`` (the server treats it as free text
+#: and branches on literal matches), so this set is for validation and
+#: readability rather than parsing.
+#:
+#: Only ``REVOKE_ACCESS`` changes authentication: an expired license under it
+#: stops authenticating entirely and the server answers ``401 LICENSE_EXPIRED``.
+#: Under the other three an expired license still authenticates, and expiry
+#: surfaces as ``ValidationCode.EXPIRED`` in the validation result instead.
+EXPIRATION_STRATEGIES: frozenset[str] = frozenset(
+    {"RESTRICT_ACCESS", "MAINTAIN_ACCESS", "ALLOW_ACCESS", "REVOKE_ACCESS"}
+)
+
+#: Every legal ``policy.authentication_strategy`` value.
+#:
+#: License-key auth (``Authorization: License <key>``, and the ``license:<key>``
+#: Basic sub-form) is accepted **only** under ``LICENSE`` or ``MIXED``. The
+#: column defaults to ``TOKEN``, and ``NONE`` behaves identically to ``TOKEN``
+#: at this gate — under either the server answers ``401 LICENSE_NOT_ALLOWED``.
+#: Treat that as a configuration precondition to fix on the policy, never as a
+#: retryable authentication failure.
+AUTHENTICATION_STRATEGIES: frozenset[str] = frozenset({"TOKEN", "LICENSE", "MIXED", "NONE"})
+
+
 class CheckInInterval(str, Enum):
     """Lowercase — inconsistent with the ``SCREAMING_SNAKE_CASE`` convention above."""
 
@@ -110,11 +135,17 @@ class PolicyResource:
         check_in_interval: See ``CheckInInterval``. ``None`` if check-in isn't required.
         require_check_in: Whether periodic check-in is required at all.
         scheme: See ``LicenseScheme``.
-        expiration_strategy: ``"RESTRICT_ACCESS"`` (default) denies access
-            past expiry; ``"MAINTAIN_ACCESS"``/``"ALLOW_ACCESS"`` permit it.
+        expiration_strategy: One of ``EXPIRATION_STRATEGIES``.
+            ``"RESTRICT_ACCESS"`` (default) denies access past expiry;
+            ``"MAINTAIN_ACCESS"``/``"ALLOW_ACCESS"`` permit it;
+            ``"REVOKE_ACCESS"`` additionally stops the expired license from
+            authenticating at all (``401 LICENSE_EXPIRED``).
         renewal_basis: ``"FROM_EXPIRY"`` (default) vs ``"FROM_NOW"``.
-        authentication_strategy: ``"TOKEN"`` (default);
-            ``"LICENSE"``/``"MIXED"`` permit license-key bearer auth.
+        authentication_strategy: One of ``AUTHENTICATION_STRATEGIES``.
+            ``"TOKEN"`` (default) and ``"NONE"`` both **reject** license-key
+            auth with ``401 LICENSE_NOT_ALLOWED``; only ``"LICENSE"`` and
+            ``"MIXED"`` accept it. Check this before shipping a client that
+            authenticates with a raw license key.
         max_machines: Machine limit, subject to ``overage_strategy``.
         max_cores: Core limit, subject to ``overage_strategy``.
         max_processes: Process limit, subject to ``overage_strategy``.
@@ -235,6 +266,16 @@ class Entitlement:
         metadata: Arbitrary metadata.
         created: Creation timestamp.
         updated: Last-update timestamp.
+        inherited: ``True`` when the license holds this entitlement through
+            its policy rather than by a direct attachment. ``None`` when the
+            server did not send the flag — it appears only on the
+            license-scoped listing, not on account-, policy-, or
+            release-scoped responses. An inherited entitlement cannot be
+            detached from the license (``403 POLICY_ENTITLEMENT``), cannot be
+            attached again (``422 ENTITLEMENT_ALREADY_INHERITED``), and is
+            **not** resolvable through
+            ``TamgaClient.entitlements.get`` — that route reads only direct
+            attachments and answers ``404`` for it.
     """
 
     id: UUID
@@ -243,3 +284,4 @@ class Entitlement:
     metadata: dict[str, Any] = field(default_factory=dict)
     created: datetime | None = None
     updated: datetime | None = None
+    inherited: bool | None = None

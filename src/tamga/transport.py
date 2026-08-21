@@ -2,7 +2,9 @@
 
 Base URL shape: ``https://<host>/v1/accounts/{account_id}/...`` —
 ``{account_id}`` is always required, in both singleplayer and multiplayer
-server modes.
+server modes. A host given with an explicit ``http://`` scheme keeps it (see
+``build_base_url``), so a self-hosted or local plain-HTTP deployment stays
+reachable; a bare host still defaults to ``https``.
 
 Auth transports, in the order the server tries them (SDK defaults to the
 first — ``Bearer``):
@@ -11,11 +13,21 @@ first — ``Bearer``):
 2. ``Authorization: Basic <base64>`` — 3 sub-forms: ``email:password``,
    ``token:`` (token as username, empty password), ``license:<key>``
 3. ``Authorization: License <key>`` — primary transport for
-   embedded/client SDKs validating against a raw license key
+   embedded/client SDKs validating against a raw license key. **Only accepted
+   when the license's policy sets ``authentication_strategy`` to ``"LICENSE"``
+   or ``"MIXED"``.** That column defaults to ``"TOKEN"`` (and ``"NONE"``
+   behaves identically at this gate), under which the server answers ``401
+   LICENSE_NOT_ALLOWED`` — a configuration precondition, not a retryable
+   failure. The same applies to the ``license:<key>`` Basic sub-form.
 4. ``Cookie: Tamga-Session=<uuid>`` — browser/portal only, requires a
    matching ``Origin`` header. **Not implemented** in this SDK — it targets
    non-browser embedded apps.
 5. ``?token=``/``?auth=`` query parameter
+
+This SDK never sends an ``Origin`` header. Keep it that way: the server skips
+the ``last_validated_at`` write on any quick-validate request that carries one
+(see ``TamgaClient.licenses.quick_validate``), and the response is byte-identical
+either way, so a proxy that injects ``Origin`` silently disables that write.
 
 Every issued token gets the ``tok-`` prefix regardless of documented type —
 do not build prefix-based token type detection; treat all tokens as opaque
@@ -39,8 +51,14 @@ import httpx
 
 from tamga.errors import parse_error_envelope
 
-DEFAULT_TIMEOUT_SECONDS: float = 30.0
-"""Default connect/read timeout for the underlying httpx.Client."""
+DEFAULT_TIMEOUT_SECONDS: float = 45.0
+"""Default connect/read timeout for the underlying httpx.Client.
+
+Deliberately longer than the server's own 30 s request timeout. At an equal
+30 s the two race, and a slow request usually surfaces as a local timeout with
+no ``X-Request-Id`` instead of the server's ``504`` — which does carry one, and
+is the correlation id support asks for first.
+"""
 
 MAX_TAMGA_VERSION_LENGTH: int = 32
 """Server-side max length for the sanitized ``Tamga-Version`` header value."""
@@ -52,17 +70,27 @@ JSON_API_CONTENT_TYPE: str = "application/vnd.api+json"
 def build_base_url(host: str, account_id: str) -> str:
     """Build the account-scoped base URL: ``https://<host>/v1/accounts/{account_id}``.
 
+    An explicit ``http://`` scheme is **preserved**, not upgraded: a
+    self-hosted or local deployment may legitimately serve plain HTTP (the
+    server's TLS cert/key paths are optional, and it allows ``localhost``/
+    ``127.0.0.1``), and silently rewriting the scheme made those deployments
+    unreachable with no diagnostic. A bare host, or one given as ``https://``,
+    still resolves to ``https``.
+
     Args:
-        host: API host, without scheme (e.g. ``"api.tamga.sh"``).
+        host: API host, with or without scheme (e.g. ``"api.tamga.sh"``,
+            ``"http://localhost:8080"``).
         account_id: Account ID or code — always required, singleplayer and
             multiplayer alike.
 
     Returns:
         The fully-qualified base URL, with no trailing slash.
     """
-    normalized_host = host.strip().removeprefix("https://").removeprefix("http://")
+    stripped = host.strip()
+    scheme = "http" if stripped.startswith("http://") else "https"
+    normalized_host = stripped.removeprefix("https://").removeprefix("http://")
     normalized_host = normalized_host.rstrip("/")
-    return f"https://{normalized_host}/v1/accounts/{account_id}"
+    return f"{scheme}://{normalized_host}/v1/accounts/{account_id}"
 
 
 def sanitize_tamga_version(version: str) -> str:

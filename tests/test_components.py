@@ -73,6 +73,29 @@ def test_create_component_duplicate_fingerprint_conflict(
         client.components.create(MACHINE_ID, "cpu-fp-1", "CPU")
 
 
+def test_list_components_sends_the_server_max_page_size_by_default(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    # With no `limit` the server applies its own default of 25 rows and exposes
+    # no total or cursor metadata, so a truncated listing was indistinguishable
+    # from a complete one. Sending the max explicitly makes a full page
+    # detectable and yields a usable cursor.
+    seen: dict = {}
+    full_page = [
+        _component_data(UUID(int=0x018F2F3A_0000_7000_8000_000000000300 + i)) for i in range(100)
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["limit"] = request.url.params.get("limit")
+        return httpx.Response(200, json={"data": full_page})
+
+    client = make_client(handler)
+    page = client.components.list(MACHINE_ID)
+
+    assert seen["limit"] == "100"
+    assert page.next_after == str(full_page[-1]["id"])
+
+
 def test_list_components_pagination(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
 ) -> None:

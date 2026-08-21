@@ -1,10 +1,17 @@
 """Create a machine, then validate the license, handling an over-limit rollback.
 
-This is the documented activation flow (Tamga API protocol specification
-section 5): the server does not check machine/core/memory/disk/process limits
-at *creation* time — only later, on license validation. `activate_machine` implements
-create -> validate -> delete-and-raise-on-over-limit so a caller doesn't
-have to hand-roll the rollback themselves.
+A limit can stop the activation at either of two points, and `activate_machine`
+handles both:
+
+- At creation, with a `422` (`MACHINE_LIMIT_EXCEEDED` and friends) — no row was
+  created, so there is nothing to roll back.
+- At validation, when the policy's overage strategy let the create through — the
+  row exists and is deleted before the error is raised.
+
+Either way the caller sees one `ValueError` naming the equivalent
+`ValidationCode`, so there is one branch to write instead of two.
+
+`memory` and `disk`, if reported, are in **megabytes**.
 
 Run:
     TAMGA_ACCOUNT_ID=... TAMGA_HOST=api.tamga.sh TAMGA_LICENSE_ID=... \
@@ -36,9 +43,11 @@ def main() -> None:
                 cores=os.cpu_count(),
             )
         except ValueError as exc:
-            # activate_machine already deleted the just-created machine row
-            # before raising — no manual cleanup needed here.
-            print("Activation rejected (machine row rolled back):", exc)
+            # activate_machine has already cleaned up whatever needed cleaning
+            # up: it deletes the machine row when the create succeeded and only
+            # validation rejected it, and skips the delete when the create
+            # itself was refused. No manual cleanup here either way.
+            print("Activation rejected:", exc)
             return
 
         print("Machine activated:", machine.id, machine.heartbeat_status)

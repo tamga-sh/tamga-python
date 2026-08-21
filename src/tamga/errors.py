@@ -18,6 +18,18 @@ modeled below as typed subclasses.
 ``429 TOO_MANY_REQUESTS`` is live and modelled as ``RateLimitedError``, which
 carries the server's ``Retry-After``. Credential-accepting endpoints run on a
 tight per-IP budget that a heartbeat timer reaches easily.
+
+**Auth is enforced.** ``Authorization: License <key>`` is only accepted when
+the license's policy has ``authentication_strategy`` set to ``"LICENSE"`` or
+``"MIXED"``. That column defaults to ``"TOKEN"``, and ``"NONE"`` behaves like
+``"TOKEN"`` at the auth gate — under either, license-key auth is rejected with
+``401 LICENSE_NOT_ALLOWED`` (``LicenseNotAllowedError``). That is a
+configuration precondition, **not** a retryable authentication failure: retrying
+or re-sending the same key will never succeed. Likewise, a license whose policy
+uses ``expiration_strategy: "REVOKE_ACCESS"`` stops authenticating entirely once
+it expires (``401 LICENSE_EXPIRED``), while the other three expiration
+strategies still authenticate an expired license and report expiry through the
+validation ``meta.code`` instead.
 """
 
 from __future__ import annotations
@@ -133,6 +145,82 @@ class DatasetInvalidError(TamgaError):
     """422 ``DATASET_INVALID`` — offline proof ``dataset`` payload rejected."""
 
 
+class MachineLimitExceededError(TamgaError):
+    """422 ``MACHINE_LIMIT_EXCEEDED`` — machine creation refused by the policy's machine limit.
+
+    Creation *does* enforce limits: the server runs the check through the
+    policy's overage strategy before inserting the row, so under
+    ``NO_OVERAGE`` (and any strategy whose multiplied ceiling is already
+    reached) ``POST /machines`` fails outright rather than succeeding and
+    surfacing the problem at validation time. The equivalent validation code
+    is ``ValidationCode.TOO_MANY_MACHINES``.
+    """
+
+
+class CoreLimitExceededError(TamgaError):
+    """422 ``CORE_LIMIT_EXCEEDED`` — machine ``cores`` would exceed the policy's core limit.
+
+    Same create-time enforcement as ``MachineLimitExceededError``; the
+    equivalent validation code is ``ValidationCode.TOO_MANY_CORES``.
+    """
+
+
+class MemoryLimitExceededError(TamgaError):
+    """422 ``MEMORY_LIMIT_EXCEEDED`` — machine ``memory`` would exceed the policy's limit.
+
+    ``memory`` is reported in **megabytes**; reporting bytes inflates the
+    license's running total by ~1e6 and trips this on the next activation.
+    The equivalent validation code is ``ValidationCode.TOO_MUCH_MEMORY``.
+    """
+
+
+class DiskLimitExceededError(TamgaError):
+    """422 ``DISK_LIMIT_EXCEEDED`` — machine ``disk`` would exceed the policy's limit.
+
+    ``disk`` is reported in **megabytes**, same caveat as
+    ``MemoryLimitExceededError``. The equivalent validation code is
+    ``ValidationCode.TOO_MUCH_DISK``.
+    """
+
+
+class TooManyProcessesError(TamgaError):
+    """422 ``TOO_MANY_PROCESSES`` — process spawn refused by the policy's process limit.
+
+    Raised by ``POST /processes``. Note the server never reaps process rows on
+    its own, so a crashed process holds its slot until it is deleted
+    explicitly.
+    """
+
+
+class LicenseSuspendedError(TamgaError):
+    """401 ``LICENSE_SUSPENDED`` — the license is suspended, so the credential is refused.
+
+    Distinct from the ``ValidationCode.SUSPENDED`` validation result: this one
+    fails at the auth gate, before any endpoint logic runs.
+    """
+
+
+class LicenseExpiredError(TamgaError):
+    """401 ``LICENSE_EXPIRED`` — expired license under ``expiration_strategy: REVOKE_ACCESS``.
+
+    Only ``REVOKE_ACCESS`` refuses the credential outright;
+    ``RESTRICT_ACCESS``/``MAINTAIN_ACCESS``/``ALLOW_ACCESS`` still
+    authenticate an expired license and report expiry through the validation
+    ``meta.code`` instead.
+    """
+
+
+class LicenseNotAllowedError(TamgaError):
+    """401 ``LICENSE_NOT_ALLOWED`` — license-key auth is disabled by the policy.
+
+    The policy's ``authentication_strategy`` must be ``"LICENSE"`` or
+    ``"MIXED"`` for ``Authorization: License <key>`` to be accepted; it
+    defaults to ``"TOKEN"``, and ``"NONE"`` behaves the same way at this gate.
+    A configuration precondition, not a transient failure — **do not retry**,
+    and do not present it to end users as a bad-key error.
+    """
+
+
 class UnknownTamgaError(TamgaError):
     """Fallback for error ``code`` values not yet modeled by this SDK version."""
 
@@ -155,6 +243,14 @@ _CODE_TO_EXCEPTION: dict[str, type[TamgaError]] = {
     "LICENSE_KEY_MISSING": LicenseKeyMissingError,
     "SCHEME_NOT_SUPPORTED": SchemeNotSupportedError,
     "DATASET_INVALID": DatasetInvalidError,
+    "MACHINE_LIMIT_EXCEEDED": MachineLimitExceededError,
+    "CORE_LIMIT_EXCEEDED": CoreLimitExceededError,
+    "MEMORY_LIMIT_EXCEEDED": MemoryLimitExceededError,
+    "DISK_LIMIT_EXCEEDED": DiskLimitExceededError,
+    "TOO_MANY_PROCESSES": TooManyProcessesError,
+    "LICENSE_SUSPENDED": LicenseSuspendedError,
+    "LICENSE_EXPIRED": LicenseExpiredError,
+    "LICENSE_NOT_ALLOWED": LicenseNotAllowedError,
 }
 
 

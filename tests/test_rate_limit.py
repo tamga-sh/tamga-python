@@ -10,6 +10,7 @@ bucket empty, and the client never recovers on its own.
 from __future__ import annotations
 
 import json
+from uuid import UUID
 
 import httpx
 import pytest
@@ -24,6 +25,7 @@ from tamga.errors import RateLimitedError
 from tamga.transport import LicenseAuth
 
 ACCOUNT = "acc-123"
+MACHINE_ID = UUID("018f2f3a-0000-7000-8000-000000000051")
 
 
 def _rate_limited_body() -> bytes:
@@ -119,7 +121,42 @@ def test_a_create_is_never_auto_retried() -> None:
 def test_idempotent_calls_are_retryable() -> None:
     assert _is_retryable("GET", "/v1/accounts/acc/licenses") is True
     assert _is_retryable("POST", "/v1/accounts/acc/licenses/actions/validate") is True
-    assert _is_retryable("POST", "/v1/accounts/acc/machines/x/actions/ping") is True
+    assert _is_retryable("POST", "/v1/accounts/acc/processes/x/actions/ping") is True
+
+
+def test_the_machine_heartbeat_is_retryable() -> None:
+    # `/actions/ping-heartbeat` does not end with `/actions/ping` — that suffix
+    # only matches the *process* ping route — so the machine heartbeat was
+    # excluded from backoff. It is the one call a machine makes on a timer, and
+    # the limiter buckets per route pattern with every caller sharing a bucket,
+    # so a throttled heartbeat was dropped silently and the machine drifted
+    # toward being culled. Both heartbeat writes are bare idempotent UPDATEs.
+    assert _is_retryable("POST", "/v1/accounts/acc/machines/m-1/actions/ping-heartbeat") is True
+    assert _is_retryable("POST", "/v1/accounts/acc/machines/m-1/actions/reset-heartbeat") is True
+
+
+def test_a_throttled_heartbeat_is_actually_retried() -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, content=_rate_limited_body(), headers={"Retry-After": "0"})
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "id": str(MACHINE_ID),
+                    "type": "machines",
+                    "attributes": {"fingerprint": "fp", "heartbeat_status": "ALIVE"},
+                }
+            },
+        )
+
+    machine = _client(handler).machines.ping_heartbeat(MACHINE_ID)
+
+    assert machine.heartbeat_status.value == "ALIVE"
+    assert calls["n"] == 2, "the throttled heartbeat must have been retried"
 
 
 def test_an_absurd_retry_after_is_capped() -> None:

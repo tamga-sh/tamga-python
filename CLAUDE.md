@@ -113,48 +113,113 @@ individually; see `.github/workflows/ci.yml` for the exact order
 - **`pid` is a string on the wire.** `ProcessResource.pid` and `processes.create(..., pid=...)` are
   typed `str`, matching the server exactly. Reject `int` input at the call boundary; don't
   `str()`-coerce it — that hides a caller bug instead of surfacing it.
+- **`memory` and `disk` are megabytes, not bytes.** The server's `machines` table documents the
+  unit explicitly, and those columns feed the license's `machines_memory_count` /
+  `machines_disk_count` totals that create-time and validate-time limit checks compare against.
+  A caller reporting 16 GB as `17179869184` inflates the license total by ~1e6 and trips
+  `MEMORY_LIMIT_EXCEEDED` on the next activation. Never document these as bytes.
 - **`"DENY_ACCESS"` / `"NO_RESURRECTION"` are not real enum variants.** Freshly-created policies
   report these as their `overage_strategy`/`heartbeat_resurrection_strategy` defaults, but neither
   string is a valid member of `OverageStrategy`/`HeartbeatResurrectionStrategy`. Both silently
   behave as `NO_OVERAGE`/`NO_REVIVE` server-side — `PolicyResource` parsing must apply that
   fallback, not trust the field name's implication that access is denied by default.
 
-### Protocol-specification "Known Server-Side Gaps" that apply to this repo
+### Server behaviour this SDK has to match
 
-Only the gaps relevant to this SDK's actual scope (license validation, checkout, machine
-management, entitlements) are listed — see the Tamga API protocol specification for the full list,
-including analytics/EE items that don't touch this package at all.
+Verified against the server source. Where an older note in this file said otherwise, the note was
+wrong — these replace it.
 
-- **Auth is not enforced server-side on license/machine endpoints** (gap #3). Send
-  `Authorization: License <key>` (or another transport) on every call anyway — it's
-  forward-compatible for when enforcement lands, but don't build any test or example that asserts
-  a *missing* credential gets rejected today; it won't be.
-- **Only 14 of 24 `ValidationCode` values are reachable** (gap #4). Model all 24 in
-  `ValidationCode` with a lenient unknown-value fallback, but don't write tests or docs implying
-  the other 10 (`BANNED`, `ENTITLEMENTS_MISSING`, `TOO_MANY_USERS`, `HEARTBEAT_DEAD`,
-  `HEARTBEAT_NOT_STARTED`, `FINGERPRINT_SCOPE_MISMATCH`, `COMPONENTS_SCOPE_MISMATCH`,
-  `CHECKSUM_SCOPE_MISMATCH`, `VERSION_SCOPE_MISMATCH`, plus `NOT_FOUND` which comes back as a raw
-  HTTP 404 instead) can currently occur.
-- **`429` is live and handled client-side.** Credential-accepting endpoints run on a tight per-IP
-  budget that a heartbeat timer reaches easily. `client.py`'s `_request_with_retry` retries while
-  the server answers `429`, using `_retry_delay` (server `Retry-After` preferred but capped at
-  60s, else jittered exponential backoff) and `_is_retryable` (every `GET`, plus exactly five
-  `POST` actions: `validate`, `validate-key`, `check-in`, `check-out`, `ping`). Creates are
-  deliberately excluded — retrying `POST /machines` risks burning a second seat. When the retry
-  budget is spent the caller gets `errors.RateLimitedError` carrying `retry_after`. `X-RateLimit-*`
-  response headers are still not set server-side, so `Retry-After` is the only server signal —
-  don't build header parsing for the others.
+- **Auth IS enforced.** License-key auth (`Authorization: License <key>`, and the `license:<key>`
+  Basic sub-form) is only accepted when the license's policy sets `authentication_strategy` to
+  `LICENSE` or `MIXED`. The column defaults to `TOKEN`, and `NONE` behaves identically at that
+  gate, so the server answers `401 LICENSE_NOT_ALLOWED` (`errors.LicenseNotAllowedError`) until
+  someone turns license-key auth on. Treat that as a configuration precondition, never as a
+  retryable auth failure. Likewise `expiration_strategy: REVOKE_ACCESS` stops an expired license
+  from authenticating at all (`401 LICENSE_EXPIRED`); the other three strategies still
+  authenticate it and report expiry via the validation `meta.code`.
+- **16 of 24 `ValidationCode` values are reachable.** Model all 24 with the lenient
+  unknown-value fallback. `ENTITLEMENTS_MISSING` and `FINGERPRINT_SCOPE_MISMATCH` are now
+  genuinely emitted — `scope.entitlements` and `scope.fingerprint` are enforced (codes compared
+  case-insensitively and de-duplicated, satisfied by policy-inherited entitlements too; the
+  fingerprint matches any machine on the license regardless of heartbeat status). Still
+  unreachable: `BANNED`, `TOO_MANY_USERS`, `HEARTBEAT_DEAD`, `HEARTBEAT_NOT_STARTED`,
+  `COMPONENTS_SCOPE_MISMATCH`, `NOT_FOUND` (raw HTTP 404 instead), and
+  `CHECKSUM_SCOPE_MISMATCH`/`VERSION_SCOPE_MISMATCH` — the latter two because those scope keys are
+  *rejected* rather than evaluated (see below).
+- **`scope.version` / `scope.checksum` are rejected, not ignored.** The server fails the whole
+  validate call with `422 SCOPE_NOT_SUPPORTED` (pointer `/meta/scope`) the moment either key is
+  present, before any validation runs — the caller gets no `meta.valid` at all. `_scope_to_dict`
+  therefore does not emit them. Keep the fields on `LicenseScope` (removing a public field is
+  breaking) and keep them out of the request.
+- **Machine creation enforces limits.** `POST /machines` checks machines/cores/memory/disk through
+  the policy's overage strategy *before* inserting, returning `422 MACHINE_LIMIT_EXCEEDED` /
+  `CORE_LIMIT_EXCEEDED` / `MEMORY_LIMIT_EXCEEDED` / `DISK_LIMIT_EXCEEDED`. Under a permissive
+  overage strategy the create still succeeds and the limit only surfaces at validate. Both paths
+  must stay in `activate_machine`: create-time 422 raises without a rollback DELETE (no row
+  exists), validate-time over-limit deletes the row first. The uniqueness pre-check runs before
+  the limit checks, so a duplicate fingerprint always yields `409 FINGERPRINT_TAKEN`.
+- **`GET /licenses/{id}/entitlements` cannot be paginated.** The listing unions direct and
+  policy-inherited rows, so the server accepts `page[after]` and ignores it — every "next page"
+  repeats the first. `entitlements.list` must send an explicit `limit` (the SDK sends the server
+  max, 100), must never return a `next_after`, and `list_all` must be a single request. Looping
+  here hangs the process. The listing tops out at 100 effective entitlements with no total count,
+  so a negative `has_entitlement` is only authoritative below that ceiling. Entitlements carry an
+  `inherited` flag, and `entitlements.get` resolves direct attachments only — it 404s for an
+  inherited row, so list-then-get-each is not a valid pattern here.
+  `/machines/{id}/components` is different: keyset paging genuinely works there.
+- **Never omit `limit` on a list call.** The server defaults to 25 and exposes no `links` or
+  `meta.page`, so an omitted page size makes truncation indistinguishable from completion. Send
+  `MAX_PAGE_SIZE` and derive the cursor from that known value.
+- **`429` is live and handled client-side.** The limiter buckets per `(caller, route pattern)`,
+  and with proxy headers untrusted every caller shares one bucket per route — a fleet throttles
+  itself on exactly the calls it makes on a timer. `client.py`'s `_request_with_retry` retries
+  while the server answers `429`, using `_retry_delay` (server `Retry-After` preferred but capped
+  at 60s, else jittered exponential backoff) and `_is_retryable` (every `GET`, plus seven `POST`
+  actions: `validate`, `validate-key`, `check-in`, `check-out`, `ping`, `ping-heartbeat`,
+  `reset-heartbeat`). Note `/actions/ping-heartbeat` does **not** end with `/actions/ping` — that
+  suffix matches only the process route — so it needs its own entry; leaving it out silently
+  dropped the machine heartbeat under throttling. Both heartbeat writes are bare idempotent
+  `UPDATE`s, so repeating them is safe. Creates stay excluded — retrying `POST /machines` risks
+  burning a second seat. When the retry budget is spent the caller gets `errors.RateLimitedError`
+  carrying `retry_after`.
 - **`Tamga-Environment` header is not implemented** (gap #7). Don't add it to `transport.py`'s
   request headers even though it's documented as a planned EE feature — no server code path reads
   it yet.
-- **`heartbeat_status` ignores `policy.heartbeat_duration`** (gap #8). The window is a hardcoded
-  600s for machines regardless of what a license's policy declares. `HeartbeatScheduler`'s
-  recommended interval (~200s) is sized against that hardcoded constant, not against
-  `policy.heartbeat_duration` — don't wire the scheduler to read the policy value, it wouldn't
-  matter server-side anyway.
-- **RFC 9421 response signing is dead code** (gap #6) and the auto-update/release-check endpoint
-  is unusable (Tamga API protocol specification §12). Neither is in this SDK's scope at all —
-  there is no `releases` sub-client and none should be added until the server side is real.
+- **The heartbeat window comes from the policy.** It is `policy.heartbeat_duration`, falling back
+  to 600s only when that column is unset — not a fixed constant. `HeartbeatScheduler`'s default
+  ~200s interval is sized against the *fallback*, so a policy with a shorter window needs an
+  explicit interval. Do not schedule off the ping response's `next_heartbeat_at`: that code path
+  does not join the policy. Reading the policy-correct value needs `GET /machines/{id}` or
+  `GET /licenses/{id}/policy`, neither of which this SDK exposes yet.
+- **`DEAD` never stops the heartbeat loop.** `DEAD` means only "the last ping is older than the
+  window". It does not imply the row was deleted, and `require_heartbeat` defaults to `false`, so
+  under a default policy the culling worker returns immediately and nothing is ever culled. The
+  ping is an unconditional `last_heartbeat_at = NOW()` write with no liveness precondition, so it
+  revives a `DEAD` machine. `HeartbeatScheduler.run_forever` used to `break` on the first `DEAD`
+  reading — permanently, with nothing to restart it. The only signal that the row is really gone
+  is a `404` from the ping itself; that propagates to the caller, who re-activates.
+- **`reset_heartbeat` and `generate_offline_proof` always 403 under license-key auth.** Both are
+  gated on the caller's *role* (admin / developer / product token / environment token), not just a
+  permission, and a `LicenseToken` holds none of them — even though it does hold
+  `machine.proofs.generate`. `ping_heartbeat` is permission-only and works. Document the 403;
+  don't present `reset_heartbeat` to an embedded license-key client as a recovery tool.
+- **`quick_validate` skips its write when an `Origin` header is present.** The server suppresses
+  the `last_validated_at` update on any quick-validate request carrying `Origin`, and the response
+  is byte-identical either way. This SDK never sends `Origin` — keep it that way, and never add
+  it to a non-cookie transport. When the write must happen, use `POST validate`
+  (`validate_by_id`), which has no `Origin` branch.
+- **The auto-update / upgrade-check endpoint works.** `GET /releases/actions/upgrade` routes to a
+  live, public handler: `204 No Content` when already current, otherwise a `releases` resource.
+  The artifact download route exists too, though it is currently walled off by a permission gap.
+  The old note here claimed the endpoint 500s and forbade building against it — that was wrong.
+  There is still no `releases` sub-client (out of scope for this release, not impossible), and
+  RFC 9421 response signing genuinely is dead code.
+- **`http://` hosts are preserved.** `build_base_url` upgrades a bare host to `https` but keeps an
+  explicit `http://` scheme — a self-hosted deployment may serve plain HTTP, and rewriting the
+  scheme made it unreachable with no useful diagnostic.
+- **The default timeout is 45s, above the server's own 30s.** At an equal 30s the two race and a
+  slow request surfaces as a local timeout with no `X-Request-Id`, instead of the server's `504`,
+  which carries one.
 
 ## Testing
 

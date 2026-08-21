@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 import httpx
@@ -120,3 +120,34 @@ def test_process_heartbeat_scheduler_stops_when_signalled(
     monkeypatch.setattr("tamga.client.time.sleep", fake_sleep)
     scheduler.run_forever()
     assert ping_count["n"] == 3
+
+
+def test_process_timestamps_are_parsed(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    # `last_heartbeat_at` is NOT NULL server-side (a process is ALIVE from
+    # creation) and was dropped entirely by the parser.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "id": str(PROCESS_ID),
+                    "type": "processes",
+                    "attributes": {
+                        "pid": "12345",
+                        "machine_id": str(MACHINE_ID),
+                        "last_heartbeat_at": "2024-01-01T00:00:10Z",
+                        "created": "2024-01-01T00:00:00Z",
+                        "updated": "2024-01-01T00:00:10Z",
+                    },
+                }
+            },
+        )
+
+    client = make_client(handler)
+    process = client.processes.ping(PROCESS_ID)
+
+    assert process.last_heartbeat_at == datetime(2024, 1, 1, 0, 0, 10, tzinfo=timezone.utc)
+    assert process.created == datetime(2024, 1, 1, tzinfo=timezone.utc)
+    assert process.updated == datetime(2024, 1, 1, 0, 0, 10, tzinfo=timezone.utc)

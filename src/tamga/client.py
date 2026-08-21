@@ -5,11 +5,13 @@
 ``.entitlements``) rather than one flat method namespace, mirroring the
 server's own resource grouping.
 
-Auth note: server-side auth enforcement is **not currently active** on the
-license or machine endpoints — this SDK still always sends proper
-credentials (default: ``Authorization: License <key>`` for license-key-based
-flows) for forward-compatibility, not because the server currently checks
-them.
+Auth note: auth **is** enforced server-side. For the license-key transport
+(``Authorization: License <key>``) the license's policy must set
+``authentication_strategy`` to ``"LICENSE"`` or ``"MIXED"``; the column
+defaults to ``"TOKEN"``, and ``"NONE"`` behaves the same way at the auth gate,
+so an unconfigured policy answers ``401 LICENSE_NOT_ALLOWED``
+(``tamga.errors.LicenseNotAllowedError``). That is a configuration
+precondition, not a transient failure — retrying the same key never helps.
 
 Rate limiting: the server does answer ``429``. Requests that are safe to
 repeat are retried here with capped ``Retry-After``/jittered backoff — see
@@ -31,7 +33,7 @@ from uuid import UUID
 
 import httpx
 
-from tamga.errors import TtlInvalidError, parse_error_envelope
+from tamga.errors import TamgaError, TtlInvalidError, parse_error_envelope
 from tamga.models.license import LicenseFileResource, LicenseResource, LicenseScope
 from tamga.models.machine import (
     ComponentResource,
@@ -56,9 +58,11 @@ from tamga.transport import (
 
 T = TypeVar("T")
 
-#: Recommended machine heartbeat ping interval — roughly 1/3 of the
-#: server's hardcoded 600s heartbeat window (see the Tamga API protocol
-#: specification section 5).
+#: Recommended machine heartbeat ping interval — roughly 1/3 of the server's
+#: *default* 600s heartbeat window. The window is not a constant: it comes from
+#: the license's ``policy.heartbeat_duration`` and only falls back to 600s when
+#: that column is unset, so a policy with a short window needs a
+#: correspondingly shorter interval passed explicitly to ``HeartbeatScheduler``.
 MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL: timedelta = timedelta(seconds=200)
 
 #: Recommended process heartbeat ping interval — well inside the server's
@@ -66,9 +70,31 @@ MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL: timedelta = timedelta(seconds=200)
 #: period (see the Tamga API protocol specification section 8).
 PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL: timedelta = timedelta(seconds=10)
 
+#: The server's maximum (and this SDK's default) page size for the keyset-
+#: paginated list routes. The server clamps `limit` to 1..100 and applies its
+#: own default of 25 when the parameter is absent — which is invisible to the
+#: caller, so this SDK always sends a page size explicitly.
+MAX_PAGE_SIZE: int = 100
+
 #: Server-side bounds on machine/process checkout `ttl` (seconds): must be
 #: `> 0` and `<= 31536000` (365 days), else `422 TTL_INVALID`.
 MAX_CHECKOUT_TTL_SECONDS: int = 31536000
+
+#: Create-time limit error codes on ``POST /machines``, mapped to the
+#: ``ValidationCode`` that describes the same limit.
+#:
+#: Machine creation is **not** limit-free: the server checks machines/cores/
+#: memory/disk before inserting the row. The check runs through the policy's
+#: overage strategy, so under a permissive strategy (``ALLOW_ACCESS``-style
+#: multipliers, ``ALLOW_1_25X_OVERAGE`` and friends) creation still succeeds and
+#: the limit only shows up at validate time — which is why
+#: ``MachinesClient.activate_machine`` keeps both paths.
+_CREATE_LIMIT_CODE_TO_VALIDATION_CODE: dict[str, ValidationCode] = {
+    "MACHINE_LIMIT_EXCEEDED": ValidationCode.TOO_MANY_MACHINES,
+    "CORE_LIMIT_EXCEEDED": ValidationCode.TOO_MANY_CORES,
+    "MEMORY_LIMIT_EXCEEDED": ValidationCode.TOO_MUCH_MEMORY,
+    "DISK_LIMIT_EXCEEDED": ValidationCode.TOO_MUCH_DISK,
+}
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -108,6 +134,11 @@ def _parse_machine_resource(data: dict[str, Any]) -> MachineResource:
         disk=attrs.get("disk"),
         metadata=attrs.get("metadata") or {},
         heartbeat_status=HeartbeatStatus(attrs.get("heartbeat_status", "NOT_STARTED")),
+        last_heartbeat_at=_parse_datetime(attrs.get("last_heartbeat_at")),
+        next_heartbeat_at=_parse_datetime(attrs.get("next_heartbeat_at")),
+        last_check_out_at=_parse_datetime(attrs.get("last_check_out_at")),
+        created=_parse_datetime(attrs.get("created")),
+        updated=_parse_datetime(attrs.get("updated")),
     )
 
 
@@ -119,6 +150,8 @@ def _parse_component_resource(data: dict[str, Any]) -> ComponentResource:
         fingerprint=attrs.get("fingerprint", ""),
         name=attrs.get("name", ""),
         metadata=attrs.get("metadata") or {},
+        created=_parse_datetime(attrs.get("created")),
+        updated=_parse_datetime(attrs.get("updated")),
     )
 
 
@@ -129,6 +162,9 @@ def _parse_process_resource(data: dict[str, Any]) -> ProcessResource:
         machine_id=UUID(str(attrs["machine_id"])),
         pid=attrs.get("pid", ""),
         metadata=attrs.get("metadata") or {},
+        last_heartbeat_at=_parse_datetime(attrs.get("last_heartbeat_at")),
+        created=_parse_datetime(attrs.get("created")),
+        updated=_parse_datetime(attrs.get("updated")),
     )
 
 
@@ -141,6 +177,7 @@ def _parse_entitlement(data: dict[str, Any]) -> Entitlement:
         metadata=attrs.get("metadata") or {},
         created=_parse_datetime(attrs.get("created")),
         updated=_parse_datetime(attrs.get("updated")),
+        inherited=attrs.get("inherited"),
     )
 
 
@@ -181,10 +218,13 @@ def _scope_to_dict(scope: LicenseScope | None) -> dict[str, Any] | None:
         result["entitlements"] = scope.entitlements
     if scope.fingerprint is not None:
         result["fingerprint"] = scope.fingerprint
-    if scope.version is not None:
-        result["version"] = scope.version
-    if scope.checksum is not None:
-        result["checksum"] = scope.checksum
+    # `version` and `checksum` are deliberately NOT emitted. The server does
+    # not ignore them: `reject_unenforced_scope` runs before any validation
+    # work and fails the whole call with `422 SCOPE_NOT_SUPPORTED` the moment
+    # either key is present, so a caller that sets one gets no `meta.valid` at
+    # all. Dropping them here degrades that caller to a working validate
+    # instead of a hard failure. The fields stay on `LicenseScope` (removing
+    # them would be a breaking change) and are documented as deprecated there.
     return result
 
 
@@ -204,7 +244,11 @@ class TamgaConfig:
         default_auth: The default auth transport used when a per-call auth
             override isn't supplied.
         timeout_seconds: Connect/read timeout for the underlying
-            ``httpx.Client``.
+            ``httpx.Client``. Defaults to 45s — deliberately longer than the
+            server's own 30s request timeout, so a slow request surfaces as
+            the server's ``504`` (which carries an ``X-Request-Id`` to quote
+            in a support ticket) rather than racing it to a local timeout
+            that carries nothing.
         max_retries: How many times a rate-limited (``429``) request is
             retried before giving up. ``0`` disables automatic retries — the
             raised ``RateLimitedError`` still carries ``Retry-After`` so you
@@ -317,6 +361,14 @@ _RETRYABLE_POST_SUFFIXES = (
     "/actions/check-in",
     "/actions/check-out",
     "/actions/ping",
+    # `/actions/ping-heartbeat` does NOT end with `/actions/ping` — that suffix
+    # only matches the process ping route. Leaving it off excluded the single
+    # call a machine makes on a timer from backoff, so a throttled heartbeat
+    # was dropped silently and the machine drifted toward being culled. Both
+    # heartbeat writes are bare idempotent `UPDATE`s server-side, so repeating
+    # them is unconditionally safe (unlike `POST /machines`, which burns a seat).
+    "/actions/ping-heartbeat",
+    "/actions/reset-heartbeat",
 )
 
 
@@ -324,9 +376,12 @@ def _is_retryable(method: str, path: str) -> bool:
     """Is this request safe to repeat after a ``429``?
 
     ``GET`` always is. Among the ``POST``s only the licensing *actions* are —
-    they are effectively idempotent (validate, check in/out, ping a heartbeat)
-    and they are precisely the calls a client makes on a timer, so they are the
-    ones that hit the rate limit in the first place.
+    they are effectively idempotent (validate, check in/out, ping or reset a
+    heartbeat) and they are precisely the calls a client makes on a timer, so
+    they are the ones that hit the rate limit in the first place. The rate
+    limiter buckets per ``(caller, route pattern)``, and with proxy headers
+    untrusted every caller shares one bucket per route — so a fleet throttles
+    itself on exactly these routes.
 
     Creates are deliberately excluded: retrying ``POST /machines`` risks a
     second activation burning a second seat, and only the caller knows whether
@@ -492,6 +547,17 @@ class LicensesClient:
 
         Parses the flat plain-JSON response (no ``data`` envelope) via
         ``tamga.transport.parse_response(..., is_quick_validate=True)``.
+
+        Warning:
+            The server **skips** the ``last_validated_at`` write whenever the
+            request carries an ``Origin`` header, and the response body is
+            byte-identical either way — the caller cannot tell. This SDK never
+            sends ``Origin``, but a proxy or middleware that injects one turns
+            this call into a pure read with no diagnostic. That matters:
+            a license with no machines and a null ``last_validated_at`` reports
+            ``INACTIVE``, and the same column is the baseline for check-in
+            overdue sweeps. When the write must happen, use
+            ``validate_by_id`` (``POST``), which has no ``Origin`` branch.
         """
         data = _send_request(
             self._http,
@@ -619,13 +685,36 @@ class MachinesClient:
     ) -> MachineResource:
         """``POST /machines``.
 
-        No machine/core/etc. limit is checked at creation time — those
-        limits only surface later via license validation. Prefer
-        ``activate_machine`` for the documented create-then-validate flow.
+        Creation **does** enforce the policy's machine/core/memory/disk
+        limits, evaluated through its overage strategy: under a strict
+        strategy this call fails with a ``422`` before the row exists, while
+        under a permissive one it succeeds and the limit only surfaces at
+        validation time. Prefer ``activate_machine``, which handles both
+        outcomes.
+
+        ``memory`` and ``disk`` are **megabytes**, not bytes. Reporting bytes
+        (e.g. ``17179869184`` for 16 GB) inflates the license's running total
+        by roughly a million and trips ``MEMORY_LIMIT_EXCEEDED`` /
+        ``DISK_LIMIT_EXCEEDED`` on the next activation against the same
+        license.
+
+        Note:
+            The uniqueness pre-check runs *before* the limit checks, so an
+            already-registered fingerprint always yields ``409
+            FINGERPRINT_TAKEN`` — never a limit error. How wide "already
+            registered" is depends on the policy's machine-uniqueness
+            strategy (per license, per policy, or per account).
 
         Raises:
             tamga.errors.FingerprintTakenError: On ``409 FINGERPRINT_TAKEN``
-                for a duplicate ``(account_id, license_id, fingerprint)``.
+                for a duplicate fingerprint within the policy's uniqueness
+                scope.
+            tamga.errors.MachineLimitExceededError: On ``422
+                MACHINE_LIMIT_EXCEEDED``.
+            tamga.errors.CoreLimitExceededError: On ``422 CORE_LIMIT_EXCEEDED``.
+            tamga.errors.MemoryLimitExceededError: On ``422
+                MEMORY_LIMIT_EXCEEDED``.
+            tamga.errors.DiskLimitExceededError: On ``422 DISK_LIMIT_EXCEEDED``.
         """
         attributes: dict[str, Any] = {"fingerprint": fingerprint}
         if name is not None:
@@ -662,23 +751,57 @@ class MachinesClient:
     def activate_machine(self, license_id: UUID, fingerprint: str, **attrs: Any) -> MachineResource:
         """Create a machine, then validate the license, rolling back on over-limit.
 
-        Implements the documented flow: create machine -> validate license ->
-        on ``TOO_MANY_MACHINES``/``TOO_MANY_CORES``/``TOO_MUCH_MEMORY``/
-        ``TOO_MUCH_DISK``/``TOO_MANY_PROCESSES``, delete the just-created
-        machine and raise, since the machine row may already have been
-        created even though the license is over its limit.
+        A limit can stop the activation at either of two points, and both are
+        handled here:
+
+        1. **At creation.** The server checks machines/cores/memory/disk
+           before inserting the row and answers ``422``
+           ``MACHINE_LIMIT_EXCEEDED`` / ``CORE_LIMIT_EXCEEDED`` /
+           ``MEMORY_LIMIT_EXCEEDED`` / ``DISK_LIMIT_EXCEEDED``. No row was
+           created, so there is nothing to roll back — this method normalizes
+           the code to its ``ValidationCode`` equivalent
+           (``TOO_MANY_MACHINES`` / ``TOO_MANY_CORES`` / ``TOO_MUCH_MEMORY`` /
+           ``TOO_MUCH_DISK``) and raises, without issuing a ``DELETE``.
+        2. **At validation.** The create-time check runs through the policy's
+           overage strategy, so under a permissive strategy creation succeeds
+           and the same limit only surfaces in the validate response's
+           ``meta.code``. The just-created machine is then deleted before
+           raising, because the row does exist and would otherwise hold a seat.
 
         Args:
             license_id: The license to activate the machine against.
             fingerprint: The machine's unique fingerprint.
             **attrs: Additional optional machine attributes (``name``,
                 ``ip``, ``hostname``, ``platform``, ``cores``, ``memory``,
-                ``disk``, ``metadata``).
+                ``disk``, ``metadata``). ``memory``/``disk`` are in
+                **megabytes** — see ``create``.
 
         Returns:
             The created (and license-validated) ``MachineResource``.
+
+        Raises:
+            ValueError: If either limit path above rejects the activation. The
+                message names the ``ValidationCode`` and says whether a
+                rollback was needed.
+            tamga.errors.FingerprintTakenError: If the fingerprint is already
+                registered within the policy's uniqueness scope. Activation is
+                not idempotent — this SDK version offers no way to recover the
+                existing machine's id.
         """
-        machine = self.create(license_id, fingerprint, **attrs)
+        try:
+            machine = self.create(license_id, fingerprint, **attrs)
+        except TamgaError as exc:
+            equivalent = _CREATE_LIMIT_CODE_TO_VALIDATION_CODE.get(exc.code)
+            if equivalent is None:
+                raise
+            # Creation was refused, so no row exists: rolling back here would
+            # DELETE a machine id we never received (or, worse, someone
+            # else's). Raise the same ValueError shape as the validate-time
+            # path so callers keep one branch for "over limit".
+            raise ValueError(
+                f"machine activation rejected: creation returned {exc.code} "
+                f"({equivalent.value}) — no machine was created, nothing to roll back"
+            ) from exc
 
         licenses = LicensesClient(_http=self._http, _config=self._config)
         result = licenses.validate_by_id(license_id)
@@ -699,14 +822,39 @@ class MachinesClient:
         return machine
 
     def ping_heartbeat(self, machine_id: UUID) -> MachineResource:
-        """``POST /machines/{id}/actions/ping-heartbeat``, no body. Sets ``last_heartbeat_at``."""
+        """``POST /machines/{id}/actions/ping-heartbeat``, no body. Sets ``last_heartbeat_at``.
+
+        A bare, unconditional ``UPDATE`` server-side: it revives a machine
+        currently reporting ``DEAD`` just as readily as it refreshes a live
+        one, and it is safe to repeat (it is retried after a ``429``; see
+        ``_is_retryable``). The only response that means the row is really
+        gone is ``404`` — ``tamga.errors.NotFoundError`` — which is the signal
+        to re-activate.
+
+        Note:
+            The ``next_heartbeat_at`` on this response is computed without
+            joining the policy, so it is not a trustworthy source for a ping
+            schedule. Size the interval from the policy's
+            ``heartbeat_duration`` instead.
+        """
         data = _send_request(
             self._http, self._config, "POST", f"/machines/{machine_id}/actions/ping-heartbeat"
         )
         return _parse_machine_resource(data)
 
     def reset_heartbeat(self, machine_id: UUID) -> MachineResource:
-        """``POST /machines/{id}/actions/reset-heartbeat``, no body. Rewinds to ``NOT_STARTED``."""
+        """``POST /machines/{id}/actions/reset-heartbeat``, no body. Rewinds to ``NOT_STARTED``.
+
+        Warning:
+            **Always ``403`` under license-key auth.** This route is gated on
+            the caller's *role* (admin / developer / product token /
+            environment token), not merely on a permission, and a license-key
+            credential holds none of them — unlike ``ping_heartbeat``, which is
+            permission-only and works. Server-side this is the only way to
+            unstick a machine with a wedged heartbeat job, so an embedded
+            license-key client cannot perform that recovery at all; it needs a
+            privileged token.
+        """
         data = _send_request(
             self._http, self._config, "POST", f"/machines/{machine_id}/actions/reset-heartbeat"
         )
@@ -794,6 +942,12 @@ class MachinesClient:
         Always signed with RSA-2048 PKCS#1 v1.5 / SHA-256 server-side,
         regardless of the license's ``scheme``. Returns a
         ``tamga.proof.ProofResult``.
+
+        Warning:
+            **Always ``403`` under license-key auth**, same role gate as
+            ``reset_heartbeat`` — the license-key credential holds the
+            ``machine.proofs.generate`` permission but not an accepted role.
+            Generate proofs with a privileged token.
         """
         body = {"meta": {"dataset": dataset or {}}}
         response = _client_request(
@@ -861,10 +1015,19 @@ class ComponentsClient:
     def list(
         self, machine_id: UUID, limit: int | None = None, after: str | None = None
     ) -> Page[ComponentResource]:
-        """``GET /machines/{id}/components``, keyset-paginated (``limit``/``page[after]``)."""
-        params: dict[str, Any] = {}
-        if limit is not None:
-            params["limit"] = limit
+        """``GET /machines/{id}/components``, keyset-paginated (``limit``/``page[after]``).
+
+        This is the one list route where ``page[after]`` really works, so a
+        caller can page through it to completion.
+
+        When ``limit`` is omitted the SDK sends the server maximum (100)
+        explicitly rather than letting the server apply its own default of 25.
+        Without a known page size there is no way to tell a full page from the
+        last one, so an omitted ``limit`` used to return ``next_after=None``
+        after 25 rows and silently look complete.
+        """
+        effective_limit = limit if limit is not None else MAX_PAGE_SIZE
+        params: dict[str, Any] = {"limit": effective_limit}
         if after is not None:
             params["page[after]"] = after
         response = _send_request_raw(
@@ -875,7 +1038,7 @@ class ComponentsClient:
             params=params,
         )
         items = [_parse_component_resource(d) for d in (response.data or [])]
-        return Page(items=items, next_after=_next_after_cursor(items, limit))
+        return Page(items=items, next_after=_next_after_cursor(items, effective_limit))
 
 
 @dataclass
@@ -927,16 +1090,30 @@ class EntitlementsClient:
     def list(
         self, license_id: UUID, limit: int | None = None, after: str | None = None
     ) -> Page[Entitlement]:
-        """``GET /licenses/{license_id}/entitlements``, keyset-paginated.
+        """``GET /licenses/{license_id}/entitlements`` — not paginable.
 
-        No auth/permission check is applied on this license-scoped read
-        endpoint beyond the license existing.
+        The listing is a union of the license's direct entitlements and the
+        ones inherited from its policy, so the server dropped keyset paging on
+        this route: ``page[after]`` is accepted for wire compatibility and then
+        **ignored**, and ``limit`` (max 100) is the only thing bounding the
+        response.
+
+        Consequences a caller has to live with:
+
+        - ``Page.next_after`` is always ``None`` here. It cannot be anything
+          else: every "next page" would repeat the first one verbatim.
+        - A license with more than 100 effective entitlements **cannot be
+          enumerated in full** through this endpoint, so a negative
+          ``has_entitlement`` answer is only authoritative below that ceiling.
+        - ``after`` is retained on the signature (removing it would break
+          callers) but is not sent.
+
+        Each item carries ``Entitlement.inherited``: ``True`` when the license
+        holds it through its policy rather than directly. Inherited
+        entitlements cannot be detached, and ``get()`` returns ``404`` for
+        them — see ``get``.
         """
-        params: dict[str, Any] = {}
-        if limit is not None:
-            params["limit"] = limit
-        if after is not None:
-            params["page[after]"] = after
+        params: dict[str, Any] = {"limit": limit if limit is not None else MAX_PAGE_SIZE}
         response = _send_request_raw(
             self._http,
             self._config,
@@ -945,13 +1122,21 @@ class EntitlementsClient:
             params=params,
         )
         items = [_parse_entitlement(d) for d in (response.data or [])]
-        return Page(items=items, next_after=_next_after_cursor(items, limit))
+        return Page(items=items, next_after=None)
 
     def get(self, license_id: UUID, entitlement_id: UUID) -> Entitlement:
         """``GET /licenses/{license_id}/entitlements/{entitlement_id}``.
 
         Despite the URL shape, returns a full ``Entitlement`` resource, not
         a lightweight junction record.
+
+        Warning:
+            Resolves **direct attachments only**. This route queries the
+            license-entitlement join table alone, so an entitlement that
+            ``list()`` returned with ``inherited=True`` raises
+            ``tamga.errors.NotFoundError`` here. List-then-get-each is not a
+            valid pattern against this resource; read the fields off the list
+            response instead.
         """
         data = _send_request(
             self._http,
@@ -962,11 +1147,22 @@ class EntitlementsClient:
         return _parse_entitlement(data)
 
     def list_all(self, license_id: UUID) -> builtins.list[Entitlement]:
-        """Fetch every page of entitlements for ``license_id`` and concatenate.
+        """Fetch this license's entitlements — a single request, capped at 100.
 
         Internal helper backing ``LicenseResource.refresh_entitlements()``'s
-        fetcher — the public ``list()`` method above returns one page at a
-        time for callers who want to paginate manually.
+        fetcher.
+
+        This used to loop on ``page[after]`` until it saw a short page. The
+        server ignores ``page[after]`` on this route (see ``list``), so a
+        license with 100 or more effective entitlements returned the identical
+        full page forever: an unbounded loop that never terminated and grew
+        ``items`` until the process ran out of memory. There is no cursor to
+        follow, so there is no loop.
+
+        Warning:
+            Truncates silently at 100 effective entitlements — the server
+            offers no way to read past that on this route, and exposes no total
+            count to detect it with.
 
         Note:
             Return type is spelled ``builtins.list[Entitlement]`` rather
@@ -977,16 +1173,7 @@ class EntitlementsClient:
             ``list[Entitlement]`` here resolves to "the ``list`` method used
             as a type" instead of the builtin generic.
         """
-        page_size = 100
-        items: list[Entitlement] = []
-        after: str | None = None
-        while True:
-            page = self.list(license_id, limit=page_size, after=after)
-            items.extend(page.items)
-            if page.next_after is None:
-                break
-            after = page.next_after
-        return items
+        return self.list(license_id, limit=MAX_PAGE_SIZE).items
 
 
 def _next_after_cursor(items: list[Any], limit: int | None) -> str | None:
@@ -1001,6 +1188,9 @@ def _next_after_cursor(items: list[Any], limit: int | None) -> str | None:
     limit``, including empty) is the last page. When no ``limit`` was
     supplied, there is no way to detect a "full" page, so this always
     returns ``None`` (i.e. treats the single unpaginated call as complete).
+    Callers inside this module never hit that branch any more: they pass the
+    page size they actually sent, defaulting to ``MAX_PAGE_SIZE``, precisely so
+    a truncated page is detectable.
     """
     if not items or limit is None or len(items) < limit:
         return None
@@ -1012,16 +1202,23 @@ def _next_after_cursor(items: list[Any], limit: int | None) -> str | None:
 class HeartbeatScheduler:
     """Background-safe machine heartbeat ping loop.
 
-    Recommends pinging at roughly 1/3 of the server's hardcoded 600s
-    heartbeat window (~200s) to stay safely inside it.
-    ``DEAD`` is treated as "machine likely deleted server-side —
-    re-activate rather than retry ping", not as a transient error to retry
-    through.
+    The default interval (~200s) is roughly 1/3 of the server's *default* 600s
+    heartbeat window. That window is the license policy's
+    ``heartbeat_duration`` and only falls back to 600s when it is unset, so
+    against a policy with a shorter window the interval must be passed
+    explicitly — a fixed 200s ping is not safe under, say, a 120s window.
+
+    ``DEAD`` does not stop the loop. It means only "the last ping is older than
+    the window": it does not imply the machine row is gone, and under the
+    default policy (``require_heartbeat`` defaults to ``false``) the culling
+    worker returns immediately and nothing is ever deleted. Pinging a ``DEAD``
+    machine succeeds and revives it.
 
     Attributes:
         machine_id: The machine to ping.
         interval: Ping interval; defaults to
-            ``MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL``.
+            ``MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL``. Size it against the
+            policy's ``heartbeat_duration`` when that is known.
     """
 
     machines: MachinesClient
@@ -1034,18 +1231,25 @@ class HeartbeatScheduler:
         self._stop = True
 
     def run_forever(self) -> None:
-        """Ping on ``self.interval`` until stopped/cancelled by the caller's runtime.
+        """Ping on ``self.interval`` until stopped, cancelled, or the machine is gone.
 
-        Treats a ``DEAD`` heartbeat status as "machine likely deleted
-        server-side" and stops the loop rather than retrying the ping
-        indefinitely — callers should re-activate via
-        ``MachinesClient.activate_machine`` instead of relying on this loop
-        to recover a dead machine.
+        Keeps pinging through a ``DEAD`` status. This loop used to ``break`` on
+        the first ``DEAD`` reading, which was unrecoverable: nothing restarted
+        it, so a machine that merely missed one window — the common case, since
+        ``require_heartbeat`` defaults to ``false`` and the culling worker then
+        deletes nothing — stopped heartbeating permanently and drifted into
+        looking abandoned. The ping is an unconditional
+        ``last_heartbeat_at = NOW()`` write with no liveness precondition, so
+        the very next one revives the machine.
+
+        The one status that does end the loop is the row actually being gone,
+        and the server reports that as ``404`` on the ping itself: the
+        resulting ``tamga.errors.NotFoundError`` propagates to the caller, who
+        should re-activate via ``MachinesClient.activate_machine``. Nothing
+        else is treated as fatal here.
         """
         while not self._stop:
-            machine = self.machines.ping_heartbeat(self.machine_id)
-            if machine.heartbeat_status == HeartbeatStatus.DEAD:
-                break
+            self.machines.ping_heartbeat(self.machine_id)
             time.sleep(self.interval.total_seconds())
 
 
@@ -1054,8 +1258,15 @@ class ProcessHeartbeatScheduler:
     """Background-safe process heartbeat ping loop.
 
     Separate from ``HeartbeatScheduler`` since the interval (~10s) and
-    dead-state semantics (immediate deletion, no resurrection grace period)
-    differ substantially from the machine-level 600s window.
+    dead-state semantics (no resurrection grace period) differ substantially
+    from the machine-level window.
+
+    Note:
+        Nothing reaps process rows server-side: the 30s window exists, but no
+        scheduled job acts on it, so a crashed process keeps its slot against
+        the policy's process limit until the row is deleted explicitly. This
+        SDK version exposes no process-delete method, so stopping the loop
+        does **not** free the slot.
 
     Attributes:
         process_id: The process to ping.
@@ -1075,10 +1286,8 @@ class ProcessHeartbeatScheduler:
     def run_forever(self) -> None:
         """Ping on ``self.interval`` until stopped/cancelled by the caller's runtime.
 
-        Unlike machine heartbeats, a dead process row is deleted
-        immediately server-side (no resurrection grace period) — a ping
-        against an already-culled process will surface as a
-        ``NotFoundError``, which this loop does not swallow.
+        Errors are not swallowed — a ``tamga.errors.NotFoundError`` (the
+        process row was deleted) propagates to the caller.
         """
         while not self._stop:
             self.processes.ping(self.process_id)

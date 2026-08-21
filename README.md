@@ -59,8 +59,8 @@ Runnable end-to-end scripts live in [`examples/`](examples/):
   encrypted, through the full verify pipeline.
 - [`machine_activation_flow.py`](examples/machine_activation_flow.py) — create machine → validate
   → roll back on over-limit.
-- [`heartbeat_scheduler.py`](examples/heartbeat_scheduler.py) — machine (600s window) vs. process
-  (30s window) heartbeat scheduling side by side.
+- [`heartbeat_scheduler.py`](examples/heartbeat_scheduler.py) — machine (policy-driven window,
+  600s default) vs. process (30s window) heartbeat scheduling side by side.
 - [`offline_proof.py`](examples/offline_proof.py) — air-gapped machine proof generation and
   verification.
 
@@ -99,6 +99,20 @@ opaque strings and do not build prefix-based type detection.
 `licenses.validate_by_key(key)` falls back to `Authorization: License <key>` for the key being
 validated when no `default_auth` is configured, since it already holds the credential
 (`src/tamga/client.py::LicensesClient.validate_by_key`).
+
+**License-key auth must be enabled on the policy.** `Authorization: License <key>` (and the
+`license:<key>` Basic sub-form) is only accepted when the license's policy sets
+`authentication_strategy` to `"LICENSE"` or `"MIXED"`. That column defaults to `"TOKEN"`, and
+`"NONE"` behaves the same way at the auth gate — under either the server answers
+`401 LICENSE_NOT_ALLOWED`, raised as `tamga.errors.LicenseNotAllowedError`. That is a
+configuration precondition to fix on the policy, not a transient failure: retrying the same key
+never succeeds, and it does not mean the key is wrong. Separately, a policy with
+`expiration_strategy: "REVOKE_ACCESS"` stops an expired license from authenticating at all
+(`401 LICENSE_EXPIRED`); the other three expiration strategies still authenticate it and report
+expiry through the validation result instead.
+
+The host may be given with an explicit `http://` scheme for a self-hosted or local deployment —
+it is preserved, not silently upgraded. A bare host defaults to `https`.
 
 ## Offline verification
 
@@ -202,22 +216,42 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
 - **No session-cookie transport.** Browser/portal only, out of scope here.
 - **No `Tamga-Environment` header.** No server code path reads it yet, so the SDK does not send
   it.
-- **No releases/auto-update sub-client.** The upgrade-check endpoint is not usable server-side.
-- **`X-RateLimit-*` response headers are not sent.** `Retry-After` on a `429` is the only
-  server-side rate-limit signal available (`src/tamga/transport.py::parse_retry_after`), and only
-  its delta-seconds form is honored — the HTTP-date form is ignored rather than risking a date
-  being misread as a duration.
-- **10 of the 24 `ValidationCode` members are declared but never emitted today** (`BANNED`,
-  `ENTITLEMENTS_MISSING`, `TOO_MANY_USERS`, `HEARTBEAT_DEAD`, `HEARTBEAT_NOT_STARTED`, the
-  `FINGERPRINT`/`COMPONENTS`/`CHECKSUM`/`VERSION` scope mismatches, and `NOT_FOUND`, which comes
-  back as a raw HTTP 404). Per-member reachability is documented in
-  `src/tamga/models/validation.py`.
-- **Only four `LicenseScope` fields are enforced server-side** — `product`, `policy`, `user`,
-  `environment`. `entitlements`, `fingerprint`, `version`, and `checksum` are sent and silently
-  ignored.
-- **Pagination cursors are inferred.** `components.list`/`entitlements.list` return
-  `next_after=None` unless you pass an explicit `limit`, because the server exposes no cursor
-  metadata (`src/tamga/client.py::_next_after_cursor`).
+- **No releases/auto-update sub-client.** The upgrade-check endpoint itself works (it is live and
+  public, answering `204 No Content` when you are already current) — this SDK simply does not wrap
+  it yet.
+- **No machine/policy/license read methods.** There is no `get_machine`, `list_machines`,
+  `get_license`, or `get_license_policy`, so a client cannot read the policy-correct heartbeat
+  window, and `activate_machine` cannot recover from `409 FINGERPRINT_TAKEN` by looking up the
+  existing machine — activation is not idempotent.
+- **No process delete.** Nothing reaps process rows server-side, so a crashed process holds its
+  slot against `policy.max_processes` until the row is deleted, and this SDK exposes no way to
+  delete it.
+- **`reset_heartbeat` and `generate_offline_proof` always fail under license-key auth.** Both are
+  role-gated (admin / developer / product token / environment token), so a license key gets `403`
+  every time. `ping_heartbeat` is permission-only and works.
+- **`X-RateLimit-*` response headers are not surfaced.** `Retry-After` on a `429` is the only
+  rate-limit signal this SDK reads (`src/tamga/transport.py::parse_retry_after`), and only its
+  delta-seconds form is honored — the HTTP-date form is ignored rather than risking a date being
+  misread as a duration.
+- **8 of the 24 `ValidationCode` members are declared but never emitted today** (`BANNED`,
+  `TOO_MANY_USERS`, `HEARTBEAT_DEAD`, `HEARTBEAT_NOT_STARTED`, `COMPONENTS_SCOPE_MISMATCH`,
+  `NOT_FOUND` — which comes back as a raw HTTP 404 — and the `CHECKSUM`/`VERSION` scope
+  mismatches, whose scope keys are rejected outright rather than evaluated). Per-member
+  reachability is documented in `src/tamga/models/validation.py`.
+- **Six `LicenseScope` fields are enforced** — `product`, `policy`, `user`, `environment`,
+  `entitlements`, and `fingerprint`. `version` and `checksum` are **not** ignored: sending either
+  makes the server reject the entire validate call with `422 SCOPE_NOT_SUPPORTED`, so this SDK
+  deprecates them and does not put them on the wire.
+- **License entitlements cannot be paginated.** The server ignores `page[after]` on
+  `/licenses/{id}/entitlements` (the listing unions direct and policy-inherited rows), so
+  `entitlements.list` always returns `next_after=None` and `list_all` is a single request capped
+  at 100 rows. A license with more than 100 effective entitlements cannot be enumerated in full,
+  which makes a negative `has_entitlement` authoritative only below that ceiling.
+  `components.list` is genuinely keyset-paginated and does page to completion.
+- **`quick_validate` records nothing if the request carries an `Origin` header.** The server skips
+  the `last_validated_at` write and returns a byte-identical response, so a proxy that injects
+  `Origin` silently disables it. This SDK never sends `Origin`; use `validate_by_id` when the
+  write matters.
 - **No CLI.** The package ships a library only.
 
 ## Documentation

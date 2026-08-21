@@ -1,11 +1,16 @@
 """Machine and process heartbeat scheduling side by side.
 
 Machines and processes have very different heartbeat windows:
-- Machines: hardcoded 600s (10 min) window, ping every ~200s (1/3 of the
-  window). A DEAD status means the machine is likely deleted server-side —
-  re-activate rather than retry pinging.
-- Processes: hardcoded 30s window with NO resurrection grace period, ping
-  every ~10s. A dead process row is deleted immediately server-side.
+- Machines: the window is the license policy's `heartbeat_duration`, defaulting
+  to 600s (10 min) when unset; ping every ~1/3 of it (~200s against the
+  default). A DEAD status means only that the last ping is older than the
+  window — the row is still there, and the next ping revives it, so keep
+  pinging. The one signal that the machine is really gone is a 404 from the
+  ping itself, which propagates out of `run_forever` for the caller to
+  re-activate on.
+- Processes: 30s window with NO resurrection grace period, ping every ~10s.
+  Nothing reaps process rows server-side, so stopping the loop does not free
+  the process slot.
 
 Run:
     TAMGA_ACCOUNT_ID=... TAMGA_HOST=api.tamga.sh TAMGA_MACHINE_ID=... \
