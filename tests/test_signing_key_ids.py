@@ -3,10 +3,15 @@
 ⚠️ Crypto-bearing — changes here require a mandatory security-reviewer pass.
 
 The vectors in ``tests/fixtures/signing_keys/signing-key-ids.json`` were produced by an
-independent SHA-256 implementation, not by this SDK; see that directory's README. The
-twelve ``kid`` values in ``tests/fixtures/machine_files/manifest.json`` are a second,
-fully independent corroboration — they came out of the *server's* encoder — so the rule
-is pinned here from two sources that have never seen each other.
+independent SHA-256 implementation, not by this SDK; see that directory's README.
+
+The twelve ``kid`` values in ``tests/fixtures/machine_files/manifest.json`` add twelve
+more known-answer pairs for the **hash rule** — valuable because two of their key shapes
+are DER and a 65-byte point, which can only hash to their ``kid`` if the digest covers
+the base64 text. They are **not** a second source for how the server *selects* a key: the
+per-scheme spread they show is a fixture-generator artifact that
+``check_out_machine.rs:127`` cannot produce. See
+``test_key_id_reproduces_every_machine_file_fixture_kid``.
 """
 
 from __future__ import annotations
@@ -64,16 +69,46 @@ def test_key_id_hashes_the_base64_string_not_the_decoded_bytes() -> None:
 
 
 @pytest.mark.parametrize("name", sorted(MACHINE_FILE_MANIFEST))
-def test_key_id_reproduces_every_server_generated_machine_file_kid(name: str) -> None:
-    """Second, independent corroboration: these came out of the server's own encoder.
+def test_key_id_reproduces_every_machine_file_fixture_kid(name: str) -> None:
+    """Twelve more known-answer pairs for the **hash rule**, and nothing beyond it.
 
-    Across all four signing schemes, each fixture's signed ``meta.kid`` claim reproduces
-    from the ``public_key_b64`` beside it under the same rule — including the RSA and
-    ECDSA files, whose keys are DER and a 65-byte point rather than 32 raw bytes, which
-    is only possible because the digest is over the base64 *text*.
+    Each pair is a real public-key string and a real ``kid``, and every one satisfies
+    ``kid == lowercase_hex(SHA-256(public-key string)[0..8])``. Two of the four key
+    shapes here are DER (RSA) and a 65-byte uncompressed point (ECDSA) rather than 32
+    raw bytes, so they only hash to their ``kid`` at all because the digest covers the
+    base64 *text*. That is what makes them worth asserting.
+
+    ⚠️ **This is NOT evidence about which key the server names, and must not be read as
+    any.** ``check_out_machine.rs:86-99`` selects the *signing* key by the license's
+    scheme, but ``:127`` derives the ``kid`` from ``account.ed25519_public_key``
+    **unconditionally** — so production emits **one** ``kid`` for a given account whatever
+    scheme signed the file, and an RSA- or ECDSA-signed machine file names a published
+    Ed25519 key that cannot verify it. This fixture set carries **four** distinct ``kid``
+    values, one per scheme, because its *generator* paired each file with its own signing
+    key. ``check_out_machine`` cannot produce that spread. It is a generator artifact.
+
+    Reading the per-scheme pairing as a server property would say the opposite of the
+    truth, and would argue for exactly the naive ``kid``-to-key lookup that reports an
+    authentic RSA file as forged. The real rule is why
+    ``MachineFile.verify_with_key_set`` refuses every scheme but Ed25519; see
+    ``tamga.checkout.key_set`` and ``tests/fixtures/machine_files/README.md``.
     """
     entry = MACHINE_FILE_MANIFEST[name]
     assert key_id(entry["public_key_b64"]) == entry["kid"]
+
+
+def test_the_machine_file_fixture_kid_spread_is_a_generator_artifact() -> None:
+    """Pin the discrepancy itself, so nobody re-derives the wrong conclusion from it.
+
+    If a future fixture refresh ever collapses these to one ``kid`` per account — what
+    ``check_out_machine.rs:127`` actually produces — this test fails and the docstring
+    above is what needs rewriting, rather than the caveat being quietly lost.
+    """
+    kids_by_scheme = {entry["scheme"]: entry["kid"] for entry in MACHINE_FILE_MANIFEST.values()}
+    assert len(set(kids_by_scheme.values())) == len(kids_by_scheme) == 4, (
+        "the fixtures still carry one distinct kid per scheme, which the server's "
+        "unconditional key_id(account.ed25519_public_key) cannot emit"
+    )
 
 
 def test_key_id_is_sixteen_lowercase_hex_characters() -> None:

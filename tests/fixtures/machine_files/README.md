@@ -28,12 +28,38 @@ needed. Each entry carries:
 | `enc_is_dot_separated` | whether `enc` is `"<nonce_b64>.<cipher_b64>"` (true iff encrypted) |
 | `scheme` | the **server-side** `LicenseScheme` variant name (`Ed25519Sign`, `EcdsaP256Sign`, `Rsa2048Pkcs1Sign`, `Rsa2048Pkcs1PssSign`) — mapped to this SDK's `LicenseScheme` in `tests/test_machine_file_fixtures.py` |
 | `public_key_b64` | the verification key: raw 32 bytes (Ed25519), 65-byte uncompressed point (ECDSA P-256), DER (RSA) |
-| `kid` | the signed `meta.kid` claim, for cross-checking the parsed claims |
+| `kid` | the signed `meta.kid` claim, for cross-checking the parsed claims — **but see the caveat below before inferring anything from which key it sits beside** |
 | `license_key` / `fingerprint` | HKDF inputs for the encrypted files (`license_key` is `null` for plain ones) |
 | `expired` | whether the signed `meta.exp` is in the past relative to `meta.iat` |
 
 The current set is 4 signing schemes x 3 variants (plain valid / encrypted valid / plain
 expired).
+
+## ⚠️ The `kid` column does not reflect how the server picks a key
+
+Every entry here satisfies `kid == key_id(its own public_key_b64)`, giving four distinct
+`kid` values, one per scheme. **The server cannot produce that.**
+`check_out_machine.rs:86-99` selects the *signing* key by the licence's scheme, but `:127`
+derives the `kid` from `account.ed25519_public_key` **unconditionally** — so one account
+emits **one** `kid` across all four schemes, and an RSA- or ECDSA-signed machine file names
+a published Ed25519 key that cannot verify it.
+
+The spread here is this fixture set's *generator* pairing each file with its own signing
+key. It is an artifact.
+
+So: these entries are twelve good known-answer pairs for the **hash rule**
+(`kid = lowercase_hex(SHA-256(public-key string)[0..8])`), and they are especially good
+ones, because the RSA and ECDSA keys are DER and a 65-byte point rather than 32 raw bytes
+and so can only hash to their `kid` if the digest covers the base64 *text*. Use them for
+that.
+
+Do **not** use them as evidence that a non-Ed25519 file's `kid` names its own signing key.
+That reading is false, and it argues for a scheme-agnostic `kid`-to-key lookup — which
+would report an authentic RSA file as forged, reintroducing the very defect key sets exist
+to fix. `MachineFile.verify_with_key_set` refuses every scheme but Ed25519 for this reason.
+
+`tests/test_signing_key_ids.py::test_the_machine_file_fixture_kid_spread_is_a_generator_artifact`
+fails if a future refresh changes this, so the note cannot go stale silently.
 
 ## Notes for whoever touches these next
 

@@ -218,9 +218,18 @@ individually; see `.github/workflows/ci.yml` for the exact order
   covering `enc`'s base64 string. Pinned from **both** directions by
   `tests/fixtures/signing_keys/signing-key-ids.json`, which carries a negative vector
   (`905f28def18eaac0` correct, `630dcd2966c43366` if you decode first) — a test asserting only the
-  positive does not catch it. Corroborated independently by all twelve server-generated fixtures
-  in `tests/fixtures/machine_files/manifest.json`, whose `kid` reproduces from the
-  `public_key_b64` beside it under the same rule, across all four signing schemes.
+  positive does not catch it. Twelve further known-answer pairs come from
+  `tests/fixtures/machine_files/manifest.json`, whose `kid` reproduces from the
+  `public_key_b64` beside it — worth having because two of those key shapes are DER and a
+  65-byte point, which can only hash to their `kid` if the digest covers the base64 text.
+  ⚠️ **Those fixtures pin the hash rule and nothing else.** Their four distinct `kid`
+  values, one per scheme, are a fixture-generator artifact: `check_out_machine.rs:127`
+  derives the `kid` from `account.ed25519_public_key` unconditionally, so production emits
+  **one** `kid` per account whatever scheme signed the file. Do not read the per-scheme
+  pairing as a server property — it says the opposite of the truth, and it argues for
+  exactly the naive `kid`-to-key lookup that reports an authentic RSA file as forged.
+  `test_the_machine_file_fixture_kid_spread_is_a_generator_artifact` pins the discrepancy
+  so a future fixture refresh cannot silently lose this note.
 - **`key_id("") == "e3b0c44298fc1c14"` is a real, reachable condition, not a curiosity.** Both
   checkout handlers build the claim as
   `key_id(account.ed25519_public_key.as_deref().unwrap_or_default())` (`check_out_license.rs:95`,
