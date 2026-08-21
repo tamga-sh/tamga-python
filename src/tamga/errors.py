@@ -141,6 +141,46 @@ class TtlInvalidError(TamgaError):
     """422 ``TTL_INVALID`` — machine checkout ``ttl`` outside ``(0, 31536000]``."""
 
 
+class PresignTtlInvalidError(TamgaError):
+    """422 ``PRESIGN_TTL_INVALID`` — artifact download ``ttl`` outside [60s, 1 week].
+
+    Distinct from ``TtlInvalidError``, which is the *checkout* ``ttl`` and has
+    a different range (``(0, 31536000]``). The two codes are separate
+    server-side (``artifacts/service.rs:30-38``), and collapsing them would
+    report the wrong permitted range to the caller.
+
+    ``ArtifactsClient.get_download_url`` range-checks client-side before
+    sending, so reaching this means the bounds drifted server-side.
+    """
+
+
+class StorageUnavailableError(TamgaError):
+    """422 ``STORAGE_UNAVAILABLE`` — the server has no object-storage backend configured.
+
+    A deployment-level condition, not a per-caller one: the download handler
+    raises it before presigning anything when ``state.storage`` is unset
+    (``artifacts/download_artifact.rs:62-68``). Retrying cannot help; the
+    server needs configuring.
+    """
+
+
+class ArtifactDownloadError(TamgaError):
+    """The presigned storage fetch failed — raised by ``ArtifactsClient.download``.
+
+    Not a Tamga API error: this is the **storage host** answering, so there is
+    no JSON:API envelope and no stable ``code`` to dispatch on. ``status`` is
+    the storage host's status; ``code`` is a fixed ``"ARTIFACT_DOWNLOAD_FAILED"``.
+
+    Most likely cause is an expired presigned URL — the default lifetime is
+    300s server-side — in which case the remedy is to presign again rather
+    than to retry the same URL.
+
+    A ``3xx`` also lands here rather than being followed. The SDK's HTTP client
+    does not follow redirects, and that is load-bearing on this path: see
+    ``ArtifactsClient.download``.
+    """
+
+
 class LicenseNotEncryptedError(TamgaError):
     """422 ``LICENSE_NOT_ENCRYPTED`` — ``encrypt=true`` requested but license has no key set."""
 
@@ -314,6 +354,8 @@ _CODE_TO_EXCEPTION: dict[str, type[TamgaError]] = {
     "PID_TAKEN": PidTakenError,
     "CHECK_IN_NOT_REQUIRED": CheckInNotRequiredError,
     "TTL_INVALID": TtlInvalidError,
+    "PRESIGN_TTL_INVALID": PresignTtlInvalidError,
+    "STORAGE_UNAVAILABLE": StorageUnavailableError,
     "LICENSE_NOT_ENCRYPTED": LicenseNotEncryptedError,
     "LICENSE_KEY_MISSING": LicenseKeyMissingError,
     "SCHEME_NOT_SUPPORTED": SchemeNotSupportedError,

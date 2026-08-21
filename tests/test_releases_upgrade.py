@@ -32,7 +32,7 @@ RELEASE_ID = UUID("018f2f3a-0000-7000-8000-000000000090")
 #: passed and `check_for_upgrade` raised `KeyError` against every real response.
 #: See the file's own `_provenance` block.
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "releases" / "upgrade_response.json"
-_FIXTURE = json.loads(FIXTURE_PATH.read_text())
+_FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
 def _release_data(**extra: object) -> dict:

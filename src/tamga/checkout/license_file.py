@@ -21,6 +21,13 @@ signature, and this module enforces ``exp``. Accepting both formats would give
 the old behaviour back, so a file whose ``alg`` lacks the ``+v2`` suffix is
 rejected.
 
+**Key rotation.** ``verify(public_key)`` takes one key, so a file signed before
+the account rotated its Ed25519 signing key fails with exactly the error a
+forgery produces. :meth:`LicenseFile.verify_with_key_set` takes the set of keys
+the account has held instead, selects by the signed ``kid`` claim these files
+have always carried, and separates "your key set is stale" from "this file was
+tampered with" — see ``tamga.checkout.key_set``.
+
 ⚠️ **The single most important trap in this SDK**: the Ed25519 signature
 covers ``enc``'s ASCII/UTF-8 bytes — the base64 **string itself**
 (``enc.encode("ascii")``) — NOT the bytes you get from
@@ -34,13 +41,18 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, InvalidTag
 
 from tamga.checkout._envelope import b64decode_strict, parse_certificate_envelope
+from tamga.checkout.key_set import (
+    SigningKeySet,
+    _resolve_signing_key,
+)
 from tamga.crypto.aes_gcm import decrypt as aes_gcm_decrypt
 from tamga.crypto.ed25519 import verify as ed25519_verify
 from tamga.crypto.hkdf import derive_license_file_key
 from tamga.models.license import LicenseResource
+from tamga.models.signing_key import SigningKey
 
 PEM_HEADER: str = "-----BEGIN LICENSE FILE-----"
 PEM_FOOTER: str = "-----END LICENSE FILE-----"
@@ -106,6 +118,26 @@ class LicenseFileClaims:
     jti: str
     kid: str
     exp: int | None = None
+
+
+@dataclass(frozen=True)
+class VerifiedLicenseFile:
+    """A ``.lic`` file that verified, and the key it verified under.
+
+    Returned by :meth:`LicenseFile.verify_with_key_set`. A dataclass rather than
+    a tuple so a later addition here does not break every call site.
+
+    Attributes:
+        license: The verified, embedded license.
+        claims: The signed claims that travelled inside the signature.
+        key: The key the signature verified under. Worth inspecting:
+            ``key.is_retired`` means the file is authentic and was issued before
+            the account's last rotation.
+    """
+
+    license: LicenseResource
+    claims: LicenseFileClaims
+    key: SigningKey
 
 
 @dataclass(frozen=True)
@@ -226,6 +258,83 @@ class LicenseFile:
         """
         return self._verify(public_key, license_key, now)
 
+    def verify_with_key_set(
+        self,
+        key_set: SigningKeySet,
+        license_key: str | None = None,
+        now: int | None = None,
+    ) -> VerifiedLicenseFile:
+        """As :meth:`verify_with_claims`, against a whole key set instead of one key.
+
+        **The reason to prefer this.** An account can rotate its Ed25519 signing
+        key, and a file signed before the rotation is still authentic — but
+        against the single current key it fails with exactly the error a forgery
+        produces, and the caller cannot tell "my keys are stale" from "refuse
+        this customer". Given the set of keys the account has held, this returns
+        the file *and* the key it verified under, and a file naming a key the set
+        does not hold raises
+        :class:`tamga.checkout.key_set.UnknownSigningKeyError` rather than
+        ``InvalidSignature``.
+
+        This applies to every ``.lic`` file without qualification: license files
+        are always Ed25519-signed regardless of the license's own ``scheme``, and
+        ``check_out_license.rs:95`` hashes the same ``account.ed25519_public_key``
+        the file was signed with, so their ``kid`` always names their signing key.
+        The machine-file counterpart carries a caveat — see
+        ``MachineFile.verify_with_key_set``.
+
+        Everything else is identical to :meth:`verify_with_claims`, which does
+        the actual work once a key is chosen: the signature must pass, the
+        payload is decrypted or plain-decoded, and the signed ``exp`` claim is
+        enforced. (The winning key's signature is checked twice — once to select
+        it, once inside the shared pipeline. That is one extra Ed25519
+        verification, in exchange for there being exactly one verification
+        pipeline rather than two that can drift.)
+
+        Args:
+            key_set: The keys the caller trusts. From
+                ``TamgaClient.accounts.signing_key_set()``, or pinned with
+                ``SigningKeySet.from_public_keys`` — see that method for why the
+                offline case usually cannot use the endpoint.
+            license_key: The license's raw key string. Required only if
+                ``self.alg == ALG_ENCRYPTED``.
+            now: Current Unix timestamp; see :meth:`verify`.
+
+        Returns:
+            The verified license, its signed claims, and the key it verified
+            under. Inspect ``key.is_retired``: a file that only verifies under a
+            retired key is authentic and was issued before the account's last
+            rotation, so whatever hands these out is due a fresh checkout.
+
+        Raises:
+            tamga.checkout.key_set.NoUsableSigningKeyError: If the set holds no
+                usable Ed25519 key. An empty set is the normal state of an
+                account that has never rotated.
+            tamga.checkout.key_set.SigningKeyNotPublishedError: If the file names
+                the empty key — the signing account published none at all, and
+                refetching will not help.
+            tamga.checkout.key_set.UnknownSigningKeyError: If the file names a
+                key the set does not hold. **Not a forgery** — refresh the set.
+            cryptography.exceptions.InvalidSignature: If the key the file names
+                *is* in the set and the signature still fails. This one really
+                does mean forged or corrupt.
+            LicenseFileExpired: If the file is authentic but its signed ``exp``
+                claim has passed.
+            ValueError: Exactly as :meth:`verify_with_claims` — every error above
+                except ``InvalidSignature`` is a ``ValueError`` subclass.
+        """
+        # Encode once, and outside the per-key callback: a non-ASCII `enc` must
+        # fail the same way whatever the key set holds, and `_resolve_signing_key`
+        # documents its `verify` callback as non-raising.
+        message_bytes = self.enc.encode("ascii")
+        key, public_key_bytes = _resolve_signing_key(
+            key_set,
+            lambda public_key: ed25519_verify(public_key, message_bytes, self.sig),
+            lambda: self._unverified_kid(license_key),
+        )
+        license, claims = self._verify(public_key_bytes, license_key, now)
+        return VerifiedLicenseFile(license=license, claims=claims, key=key)
+
     def _verify(
         self,
         public_key: bytes,
@@ -247,29 +356,7 @@ class LicenseFile:
         if not ed25519_verify(public_key, message_bytes, self.sig):
             raise InvalidSignature("license file signature verification failed")
 
-        # Strict about the alphabet, matching every other decode on these two
-        # paths. Nothing legitimate is lost: the signature covers `enc`'s exact
-        # ASCII bytes, so an `enc` that reaches here has already been proven
-        # byte-identical to what the server emitted — which is plain base64.
-        # The lax decode this replaces silently dropped stray characters, the
-        # same laxity that hid the machine-file `<nonce_b64>.<cipher_b64>`
-        # misreading for two years. Flagged LOW by the security-reviewer pass.
-        payload_bytes = b64decode_strict(self.enc, "payload", file_kind="license file")
-
-        if self.alg == ALG_ENCRYPTED:
-            if license_key is None:
-                raise ValueError("license_key is required to decrypt an encrypted license file")
-            if len(payload_bytes) < _NONCE_LENGTH + _GCM_TAG_LENGTH:
-                raise ValueError(
-                    "malformed encrypted license file payload: too short to "
-                    f"contain a {_NONCE_LENGTH}-byte nonce and {_GCM_TAG_LENGTH}-byte GCM tag"
-                )
-            nonce = payload_bytes[:_NONCE_LENGTH]
-            ciphertext_and_tag = payload_bytes[_NONCE_LENGTH:]
-            key = derive_license_file_key(license_key)
-            plaintext = aes_gcm_decrypt(key, nonce, ciphertext_and_tag)
-        else:
-            plaintext = payload_bytes
+        plaintext = self._decode_payload(license_key)
 
         # SECURITY/robustness: without this wrapping, a malformed plain (or
         # a plaintext that ends up mis-routed via the unsigned `alg`-field
@@ -290,6 +377,74 @@ class LicenseFile:
         _enforce_expiry(claims, now)
 
         return _license_resource_from(data), claims
+
+    def _decode_payload(self, license_key: str | None) -> bytes:
+        """Base64-decode ``enc`` and, if the file is encrypted, AES-256-GCM-open it.
+
+        Split out of :meth:`_verify` so :meth:`_unverified_kid` runs the exact
+        same steps rather than a second, drifting copy of them. It performs no
+        authentication of its own beyond AES-GCM's tag, so **every caller is
+        responsible for the ordering rule**: :meth:`_verify` calls it only after
+        the Ed25519 signature has passed, and :meth:`_unverified_kid` only after
+        every key in a set has already failed and the result can no longer be
+        turned into a resource.
+
+        Raises:
+            ValueError: If the payload is not valid base64, or the file is
+                encrypted and no ``license_key`` was supplied, or the payload is
+                too short to hold a nonce and a GCM tag.
+            cryptography.exceptions.InvalidTag: If AES-256-GCM authentication fails.
+        """
+        # Strict about the alphabet, matching every other decode on these two
+        # paths. Nothing legitimate is lost on the verified path: the signature
+        # covers `enc`'s exact ASCII bytes, so an `enc` that reaches here has
+        # already been proven byte-identical to what the server emitted — which
+        # is plain base64. The lax decode this replaces silently dropped stray
+        # characters, the same laxity that hid the machine-file
+        # `<nonce_b64>.<cipher_b64>` misreading for two years. Flagged LOW by
+        # the security-reviewer pass.
+        payload_bytes = b64decode_strict(self.enc, "payload", file_kind="license file")
+
+        if self.alg != ALG_ENCRYPTED:
+            return payload_bytes
+
+        if license_key is None:
+            raise ValueError("license_key is required to decrypt an encrypted license file")
+        if len(payload_bytes) < _NONCE_LENGTH + _GCM_TAG_LENGTH:
+            raise ValueError(
+                "malformed encrypted license file payload: too short to "
+                f"contain a {_NONCE_LENGTH}-byte nonce and {_GCM_TAG_LENGTH}-byte GCM tag"
+            )
+        nonce = payload_bytes[:_NONCE_LENGTH]
+        ciphertext_and_tag = payload_bytes[_NONCE_LENGTH:]
+        key = derive_license_file_key(license_key)
+        return aes_gcm_decrypt(key, nonce, ciphertext_and_tag)
+
+    def _unverified_kid(self, license_key: str | None) -> str | None:
+        """Read the ``kid`` claim **without** verifying the signature.
+
+        Only ever called by :meth:`verify_with_key_set`, and only once every key
+        in the set has already failed — at which point the file is known not to
+        be authentic under anything the caller trusts, and this value chooses
+        between two error labels and is used for nothing else. Nothing is parsed
+        out of the payload beyond it and no resource is built from it. See
+        ``tamga.checkout.key_set``'s module docstring for why the ordering is
+        this way round.
+
+        Returns:
+            The claimed ``kid``, or ``None`` if the payload cannot be reached or
+            carries no readable claims at all — which the caller treats as an
+            ordinary signature failure.
+        """
+        try:
+            return _parse_claims(json.loads(self._decode_payload(license_key))).kid
+        # ValueError covers the malformed-payload/missing-license-key paths and
+        # json.JSONDecodeError (a ValueError subclass); InvalidTag covers a
+        # payload that will not decrypt. Deliberately not a bare `except`: an
+        # unexpected exception here is a bug worth surfacing, not a `kid` that
+        # happens to be unreadable.
+        except (ValueError, InvalidTag):
+            return None
 
     def is_expired(self, as_of: datetime | None = None) -> bool:
         """Check the unsigned ``expiry`` metadata field.

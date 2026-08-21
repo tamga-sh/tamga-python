@@ -166,6 +166,50 @@ with TamgaClient(config) as client:
         scheduler.run_forever()
 ```
 
+## Choosing a machine fingerprint
+
+The server treats a fingerprint as an opaque string: `fingerprint TEXT NOT NULL`, unique per
+licence, with no normalisation of any kind. So `"ABC-123"`, `"abc-123"` and `" ABC-123 "` are
+three different machines holding three seats, and nothing surfaces the mistake — each activation
+simply succeeds.
+
+`machine_fingerprint` fixes the spelling, not the choice:
+
+```python
+from tamga import machine_fingerprint
+
+# Whatever your product decides identifies a machine.
+components = {
+    "machine-id": read_machine_id(),
+    "disk": read_disk_serial(),
+}
+fp = machine_fingerprint(components)
+
+machine = client.machines.activate_machine(license_id, fingerprint=fp)
+```
+
+It is a pure function — it reads no hardware, no environment and no files. That is deliberate:
+what identifies a machine is a product decision, not a library's. A cloned VM template shares its
+identifiers, a container has none, and a replaced motherboard changes them; no default is right
+for both a desktop application and a Kubernetes sidecar.
+
+What it guarantees:
+
+| Property | Meaning |
+|---|---|
+| Order-independent | `{"a": …, "b": …}` and `{"b": …, "a": …}` agree. |
+| Whitespace-trimmed | A value with a trailing newline — the usual result of reading a file — agrees with one without. |
+| Case-preserving | Case is **not** folded; lowercasing a base64 or hex identifier would corrupt it. |
+| Stable across SDKs | All eight Tamga SDKs implement the same rule against the same shared test vectors. |
+
+Values are **not** Unicode-normalised. If your components can arrive in more than one normal form,
+normalise them before calling — the rule is left out so that all eight ports can implement it
+identically, since NFC is not freely available in every one of their languages.
+
+Invalid components raise `FingerprintComponentError` (a `ValueError`) rather than being repaired:
+a repeated label, an empty label, a non-ASCII label, or a control character in a value. Repairing
+any of those would map two genuinely different inputs onto one seat.
+
 ## Checking for updates
 
 ```python
@@ -185,6 +229,51 @@ if release is None:
 else:
     print("Update available:", release.version)
 ```
+
+## Downloading a release's artifacts
+
+Once `check_for_upgrade` names a release, `client.artifacts` fetches what it ships.
+
+```python
+with TamgaClient(config) as client:
+    page = client.artifacts.list(release.id)
+    for artifact in page.items:
+        print(artifact.filename, artifact.filesize, artifact.status)
+
+    # Presign, then fetch the bytes yourself — best for anything large.
+    presigned = client.artifacts.get_download_url(artifact.id, ttl=900)
+    print(presigned.redirect_url)
+
+    # Or let the SDK do both steps and hand you the bytes.
+    blob = client.artifacts.download(artifact.id)
+```
+
+Only artifacts whose `status` reads `"UPLOADED"` have bytes behind them; `checksum` is a
+lowercase-hex SHA-256 the server computes at upload time, and verifying the download against it is
+the caller's job.
+
+**Why `download` makes two requests, and why that matters.** The server's download route answers
+`303 See Other` pointing at a short-lived presigned URL on a *different host*. An HTTP client that
+follows that redirect with the request's `Authorization` header still attached would hand your
+licence key to the storage provider. This SDK never lets that happen: it asks for
+`?redirect=false` so the server returns the URL in the body instead of redirecting, and its
+underlying `httpx.Client` does not follow redirects at all. The storage fetch is then made with no
+credential attached — the presigned URL carries its own signature in the query string and needs
+nothing else.
+
+Treat a `redirect_url` as a credential with an expiry. Anyone holding it can fetch the bytes until
+it lapses, so do not log it or persist it. `ttl` is in seconds and must fall within
+`[60, 604800]` (one minute to one week); omitting it gives the server's own default of **300
+seconds**, which is short enough that presigning far in advance is usually a mistake.
+
+**A `403` here is not necessarily a permissions problem.** The download action enforces the owning
+release's read gate — distribution strategy, suspension, expiry, entitlement — on top of the
+`artifact.download` permission, so a closed release's binary is refused even to a caller that
+holds it. Note the asymmetry: `list` and `get` check the permission only, so an artifact's
+*metadata* stays readable for a release whose *bytes* are not.
+
+Creating, updating, deleting and uploading artifacts are absent by design — those permissions are
+not in a licence key's role, so they are console/CI operations needing a privileged token.
 
 ## Diagnosing a misconfigured deployment
 
@@ -284,6 +373,82 @@ Machine files are format v2 as well:
   The signature covers the whole `enc` string, so verification happens before the split.
 
 `src/tamga/proof.py::ProofResult.verify` covers the lighter air-gapped machine offline proof.
+
+### Surviving a signing-key rotation
+
+An account can rotate its Ed25519 signing key. A `.lic` or machine file signed *before* the
+rotation is still authentic — but verified against the single current key it fails with exactly
+the error a forgery produces, and the caller cannot tell "my keys are stale" from "refuse this
+customer". Every signed file already names the key that signed it, in the `kid` claim.
+
+Verify against a **key set** instead of one key, and the two outcomes separate:
+
+```python
+from cryptography.exceptions import InvalidSignature
+
+from tamga.checkout import (
+    LicenseFile,
+    SigningKeySet,
+    UnknownSigningKeyError,
+    SigningKeyNotPublishedError,
+)
+
+# Either fetch the account's published key set (needs `account.read` — see below) ...
+with TamgaClient(config) as client:
+    key_set = client.accounts.signing_key_set()
+
+# ... or pin the keys into your application, which works with no network at all:
+# Keep the old keys — that is the point.
+key_set = SigningKeySet.from_public_keys(
+    ["CURRENT+ACCOUNT+PUBLIC+KEY+BASE64=", "PREVIOUS+ACCOUNT+PUBLIC+KEY+BASE64="]
+)
+
+try:
+    verified = LicenseFile.parse(certificate).verify_with_key_set(key_set)
+except SigningKeyNotPublishedError:
+    # Narrower, so it goes first: the signing account has no published key at
+    # all, so no key set can ever verify this file. A server-side fix, and
+    # refetching the key set will not help.
+    ...
+except UnknownSigningKeyError as exc:
+    # NOT a forgery: the file names key `exc.kid`, which we do not hold.
+    # Refresh the key set or ship an update.
+    ...
+except InvalidSignature:
+    # The key it names IS in the set and the signature still fails. Forged.
+    ...
+else:
+    print(verified.license.id, verified.claims.jti, verified.key.kid)
+    if verified.key.is_retired:
+        # Authentic, but issued before the last rotation — due a fresh checkout.
+        ...
+```
+
+`MachineFile.verify_with_key_set(key_set, scheme, ...)` is the machine-file counterpart, with one
+caveat: **Ed25519-signed machine files only.** A machine file's signing key is chosen by the
+license's `scheme`, while its `kid` claim is computed from the account's Ed25519 key whatever the
+scheme — so for an RSA- or ECDSA-signed file the claim names a key that had no part in the
+signature, and the endpoint publishes Ed25519 keys only in any case. Those raise
+`SigningKeyNotApplicableError`; verify them with `MachineFile.verify(public_key, scheme, ...)` and
+the account's own key for that algorithm. Nothing is lost — rotation only ever rotates the Ed25519
+key, so no other scheme has a rotation to survive.
+
+Three things worth knowing about `client.accounts.list_signing_keys()` / `signing_key_set()`:
+
+- **It answers `403` under license-key auth.** The route needs `account.read`, which a license
+  credential does not hold, and there is no license-scoped alternative route. An embedded client
+  doing offline verification is precisely the one that cannot call it — pin the keys instead. An
+  offline verifier that only works while it has a network is not offline.
+- **An empty result is normal, not an error.** The key-history table is only written by a
+  rotation, so an account that has never rotated has no rows and the endpoint returns `[]`.
+- **Retired keys are included on purpose.** That is the whole feature: a client holding a file
+  signed months ago needs the key that signed it.
+
+A key's id is a pure function of the key — `key_id(public_key)` is the first eight *bytes* of
+`SHA-256` over the published **base64 string** (not the decoded key bytes), lowercase hex. So a
+caller holding a public key never needs to be told its id; `SigningKey.ed25519(public_key)` derives
+it.
+
 
 ## Security notes
 

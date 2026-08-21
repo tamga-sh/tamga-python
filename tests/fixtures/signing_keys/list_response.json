@@ -1,0 +1,36 @@
+{
+  "data": [
+    {
+      "type": "signing-keys",
+      "id": "905f28def18eaac0",
+      "attributes": {
+        "algorithm": "ed25519",
+        "publicKey": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+        "status": "active",
+        "created": "2026-08-01T09:15:00Z"
+      }
+    },
+    {
+      "type": "signing-keys",
+      "id": "b919fd68efaadd92",
+      "attributes": {
+        "algorithm": "ed25519",
+        "publicKey": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+        "status": "retired",
+        "created": "2026-02-14T11:02:03Z",
+        "retired": "2026-08-01T09:15:00Z"
+      }
+    },
+    {
+      "type": "signing-keys",
+      "id": "d97d14cfb5bf28cc",
+      "attributes": {
+        "algorithm": "ed25519",
+        "publicKey": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=",
+        "status": "retired",
+        "created": "2025-11-30T23:59:59Z",
+        "retired": "2026-02-14T11:02:03Z"
+      }
+    }
+  ]
+}

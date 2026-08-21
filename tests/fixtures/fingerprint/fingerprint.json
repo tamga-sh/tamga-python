@@ -1,0 +1,226 @@
+{
+  "_spec": {
+    "algorithm": "fingerprint = lowercase_hex( SHA-256( UTF-8( canonical ) ) )  // 64 chars",
+    "canonical": "\"tamga-fingerprint-v1\" <US> join(<US>, sort_bytewise([label + \"=\" + trimmed_value]))",
+    "separator": "<US> is U+001F, the ASCII unit separator, emitted as the single byte 0x1f",
+    "domain": "The literal prefix is a domain separator, so a future v2 rule cannot collide with v1.",
+    "label": "Non-empty. ASCII printable 0x21-0x7E only, excluding '='. Duplicate labels are rejected rather than silently deduplicated -- two values for one label is a caller bug, and picking one of them hides it.",
+    "value": "ASCII whitespace (space, tab, CR, LF, VT, FF) trimmed from both ends BEFORE validation. Must then contain no ASCII control character (0x00-0x1F, 0x7F). May contain '='. May be empty.",
+    "sort": "Bytewise ascending on the UTF-8 bytes of the whole `label=value` component. NOT locale-aware, NOT code-point order over decoded characters.",
+    "caseFolding": "NONE, deliberately. Lowercasing a base64 or hex identifier corrupts it.",
+    "unicode": "Values are NOT Unicode-normalised, and that is a constraint rather than an oversight. NFC is unavailable without a new dependency in Rust and Go, and in C11 it would mean ICU or hand-rolled Unicode tables inside a library whose whole selling point is having none. A rule eight ports cannot implement identically is worse than no rule: it would yield two fingerprints for one machine depending on which SDK the app was written in, silently consuming two seats. Callers whose values can arrive in more than one normal form must normalise before calling.",
+    "whyNotGenerated": "This helper deliberately does NOT read hardware identifiers. What identifies a machine is a product decision -- a cloned VM template shares them, a container has none, a replaced motherboard changes them -- and no default is right for both a desktop app and a Kubernetes sidecar. The measured defect it does fix: all eight SDKs sent the caller's string byte-for-byte, and the server stores `fingerprint TEXT NOT NULL` with no length limit, no CHECK and no normalisation, unique per (license_id, fingerprint). So 'ABC-123', 'abc-123' and ' ABC-123 ' were three separate seats.",
+    "generatedBy": "an independent SHA-256 implementation, not by any SDK -- a fixture an SDK produced can only prove that SDK agrees with itself."
+  },
+  "vectors": [
+    {
+      "name": "single",
+      "components": [
+        [
+          "machine-id",
+          "abc123"
+        ]
+      ],
+      "canonical": "tamga-fingerprint-v1<US>machine-id=abc123",
+      "fingerprint": "8edf2aef2de1f97d8c49b093cd789342003cc35132411010328db9c65ae47c21",
+      "note": "The smallest valid input. A port that gets this wrong gets everything wrong."
+    },
+    {
+      "name": "two_sorted",
+      "components": [
+        [
+          "disk",
+          "SN-9"
+        ],
+        [
+          "machine-id",
+          "abc123"
+        ]
+      ],
+      "canonical": "tamga-fingerprint-v1<US>disk=SN-9<US>machine-id=abc123",
+      "fingerprint": "00a1635fd5cd0485076d26b0b3a32ae1ca56285db6244c756980ec07d02774d3",
+      "note": "Already in byte order; pairs with the next vector."
+    },
+    {
+      "name": "two_unsorted",
+      "components": [
+        [
+          "machine-id",
+          "abc123"
+        ],
+        [
+          "disk",
+          "SN-9"
+        ]
+      ],
+      "canonical": "tamga-fingerprint-v1<US>disk=SN-9<US>machine-id=abc123",
+      "fingerprint": "00a1635fd5cd0485076d26b0b3a32ae1ca56285db6244c756980ec07d02774d3",
+      "note": "Same set, caller order reversed. MUST equal two_sorted -- ordering is the caller's convenience, not part of the identity."
+    },
+    {
+      "name": "whitespace_trimmed",
+      "components": [
+        [
+          "machine-id",
+          "  abc123\t\n"
+        ]
+      ],
+      "canonical": "tamga-fingerprint-v1<US>machine-id=abc123",
+      "fingerprint": "8edf2aef2de1f97d8c49b093cd789342003cc35132411010328db9c65ae47c21",
+      "note": "MUST equal `single`. Leading/trailing ASCII whitespace is the footgun this helper exists to absorb."
+    },
+    {
+      "name": "case_preserved",
+      "components": [
+        [
+          "machine-id",
+          "ABC123"
+        ]
+      ],
+      "canonical": "tamga-fingerprint-v1<US>machine-id=ABC123",
+      "fingerprint": "d9515717e1662b5e24d33ddbc05839fb9c6a50f4704c537f43127e468cdad82a",
+      "note": "MUST NOT equal `single`. Case folding is deliberately absent: lowercasing a base64 or hex identifier corrupts it."
+    },
+    {
+      "name": "empty_value",
+      "components": [
+        [
+          "machine-id",
+          ""
+        ]
+      ],
+      "canonical": "tamga-fingerprint-v1<US>machine-id=",
+      "fingerprint": "436082abfd4762981b51aa4067d4c4f32abbb85572d8ddb01e1793abe11a385a",
+      "note": "A component that exists but reads empty is not the same as an absent component -- the label still contributes."
+    },
+    {
+      "name": "equals_in_value",
+      "components": [
+        [
+          "path",
+          "a=b=c"
+        ]
+      ],
+      "canonical": "tamga-fingerprint-v1<US>path=a=b=c",
+      "fingerprint": "edf86b22e3c1d935ead44b5f0ca694a4ea754520467b9dcbf6a435f86bf776e2",
+      "note": "'=' is legal in a value and illegal in a label, so the split is unambiguously at the first '='."
+    },
+    {
+      "name": "non_ascii_value",
+      "components": [
+        [
+          "owner",
+          "café"
+        ]
+      ],
+      "canonical": "tamga-fingerprint-v1<US>owner=café",
+      "fingerprint": "8a729bee74af4aeaf886d4584cc61bc8025d4bad3cce72441693e84e5c450739",
+      "note": "Non-ASCII passes through as its UTF-8 bytes. See _spec.unicode: this is NOT normalised, so a caller whose input can arrive in more than one normal form must normalise it first."
+    },
+    {
+      "name": "many",
+      "components": [
+        [
+          "machine-id",
+          "abc123"
+        ],
+        [
+          "disk",
+          "SN-9"
+        ],
+        [
+          "board",
+          "B-77"
+        ],
+        [
+          "mac",
+          "00:11:22"
+        ]
+      ],
+      "canonical": "tamga-fingerprint-v1<US>board=B-77<US>disk=SN-9<US>mac=00:11:22<US>machine-id=abc123",
+      "fingerprint": "1931388ad29a9b1b674d2819ec517134e6e0394e5827504faff0f59a036a7925",
+      "note": "Four components, deliberately not in byte order on input."
+    }
+  ],
+  "rejected": [
+    {
+      "name": "empty_label",
+      "components": [
+        [
+          "",
+          "x"
+        ]
+      ],
+      "reason": "a label must be non-empty"
+    },
+    {
+      "name": "duplicate_label",
+      "components": [
+        [
+          "id",
+          "a"
+        ],
+        [
+          "id",
+          "b"
+        ]
+      ],
+      "reason": "duplicate labels are a caller bug, not something to deduplicate"
+    },
+    {
+      "name": "equals_in_label",
+      "components": [
+        [
+          "a=b",
+          "x"
+        ]
+      ],
+      "reason": "'=' in a label would make the split ambiguous"
+    },
+    {
+      "name": "separator_in_label",
+      "components": [
+        [
+          "a\u001fb",
+          "x"
+        ]
+      ],
+      "reason": "the separator may not appear inside a component"
+    },
+    {
+      "name": "separator_in_value",
+      "components": [
+        [
+          "id",
+          "a\u001fb"
+        ]
+      ],
+      "reason": "the separator may not appear inside a component"
+    },
+    {
+      "name": "control_in_value",
+      "components": [
+        [
+          "id",
+          "a\u0007b"
+        ]
+      ],
+      "reason": "control characters are rejected, never stripped -- stripping would map two different inputs onto one seat"
+    },
+    {
+      "name": "no_components",
+      "components": [],
+      "reason": "at least one component is required"
+    },
+    {
+      "name": "non_ascii_label",
+      "components": [
+        [
+          "café",
+          "x"
+        ]
+      ],
+      "reason": "labels are ASCII printable only, so they cannot themselves need normalising"
+    }
+  ]
+}

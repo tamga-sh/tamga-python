@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from tamga.client import TamgaClient, TamgaConfig
 from tamga.errors import (
+    ArtifactDownloadError,
     CheckInNotRequiredError,
     CoreLimitExceededError,
     DatasetInvalidError,
@@ -38,12 +39,19 @@ from tamga.errors import (
     MemoryLimitExceededError,
     NotFoundError,
     PidTakenError,
+    PresignTtlInvalidError,
     SchemeNotSupportedError,
+    StorageUnavailableError,
     TamgaError,
     TooManyProcessesError,
     TtlInvalidError,
     UnauthorizedError,
     UnknownTamgaError,
+)
+from tamga.fingerprint import (
+    FingerprintComponentError,
+    canonical_form,
+    machine_fingerprint,
 )
 
 # Kept in sync by release-please via the `generic` updater and the annotation below.
@@ -52,10 +60,12 @@ from tamga.errors import (
 __version__ = "1.1.0"  # x-release-please-version
 
 __all__ = [
+    "ArtifactDownloadError",
     "CheckInNotRequiredError",
     "CoreLimitExceededError",
     "DatasetInvalidError",
     "DiskLimitExceededError",
+    "FingerprintComponentError",
     "FingerprintTakenError",
     "ForbiddenError",
     "InternalServerError",
@@ -70,7 +80,9 @@ __all__ = [
     "MemoryLimitExceededError",
     "NotFoundError",
     "PidTakenError",
+    "PresignTtlInvalidError",
     "SchemeNotSupportedError",
+    "StorageUnavailableError",
     "TamgaClient",
     "TamgaConfig",
     "TamgaError",
@@ -79,4 +91,6 @@ __all__ = [
     "UnauthorizedError",
     "UnknownTamgaError",
     "__version__",
+    "canonical_form",
+    "machine_fingerprint",
 ]

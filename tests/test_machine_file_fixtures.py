@@ -35,7 +35,9 @@ from tamga.models.machine import HeartbeatStatus
 from tamga.models.policy import LicenseScheme
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "machine_files"
-MANIFEST: dict[str, dict[str, Any]] = json.loads((FIXTURE_DIR / "manifest.json").read_text())
+MANIFEST: dict[str, dict[str, Any]] = json.loads(
+    (FIXTURE_DIR / "manifest.json").read_text(encoding="utf-8")
+)
 
 ALL_FIXTURES = sorted(MANIFEST)
 ENCRYPTED_FIXTURES = [n for n in ALL_FIXTURES if MANIFEST[n]["encrypted"]]
@@ -63,7 +65,7 @@ def _entry(name: str) -> dict[str, Any]:
 
 
 def _parse(name: str) -> MachineFile:
-    return MachineFile.parse((FIXTURE_DIR / _entry(name)["file"]).read_text())
+    return MachineFile.parse((FIXTURE_DIR / _entry(name)["file"]).read_text(encoding="utf-8"))
 
 
 def _public_key(name: str) -> bytes:

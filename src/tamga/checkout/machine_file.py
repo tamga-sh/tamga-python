@@ -36,6 +36,14 @@ expiry surfaces as :class:`MachineFileExpired`, a subclass of
 file with no ``exp`` that genuinely never expires, so an absent claim is not
 an error.
 
+**Key rotation, and why it stops at Ed25519 here.**
+:meth:`MachineFile.verify_with_key_set` is the key-set counterpart to
+:meth:`MachineFile.verify`, but only for ``ED25519_SIGN``. The server picks a
+machine file's signing key by the license's ``scheme`` while computing its
+``kid`` claim from ``account.ed25519_public_key`` whatever the scheme, so an
+RSA- or ECDSA-signed file names a key that had no part in its signature — and
+only Ed25519 keys are ever published or rotated. See ``tamga.checkout.key_set``.
+
 ⚠️ **Wire format of an encrypted ``enc``** (server:
 ``src/shared/crypto/machine_file.rs`` -> ``FieldEncryption::encrypt``): the
 nonce and the ciphertext are base64-encoded *independently* and joined with a
@@ -79,9 +87,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, InvalidTag
 
 from tamga.checkout._envelope import b64decode_strict, parse_certificate_envelope
+from tamga.checkout.key_set import (
+    SigningKeyNotApplicableError,
+    SigningKeySet,
+    _resolve_signing_key,
+)
 from tamga.checkout.license_file import (
     LicenseFileClaims,
     LicenseFileExpired,
@@ -96,6 +109,7 @@ from tamga.crypto.rsa import verify_pkcs1v15, verify_pss
 from tamga.errors import SchemeNotSupportedError
 from tamga.models.machine import HeartbeatStatus, MachineResource
 from tamga.models.policy import LicenseScheme
+from tamga.models.signing_key import SigningKey
 
 PEM_HEADER: str = "-----BEGIN MACHINE FILE-----"
 PEM_FOOTER: str = "-----END MACHINE FILE-----"
@@ -201,6 +215,25 @@ def _validate_alg(alg: str) -> tuple[str, str]:
             f"(expected one of {sorted(VALID_ALGORITHMS)})"
         )
     return prefix, suffix
+
+
+@dataclass(frozen=True)
+class VerifiedMachineFile:
+    """A machine file that verified, and the key it verified under.
+
+    Returned by :meth:`MachineFile.verify_with_key_set`. A dataclass rather than
+    a tuple so a later addition here does not break every call site.
+
+    Attributes:
+        machine: The verified, embedded machine.
+        claims: The signed claims that travelled inside the signature.
+        key: The key the signature verified under; ``key.is_retired`` marks a
+            file issued before the account's last rotation.
+    """
+
+    machine: MachineResource
+    claims: LicenseFileClaims
+    key: SigningKey
 
 
 @dataclass(frozen=True)
@@ -342,6 +375,86 @@ class MachineFile:
         """
         return self._verify(public_key, scheme, license_key, fingerprint, now)
 
+    def verify_with_key_set(
+        self,
+        key_set: SigningKeySet,
+        scheme: LicenseScheme,
+        license_key: str | None = None,
+        fingerprint: str | None = None,
+        now: int | None = None,
+    ) -> VerifiedMachineFile:
+        """As :meth:`verify_with_claims`, against a key set instead of one key.
+
+        **Ed25519-signed machine files only**, and the restriction is the
+        server's rather than this SDK's. A machine file's signing key is chosen
+        by the license's ``scheme`` (``check_out_machine.rs:86-99``), but its
+        ``kid`` claim is computed from ``account.ed25519_public_key`` *whatever*
+        the scheme (``:125-129``). For an RSA- or ECDSA-signed file the claim
+        therefore names a key that had no part in the signature, and
+        ``/signing-keys`` publishes Ed25519 keys only in any case — so those
+        raise :class:`tamga.checkout.key_set.SigningKeyNotApplicableError` and
+        must go through :meth:`verify` with the account's own key for that
+        algorithm. Nothing is lost by it: ``/actions/rotate-signing-key`` rotates
+        the Ed25519 key alone, so no other scheme has a rotation to survive.
+
+        Everything else matches ``LicenseFile.verify_with_key_set`` — see there
+        for what a key set is for and where one comes from.
+
+        Args:
+            key_set: The keys the caller trusts.
+            scheme: The license's signing scheme, from an authenticated response
+                and never from this file's own ``alg`` — the same rule
+                :meth:`verify` states, for the same reason.
+            license_key: Required only if the file is encrypted.
+            fingerprint: Required only if the file is encrypted.
+            now: Current Unix timestamp; see :meth:`verify`.
+
+        Returns:
+            The verified machine, its signed claims, and the key it verified
+            under.
+
+        Raises:
+            tamga.errors.SchemeNotSupportedError: If ``scheme`` is
+                ``RSA_2048_JWT_RS256`` or otherwise unrecognized — rejected here
+                exactly as :meth:`verify` rejects it, never fallen through.
+            tamga.checkout.key_set.SigningKeyNotApplicableError: If ``scheme`` is
+                a recognized non-Ed25519 scheme.
+            tamga.checkout.key_set.NoUsableSigningKeyError: If the set holds no
+                usable Ed25519 key.
+            tamga.checkout.key_set.SigningKeyNotPublishedError: If the file names
+                the empty key — the signing account published none at all.
+            tamga.checkout.key_set.UnknownSigningKeyError: If the file names a key
+                the set does not hold. **Not a forgery** — refresh the set.
+            cryptography.exceptions.InvalidSignature: If the key the file names is
+                in the set and the signature still fails.
+            MachineFileExpired: If the file is authentic but its signed ``exp``
+                has passed.
+            ValueError: Exactly as :meth:`verify_with_claims`.
+        """
+        # Reject up front, before touching any parsing or crypto, and in the
+        # same order `_verify` does — RSA_2048_JWT_RS256 must never fall through
+        # to a different verifier or to the "wrong scheme for a key set" branch.
+        if scheme in REJECTED_SCHEMES or _VERIFIERS.get(scheme) is None:
+            raise SchemeNotSupportedError(
+                status=422,
+                code="SCHEME_NOT_SUPPORTED",
+                detail=f"scheme {scheme!r} is not supported for machine file checkout",
+            )
+        if scheme is not LicenseScheme.ED25519_SIGN:
+            raise SigningKeyNotApplicableError(scheme.value)
+
+        # Encode once, and outside the per-key callback: a non-ASCII `enc` must
+        # fail identically whatever the set holds, and `_resolve_signing_key`
+        # documents its `verify` callback as non-raising.
+        message_bytes = self.enc.encode("ascii")
+        key, public_key_bytes = _resolve_signing_key(
+            key_set,
+            lambda public_key: ed25519_verify(public_key, message_bytes, self.sig),
+            lambda: self._unverified_kid(license_key, fingerprint),
+        )
+        machine, claims = self._verify(public_key_bytes, scheme, license_key, fingerprint, now)
+        return VerifiedMachineFile(machine=machine, claims=claims, key=key)
+
     def _verify(
         self,
         public_key: bytes,
@@ -383,14 +496,7 @@ class MachineFile:
         if not verifier(public_key, message_bytes, self.sig):
             raise InvalidSignature("machine file signature verification failed")
 
-        # Exact prefix match against the closed alg vocabulary validated
-        # above — no longer a bare substring check (security-review
-        # hardening, finding M-1). Branch on the prefix, never on whether a
-        # `.` happens to appear in `enc`.
-        if enc_prefix == _ENC_PREFIX_ENCRYPTED:
-            plaintext = self._decrypt(license_key, fingerprint)
-        else:
-            plaintext = b64decode_strict(self.enc, "payload", file_kind="machine file")
+        plaintext = self._decode_payload(enc_prefix, license_key, fingerprint)
 
         # SECURITY/robustness: same class of gap as license_file.py's verify()
         # -- without this wrapping, a malformed plaintext leaks a raw
@@ -462,6 +568,49 @@ class MachineFile:
             heartbeat_status=heartbeat_status,
         )
         return machine, claims
+
+    def _decode_payload(
+        self, enc_prefix: str, license_key: str | None, fingerprint: str | None
+    ) -> bytes:
+        """Decode (and if encrypted, AES-256-GCM-open) an ``enc``.
+
+        Split out of :meth:`_verify` so :meth:`_unverified_kid` runs the exact
+        same steps rather than a second, drifting copy. It authenticates nothing
+        by itself beyond AES-GCM's tag — the ordering rule is the caller's:
+        :meth:`_verify` calls it only after the signature has passed, and
+        :meth:`_unverified_kid` only once every key in a set has failed.
+
+        Exact prefix match against the closed ``alg`` vocabulary (security-review
+        hardening, finding M-1) — no bare substring check, and never a branch on
+        whether a ``.`` happens to appear in ``enc``.
+        """
+        if enc_prefix == _ENC_PREFIX_ENCRYPTED:
+            return self._decrypt(license_key, fingerprint)
+        return b64decode_strict(self.enc, "payload", file_kind="machine file")
+
+    def _unverified_kid(self, license_key: str | None, fingerprint: str | None) -> str | None:
+        """Read the ``kid`` claim **without** verifying the signature.
+
+        Only ever called by :meth:`verify_with_key_set`, and only once every key
+        in the set has failed — see ``tamga.checkout.key_set``'s module docstring
+        for why that ordering is the safe one. The value chooses between two
+        error labels and is used for nothing else.
+
+        Returns:
+            The claimed ``kid``, or ``None`` if the payload cannot be reached or
+            carries no readable claims — treated by the caller as an ordinary
+            signature failure.
+        """
+        try:
+            enc_prefix, _ = _validate_alg(self.alg)
+            plaintext = self._decode_payload(enc_prefix, license_key, fingerprint)
+            return _parse_claims(json.loads(plaintext), file_kind="machine file").kid
+        # ValueError covers malformed alg/payload and the missing-key paths, plus
+        # json.JSONDecodeError (a ValueError subclass); InvalidTag covers a
+        # payload that will not decrypt. Not a bare `except`: anything else here
+        # is a bug worth surfacing rather than an unreadable `kid`.
+        except (ValueError, InvalidTag):
+            return None
 
     def _decrypt(self, license_key: str | None, fingerprint: str | None) -> bytes:
         """Split, decode and AES-256-GCM-open an already-authenticated ``enc``.
