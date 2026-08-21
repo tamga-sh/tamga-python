@@ -31,7 +31,9 @@ ACCOUNT_PATH = "/v1/accounts/018f2f3a-0000-7000-8000-000000000001"
 SIGNING_KEYS_PATH = f"{ACCOUNT_PATH}/signing-keys"
 
 FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "signing_keys" / "list_response.json").read_text()
+    (Path(__file__).parent / "fixtures" / "signing_keys" / "list_response.json").read_text(
+        encoding="utf-8"
+    )
 )
 
 MakeClient = Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient]

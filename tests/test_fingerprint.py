@@ -33,7 +33,7 @@ from tamga.fingerprint import (
 )
 
 VECTOR_FILE = Path(__file__).parent / "fixtures" / "fingerprint" / "fingerprint.json"
-_DATA: dict[str, Any] = json.loads(VECTOR_FILE.read_text())
+_DATA: dict[str, Any] = json.loads(VECTOR_FILE.read_text(encoding="utf-8"))
 VECTORS: list[dict[str, Any]] = _DATA["vectors"]
 REJECTED: list[dict[str, Any]] = _DATA["rejected"]
 
@@ -101,6 +101,28 @@ def test_rejected_vector_is_not_silently_repaired(case: dict[str, Any]) -> None:
     """
     with pytest.raises(ValueError):
         canonical_form(_components(case))
+
+
+def test_the_vector_file_is_decoded_as_utf8() -> None:
+    """The vectors are a UTF-8 artefact, and the reader must not use the locale's codec.
+
+    ``Path.read_text()`` with no ``encoding`` uses
+    ``locale.getpreferredencoding(False)``, which is cp1252 on a default
+    Windows runner. The ``non_ascii_value`` vector's ``é`` (UTF-8 ``c3 a9``)
+    then decodes to ``Ã©`` and the digest comes out wrong — the algorithm
+    hashes ``UTF-8(canonical)``, so the bytes on disk and the bytes hashed
+    must be the same ones.
+
+    Caught by CI on windows-latest, not theoretically: this test exists so the
+    failure names its cause instead of surfacing as an unexplained digest
+    mismatch on one platform only.
+    """
+    vector = next(v for v in VECTORS if v["name"] == "non_ascii_value")
+    value = vector["components"][0][1]
+    assert value == "caf\u00e9"
+    assert value.encode("utf-8") == b"caf\xc3\xa9"
+    # The mojibake a cp1252 read would have produced.
+    assert value != "cafÃ©"
 
 
 def test_the_vector_file_has_not_shrunk() -> None:

@@ -50,7 +50,7 @@ LICENSE_KEY = "SECRET-LICENCE-KEY-DO-NOT-LEAK"
 
 
 def _fixture(name: str) -> dict[str, Any]:
-    body: dict[str, Any] = json.loads((FIXTURES / name).read_text())
+    body: dict[str, Any] = json.loads((FIXTURES / name).read_text(encoding="utf-8"))
     # `_provenance` documents where the keys came from; it is not wire data.
     return {k: v for k, v in body.items() if not k.startswith("_")}
 

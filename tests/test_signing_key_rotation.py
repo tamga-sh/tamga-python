@@ -58,7 +58,7 @@ from tamga.models.signing_key import ACTIVE_STATUS, RETIRED_STATUS, SigningKey
 
 MACHINE_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "machine_files"
 MACHINE_MANIFEST: dict[str, dict[str, Any]] = json.loads(
-    (MACHINE_FIXTURE_DIR / "manifest.json").read_text()
+    (MACHINE_FIXTURE_DIR / "manifest.json").read_text(encoding="utf-8")
 )
 
 #: Far enough in the past that no fixture's signed `exp` has been reached, so the
@@ -377,7 +377,9 @@ class TestMachineFileKeySetVerification:
 
     def _fixture(self, name: str) -> tuple[MachineFile, dict[str, Any]]:
         entry = MACHINE_MANIFEST[name]
-        return MachineFile.parse((MACHINE_FIXTURE_DIR / entry["file"]).read_text()), entry
+        return MachineFile.parse(
+            (MACHINE_FIXTURE_DIR / entry["file"]).read_text(encoding="utf-8")
+        ), entry
 
     def test_a_server_signed_file_verifies_against_a_set_holding_its_key(self) -> None:
         file, entry = self._fixture(self.ED25519_FIXTURE)

@@ -34,10 +34,12 @@ from tamga.models.signing_key import (
 )
 
 VECTOR_FILE = Path(__file__).parent / "fixtures" / "signing_keys" / "signing-key-ids.json"
-VECTORS: dict[str, Any] = json.loads(VECTOR_FILE.read_text())
+VECTORS: dict[str, Any] = json.loads(VECTOR_FILE.read_text(encoding="utf-8"))
 
 MACHINE_FILE_MANIFEST: dict[str, dict[str, Any]] = json.loads(
-    (Path(__file__).parent / "fixtures" / "machine_files" / "manifest.json").read_text()
+    (Path(__file__).parent / "fixtures" / "machine_files" / "manifest.json").read_text(
+        encoding="utf-8"
+    )
 )
 
 VALID_KEY_A = base64.b64encode(bytes(range(32))).decode("ascii")
