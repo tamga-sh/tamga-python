@@ -3,8 +3,13 @@ name: CI
 on:
   push:
     branches: [main]
+  # Deliberately unfiltered. `branches: [main]` here meant a stacked PR — one
+  # whose base is another `fix/*` branch rather than `main` — got no CI at all:
+  # zero checks, a green-looking "mergeable", and nothing actually run. That is
+  # how a crypto-bearing change reached review with an empty status rollup.
+  # tamga-go, tamga-js, tamga-swift and tamga-c already run unfiltered for this
+  # reason; this brings tamga-python in line.
   pull_request:
-    branches: [main]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
