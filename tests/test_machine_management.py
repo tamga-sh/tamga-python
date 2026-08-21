@@ -15,9 +15,12 @@ from tamga.errors import (
     CoreLimitExceededError,
     FingerprintTakenError,
     MachineLimitExceededError,
+    MachineOverLimitError,
     NotFoundError,
+    TamgaError,
 )
 from tamga.models.machine import HeartbeatStatus
+from tamga.models.validation import ValidationCode
 
 ACCOUNT_PATH = "/v1/accounts/018f2f3a-0000-7000-8000-000000000001"
 
@@ -103,9 +106,11 @@ def test_activate_machine_rollback_on_too_many_machines(
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     client = make_client(handler)
-    with pytest.raises(ValueError, match="TOO_MANY_MACHINES"):
+    with pytest.raises(MachineOverLimitError, match="TOO_MANY_MACHINES") as excinfo:
         client.machines.activate_machine(LICENSE_ID, "fp-abc")
 
+    assert excinfo.value.validation_code == ValidationCode.TOO_MANY_MACHINES
+    assert excinfo.value.rolled_back is True
     assert any(c.startswith("DELETE") for c in calls), "machine should have been rolled back"
 
 
@@ -218,12 +223,17 @@ def test_activate_machine_create_time_422_does_not_delete(
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     client = make_client(handler)
-    with pytest.raises(ValueError, match="TOO_MANY_CORES") as excinfo:
+    with pytest.raises(MachineOverLimitError, match="TOO_MANY_CORES") as excinfo:
         client.machines.activate_machine(LICENSE_ID, "fp-abc", cores=64)
 
     # The create-time code is normalized to its ValidationCode equivalent, and
     # the original typed error stays attached as the cause.
-    assert "CORE_LIMIT_EXCEEDED" in str(excinfo.value)
+    assert excinfo.value.validation_code == ValidationCode.TOO_MANY_CORES
+    assert excinfo.value.code == "CORE_LIMIT_EXCEEDED"
+    assert excinfo.value.status == 422
+    # Nothing was created, so nothing was rolled back — this is the field that
+    # tells the two rejection paths apart.
+    assert excinfo.value.rolled_back is False
     assert isinstance(excinfo.value.__cause__, CoreLimitExceededError)
     assert calls == [f"POST {ACCOUNT_PATH}/machines"]
     assert not any(c.startswith("DELETE") for c in calls), "nothing was created to roll back"
@@ -260,11 +270,84 @@ def test_activate_machine_under_overage_still_rolls_back_at_validate(
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     client = make_client(handler)
-    with pytest.raises(ValueError, match="rolled back"):
+    with pytest.raises(MachineOverLimitError, match="rolled back") as excinfo:
         client.machines.activate_machine(LICENSE_ID, "fp-abc")
 
+    # Same type as the create-time rejection, but `rolled_back` records that a
+    # row really did exist and had to be deleted.
+    assert excinfo.value.rolled_back is True
+    assert excinfo.value.validation_code == ValidationCode.TOO_MANY_MACHINES
     assert calls[0] == f"POST {ACCOUNT_PATH}/machines"
     assert calls[-1] == f"DELETE {ACCOUNT_PATH}/machines/{MACHINE_ID}"
+
+
+def _over_limit_client(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> TamgaClient:
+    """A client whose machine-create is refused with a create-time limit 422."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={
+                "errors": [
+                    {
+                        "id": "e1",
+                        "status": "422",
+                        "code": "MACHINE_LIMIT_EXCEEDED",
+                        "title": "Unprocessable Entity",
+                        "detail": "machine limit exceeded for this license",
+                    }
+                ]
+            },
+        )
+
+    return make_client(handler)
+
+
+def test_over_limit_error_is_still_caught_by_a_bare_value_error_handler(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    # DO NOT DELETE, and do not drop `ValueError` from MachineOverLimitError's
+    # bases to make this pass differently. Both activation paths used to raise a
+    # bare ValueError; every integrator handler written against that must keep
+    # working, which is the whole reason the exception inherits from both. This
+    # test is the tripwire on that promise.
+    caught: list[ValueError] = []
+    try:
+        _over_limit_client(make_client).machines.activate_machine(LICENSE_ID, "fp-abc")
+    except ValueError as exc:  # deliberately the broad, pre-existing handler shape
+        caught.append(exc)
+
+    assert len(caught) == 1
+    assert isinstance(caught[0], MachineOverLimitError)
+
+
+def test_over_limit_error_is_caught_by_the_documented_tamga_error_handler(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    # The point of the change. This SDK documents `except TamgaError:` as the
+    # way to catch everything it raises against the server, and a bare
+    # ValueError silently escaped it — filing "the license is at its seat limit"
+    # in the same bucket as "this .lic file is corrupt", which the offline
+    # parsers genuinely do raise ValueError for.
+    with pytest.raises(TamgaError) as excinfo:
+        _over_limit_client(make_client).machines.activate_machine(LICENSE_ID, "fp-abc")
+
+    assert isinstance(excinfo.value, MachineOverLimitError)
+    assert excinfo.value.validation_code == ValidationCode.TOO_MANY_MACHINES
+
+
+def test_over_limit_error_mro_keeps_both_bases_reachable() -> None:
+    # A layout conflict between the two bases would surface as a TypeError at
+    # class-definition time; assert the resolved order explicitly so a future
+    # reordering of the bases cannot quietly change which __init__ wins.
+    assert MachineOverLimitError.__mro__[:4] == (
+        MachineOverLimitError,
+        TamgaError,
+        ValueError,
+        Exception,
+    )
 
 
 def test_ping_heartbeat_request_shape(

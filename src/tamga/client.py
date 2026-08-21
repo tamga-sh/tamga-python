@@ -33,7 +33,12 @@ from uuid import UUID
 
 import httpx
 
-from tamga.errors import TamgaError, TtlInvalidError, parse_error_envelope
+from tamga.errors import (
+    MachineOverLimitError,
+    TamgaError,
+    TtlInvalidError,
+    parse_error_envelope,
+)
 from tamga.models.license import LicenseFileResource, LicenseResource, LicenseScope
 from tamga.models.machine import (
     ComponentResource,
@@ -761,12 +766,15 @@ class MachinesClient:
            created, so there is nothing to roll back — this method normalizes
            the code to its ``ValidationCode`` equivalent
            (``TOO_MANY_MACHINES`` / ``TOO_MANY_CORES`` / ``TOO_MUCH_MEMORY`` /
-           ``TOO_MUCH_DISK``) and raises, without issuing a ``DELETE``.
+           ``TOO_MUCH_DISK``) and raises
+           ``tamga.errors.MachineOverLimitError`` with ``rolled_back=False``,
+           without issuing a ``DELETE``.
         2. **At validation.** The create-time check runs through the policy's
            overage strategy, so under a permissive strategy creation succeeds
            and the same limit only surfaces in the validate response's
            ``meta.code``. The just-created machine is then deleted before
-           raising, because the row does exist and would otherwise hold a seat.
+           raising ``MachineOverLimitError`` with ``rolled_back=True``,
+           because the row does exist and would otherwise hold a seat.
 
         Args:
             license_id: The license to activate the machine against.
@@ -780,9 +788,13 @@ class MachinesClient:
             The created (and license-validated) ``MachineResource``.
 
         Raises:
-            ValueError: If either limit path above rejects the activation. The
-                message names the ``ValidationCode`` and says whether a
-                rollback was needed.
+            tamga.errors.MachineOverLimitError: If either limit path above
+                rejects the activation. Read ``validation_code`` for which
+                limit was hit and ``rolled_back`` for which path produced it
+                (``False`` = refused at creation, nothing existed to delete;
+                ``True`` = created under a permissive overage strategy, then
+                deleted). It subclasses both ``TamgaError`` and ``ValueError``,
+                so handlers written against either still catch it.
             tamga.errors.FingerprintTakenError: If the fingerprint is already
                 registered within the policy's uniqueness scope. Activation is
                 not idempotent — this SDK version offers no way to recover the
@@ -796,11 +808,19 @@ class MachinesClient:
                 raise
             # Creation was refused, so no row exists: rolling back here would
             # DELETE a machine id we never received (or, worse, someone
-            # else's). Raise the same ValueError shape as the validate-time
-            # path so callers keep one branch for "over limit".
-            raise ValueError(
-                f"machine activation rejected: creation returned {exc.code} "
-                f"({equivalent.value}) — no machine was created, nothing to roll back"
+            # else's). Raise the same type as the validate-time path so
+            # callers keep one branch for "over limit"; `rolled_back` tells
+            # the two apart.
+            raise MachineOverLimitError(
+                status=exc.status,
+                code=exc.code,
+                detail=(
+                    f"machine activation rejected: creation returned {exc.code} "
+                    f"({equivalent.value}) — no machine was created, nothing to roll back"
+                ),
+                validation_code=equivalent,
+                rolled_back=False,
+                pointer=exc.pointer,
             ) from exc
 
         licenses = LicensesClient(_http=self._http, _config=self._config)
@@ -815,9 +835,18 @@ class MachinesClient:
         }
         if result.meta.code in over_limit_codes:
             self.delete(machine.id)
-            raise ValueError(
-                f"machine activation rejected: license validation returned "
-                f"{result.meta.code.value} — the created machine has been rolled back"
+            # `status=200`: validation reports an over-limit license inside a
+            # *successful* response, not an error envelope, so there is no
+            # error status to carry. `code` is that response's `meta.code`.
+            raise MachineOverLimitError(
+                status=200,
+                code=result.meta.code.value,
+                detail=(
+                    f"machine activation rejected: license validation returned "
+                    f"{result.meta.code.value} — the created machine has been rolled back"
+                ),
+                validation_code=result.meta.code,
+                rolled_back=True,
             )
         return machine
 

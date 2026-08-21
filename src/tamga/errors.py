@@ -19,6 +19,14 @@ modeled below as typed subclasses.
 carries the server's ``Retry-After``. Credential-accepting endpoints run on a
 tight per-IP budget that a heartbeat timer reaches easily.
 
+Every error this SDK raises against the server is a ``TamgaError``, so
+``except TamgaError:`` is the one handler that catches all of them — including
+``MachineOverLimitError``, which additionally inherits ``ValueError`` for
+backward compatibility. Note that the *offline* parsers
+(``tamga.checkout``, ``tamga.proof``) raise plain ``ValueError``/
+``InvalidSignature``/``InvalidTag`` for malformed input; those are local
+failures with no server involvement and are deliberately not in this hierarchy.
+
 **Auth is enforced.** ``Authorization: License <key>`` is only accepted when
 the license's policy has ``authentication_strategy`` set to ``"LICENSE"`` or
 ``"MIXED"``. That column defaults to ``"TOKEN"``, and ``"NONE"`` behaves like
@@ -35,6 +43,10 @@ validation ``meta.code`` instead.
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tamga.models.validation import ValidationCode
 
 
 class TamgaError(Exception):
@@ -219,6 +231,69 @@ class LicenseNotAllowedError(TamgaError):
     A configuration precondition, not a transient failure — **do not retry**,
     and do not present it to end users as a bad-key error.
     """
+
+
+class MachineOverLimitError(TamgaError, ValueError):
+    """Machine activation was rejected because the license is at a policy limit.
+
+    Raised by ``tamga.client.MachinesClient.activate_machine`` for both of the
+    points at which a limit can stop an activation — the create-time ``422``
+    and the validate-time over-limit result — so a caller has one type to
+    catch. ``rolled_back`` tells the two apart.
+
+    Note:
+        **The ``ValueError`` base is deliberate and must not be removed.**
+        Both paths used to raise a bare ``ValueError``; inheriting it keeps
+        every existing ``except ValueError:`` handler working, so gaining the
+        ``TamgaError`` base is purely additive. Dropping ``ValueError`` later
+        would silently break those callers. A regression test asserts the
+        ``ValueError`` catch specifically, precisely so this cannot be tidied
+        away by accident.
+
+        Being a ``TamgaError`` is the point of the change: this SDK documents
+        ``except TamgaError:`` as the way to catch everything it raises against
+        the server, and it also raises plain ``ValueError`` all over the
+        offline-file parsers for malformed PEM/JSON/certificate input. A bare
+        ``ValueError`` therefore filed "the license is at its seat limit" in
+        the same bucket as "this file is corrupt" — invisible to the documented
+        handler, and catchable by a ``ValueError`` handler written for parsing.
+
+    Attributes:
+        validation_code: The ``ValidationCode`` describing the limit that was
+            hit — ``TOO_MANY_MACHINES``, ``TOO_MANY_CORES``,
+            ``TOO_MUCH_MEMORY``, ``TOO_MUCH_DISK``, or ``TOO_MANY_PROCESSES``.
+            On the create-time path the server's ``422`` code is normalized to
+            its equivalent here, so this field means the same thing whichever
+            path produced the error.
+        rolled_back: Whether a machine row had to be deleted. ``False`` on the
+            create-time path — the server refused before inserting, so nothing
+            existed to remove. ``True`` on the validate-time path — the
+            policy's overage strategy let the create through, so the row was
+            created and then deleted before raising. Either way no machine
+            survives; this says whether a seat was briefly consumed.
+        status: HTTP status of the response that produced the rejection:
+            ``422`` for the create-time refusal, ``200`` for the validate-time
+            one (validation reports an over-limit license inside a *successful*
+            response, not an error envelope).
+        code: The wire code from that response — a JSON:API error ``code`` such
+            as ``MACHINE_LIMIT_EXCEEDED`` on the create-time path, or the
+            validation ``meta.code`` on the validate-time path.
+    """
+
+    def __init__(
+        self,
+        *,
+        status: int,
+        code: str,
+        detail: str,
+        validation_code: ValidationCode,
+        rolled_back: bool,
+        pointer: str | None = None,
+    ) -> None:
+        """Build a ``MachineOverLimitError``; see the class docstring for attribute meanings."""
+        super().__init__(status=status, code=code, detail=detail, pointer=pointer)
+        self.validation_code = validation_code
+        self.rolled_back = rolled_back
 
 
 class UnknownTamgaError(TamgaError):

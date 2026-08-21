@@ -206,6 +206,14 @@ air-gapped machine offline proof.
   purpose: `InvalidSignature` (not authentic), `InvalidTag` (authentic but decryption failed),
   `LicenseFileExpired` (authentic but expired), `ValueError` (malformed input that never reached
   a cryptographic operation).
+- **`except TamgaError:` catches everything raised against the server.** That includes
+  `MachineOverLimitError` from `activate_machine`, which reports a licence at its machine / core /
+  memory / disk limit. It also subclasses `ValueError`, deliberately and permanently, because both
+  activation rejection paths used to raise a bare `ValueError` — so existing `except ValueError:`
+  handlers keep working. Do not confuse it with the plain `ValueError`s above: those come from the
+  *offline* parsers and mean "this input is malformed", where failing closed is correct. An
+  over-limit rejection means the server said no, and carries `validation_code` plus a
+  `rolled_back` flag saying whether a machine row was created and then deleted.
 
 Report suspected vulnerabilities privately to **security@tamga.sh** — see
 [`SECURITY.md`](SECURITY.md).

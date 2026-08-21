@@ -8,8 +8,9 @@ handles both:
 - At validation, when the policy's overage strategy let the create through — the
   row exists and is deleted before the error is raised.
 
-Either way the caller sees one `ValueError` naming the equivalent
-`ValidationCode`, so there is one branch to write instead of two.
+Either way the caller sees one `MachineOverLimitError` carrying the equivalent
+`ValidationCode`, so there is one branch to write instead of two, plus a
+`rolled_back` flag saying which of the two happened.
 
 `memory` and `disk`, if reported, are in **megabytes**.
 
@@ -24,7 +25,7 @@ import os
 import platform
 from uuid import UUID
 
-from tamga import TamgaClient, TamgaConfig
+from tamga import MachineOverLimitError, TamgaClient, TamgaConfig
 
 
 def main() -> None:
@@ -42,12 +43,18 @@ def main() -> None:
                 platform=platform.system(),
                 cores=os.cpu_count(),
             )
-        except ValueError as exc:
+        except MachineOverLimitError as exc:
             # activate_machine has already cleaned up whatever needed cleaning
             # up: it deletes the machine row when the create succeeded and only
             # validation rejected it, and skips the delete when the create
             # itself was refused. No manual cleanup here either way.
-            print("Activation rejected:", exc)
+            #
+            # MachineOverLimitError subclasses both TamgaError and ValueError,
+            # so `except TamgaError:` and a legacy `except ValueError:` both
+            # still catch this — but naming it directly is what gives you
+            # `.validation_code` and `.rolled_back`.
+            print("Activation rejected:", exc.validation_code.value)
+            print("  a machine row was created and rolled back:", exc.rolled_back)
             return
 
         print("Machine activated:", machine.id, machine.heartbeat_status)

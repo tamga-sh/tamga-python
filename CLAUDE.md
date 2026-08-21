@@ -110,6 +110,20 @@ individually; see `.github/workflows/ci.yml` for the exact order
 - **`RSA_2048_JWT_RS256` is rejected, not unsupported-and-ignored.** Machine-checkout scheme
   dispatch must raise `SchemeNotSupportedError` for this scheme explicitly — don't let it fall
   through to a different verifier, and don't silently skip verification.
+- **`MachineOverLimitError` inherits `ValueError` on purpose — never remove that base.**
+  `activate_machine`'s two rejection paths originally raised a bare `ValueError`. Narrowing them
+  to a typed error would have been breaking, so the exception subclasses `TamgaError` **and**
+  `ValueError`: existing `except ValueError:` handlers keep catching it, and it also becomes
+  reachable through the `except TamgaError:` convention this SDK documents everywhere. The MRO is
+  `MachineOverLimitError -> TamgaError -> ValueError -> Exception`, which resolves cleanly because
+  both bases descend from `Exception` independently. Dropping `ValueError` in a later "tidy-up"
+  would silently break callers; `test_over_limit_error_is_still_caught_by_a_bare_value_error_handler`
+  and `test_over_limit_error_mro_keeps_both_bases_reachable` exist to stop that and must not be
+  deleted. Carry `validation_code` (the equivalent `ValidationCode`) and `rolled_back` (`False` =
+  refused at create, nothing to delete; `True` = created under a permissive overage strategy, then
+  deleted) on it. Note the mixed signal this resolves: the offline parsers in `checkout/` and
+  `proof.py` raise plain `ValueError` for malformed input, where "fail closed" is the right
+  handling — an over-limit rejection must not land in that same bucket.
 - **`pid` is a string on the wire.** `ProcessResource.pid` and `processes.create(..., pid=...)` are
   typed `str`, matching the server exactly. Reject `int` input at the call boundary; don't
   `str()`-coerce it — that hides a caller bug instead of surfacing it.
