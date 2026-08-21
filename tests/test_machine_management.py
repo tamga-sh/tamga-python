@@ -384,6 +384,54 @@ def test_heartbeat_scheduler_default_interval_is_200_seconds(
     assert scheduler.interval == timedelta(seconds=200)
 
 
+@pytest.mark.parametrize("interval", [timedelta(0), timedelta(seconds=-300)])
+def test_heartbeat_scheduler_clamps_a_non_positive_interval_to_the_default(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    interval: timedelta,
+) -> None:
+    # `for_policy` cannot produce a non-positive interval: a policy whose
+    # `heartbeat_duration` is zero or negative -- which the column permits,
+    # carrying no positivity constraint -- is read as unset and falls back to
+    # the 600s window, so to this same 200s ping. Building the dataclass by
+    # hand is a documented public path that bypassed that guarantee entirely.
+    client = make_client(lambda r: httpx.Response(200, json={"data": _machine_data()}))
+    scheduler = HeartbeatScheduler(
+        machines=client.machines, machine_id=MACHINE_ID, interval=interval
+    )
+    assert scheduler.interval == timedelta(seconds=200)
+
+
+def test_heartbeat_scheduler_does_not_busy_loop_on_a_zero_interval(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The parametrized test above pins the attribute; this pins the consequence
+    # that actually matters -- what `run_forever` waits between pings. A zero
+    # interval is not a fast heartbeat but an unthrottled one: `ping-heartbeat`
+    # issued as fast as the loop turns, from every machine running that code,
+    # every request individually valid and correctly authenticated, so nothing
+    # about the traffic looks wrong from either end.
+    slept: list[float] = []
+    ping_count = {"n": 0}
+    scheduler_box: dict[str, HeartbeatScheduler] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ping_count["n"] += 1
+        if ping_count["n"] >= 2:
+            scheduler_box["scheduler"].stop()
+        return httpx.Response(200, json={"data": _machine_data()})
+
+    client = make_client(handler)
+    scheduler = HeartbeatScheduler(
+        machines=client.machines, machine_id=MACHINE_ID, interval=timedelta(0)
+    )
+    scheduler_box["scheduler"] = scheduler
+    monkeypatch.setattr("tamga.client.time.sleep", lambda seconds: slept.append(seconds))
+    scheduler.run_forever()
+
+    assert slept == [200.0, 200.0], "a hand-built zero interval must not become sleep(0)"
+
+
 def test_heartbeat_scheduler_keeps_pinging_after_a_dead_observation(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
     monkeypatch: pytest.MonkeyPatch,

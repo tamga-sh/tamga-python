@@ -154,6 +154,48 @@ def test_process_heartbeat_scheduler_default_interval_is_10_seconds(
     assert scheduler.interval == timedelta(seconds=10)
 
 
+@pytest.mark.parametrize("interval", [timedelta(0), timedelta(seconds=-30)])
+def test_process_heartbeat_scheduler_clamps_a_non_positive_interval_to_the_default(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    interval: timedelta,
+) -> None:
+    # This scheduler has no `for_policy` equivalent -- the process window is a
+    # hardcoded server-side 30s, not policy-derived -- so hand construction is
+    # the *only* way to build one and there was no guard anywhere. A zero
+    # interval turns `run_forever` into an unthrottled `ping` loop against the
+    # licensing server.
+    client = make_client(lambda r: httpx.Response(200, json={"data": _process_data()}))
+    scheduler = ProcessHeartbeatScheduler(
+        processes=client.processes, process_id=PROCESS_ID, interval=interval
+    )
+    assert scheduler.interval == timedelta(seconds=10)
+
+
+def test_process_heartbeat_scheduler_does_not_busy_loop_on_a_zero_interval(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+    ping_count = {"n": 0}
+    scheduler_box: dict[str, ProcessHeartbeatScheduler] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ping_count["n"] += 1
+        if ping_count["n"] >= 2:
+            scheduler_box["scheduler"].stop()
+        return httpx.Response(200, json={"data": _process_data()})
+
+    client = make_client(handler)
+    scheduler = ProcessHeartbeatScheduler(
+        processes=client.processes, process_id=PROCESS_ID, interval=timedelta(0)
+    )
+    scheduler_box["scheduler"] = scheduler
+    monkeypatch.setattr("tamga.client.time.sleep", lambda seconds: slept.append(seconds))
+    scheduler.run_forever()
+
+    assert slept == [10.0, 10.0], "a hand-built zero interval must not become sleep(0)"
+
+
 def test_process_heartbeat_scheduler_stops_when_signalled(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
     monkeypatch: pytest.MonkeyPatch,

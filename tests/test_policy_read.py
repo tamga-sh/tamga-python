@@ -197,6 +197,30 @@ def test_scheduler_for_policy_uses_the_policy_derived_interval(
     assert scheduler.machines is client.machines
 
 
+@pytest.mark.parametrize("heartbeat_duration", [0, -5])
+def test_both_construction_paths_agree_on_a_non_positive_window(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    heartbeat_duration: int,
+) -> None:
+    """The scheduler's own clamp must not disagree with the policy-derived one.
+
+    This is why the constructor falls back rather than raising. `for_policy`
+    substitutes the 600s default for a non-positive `heartbeat_duration`, so a
+    constructor that rejected the same input would make the two paths report
+    different things about one policy.
+    """
+    client = make_client(lambda request: httpx.Response(200, json={"data": {}}))
+    derived = HeartbeatScheduler.for_policy(
+        client.machines, MACHINE_ID, _policy(heartbeat_duration)
+    )
+    by_hand = HeartbeatScheduler(
+        machines=client.machines,
+        machine_id=MACHINE_ID,
+        interval=timedelta(seconds=heartbeat_duration),
+    )
+    assert by_hand.interval == derived.interval == timedelta(seconds=200)
+
+
 def test_policy_defaults_stay_backwards_compatible_for_positional_construction() -> None:
     """The three new fields are appended with defaults, so old call sites still work."""
     policy = _policy(None)

@@ -2173,13 +2173,42 @@ class HeartbeatScheduler:
         interval: Ping interval; defaults to
             ``MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL``. Size it against the
             policy's ``heartbeat_duration`` when that is known — see
-            ``for_policy``.
+            ``for_policy``. A non-positive value is replaced by that same
+            default rather than honoured — see ``__post_init__``.
     """
 
     machines: MachinesClient
     machine_id: UUID
     interval: timedelta = field(default=MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL)
     _stop: bool = field(default=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Clamp a non-positive ``interval`` to ``MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL``.
+
+        ``for_policy`` cannot hand back a non-positive interval. A policy whose
+        ``heartbeat_duration`` is zero or negative — which the column permits,
+        having no positivity constraint, and which the server returns verbatim —
+        is read as unset by ``PolicyResource.effective_heartbeat_window_seconds``
+        and falls back to 600s, and ``heartbeat_interval_for_policy`` floors what
+        is left at one second. Constructing this dataclass directly is an equally
+        supported path and had no such guard, so the same guarantee is applied
+        here rather than only on the way in through ``for_policy``.
+
+        A zero interval is the case worth preventing. It does not make
+        ``run_forever`` a fast heartbeat, it makes it an unthrottled one: the
+        loop issues ``ping-heartbeat`` as fast as it can turn, from every machine
+        running that code, with every request individually valid and correctly
+        authenticated — so neither end sees anything obviously wrong while the
+        licensing server absorbs the traffic. A negative interval is caught by
+        the same branch; left alone it raises ``ValueError`` out of
+        ``time.sleep``, but only after the first ping has already gone out.
+
+        Falls back rather than raising, matching ``for_policy``. A constructor
+        that rejected what the policy path silently defaults would make the two
+        paths disagree about the same policy.
+        """
+        if self.interval <= timedelta(0):
+            self.interval = MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL
 
     @classmethod
     def for_policy(
@@ -2275,13 +2304,30 @@ class ProcessHeartbeatScheduler:
     Attributes:
         process_id: The process to ping.
         interval: Ping interval; defaults to
-            ``PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL``.
+            ``PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL``. A non-positive value is
+            replaced by that same default rather than honoured — see
+            ``__post_init__``.
     """
 
     processes: ProcessesClient
     process_id: UUID
     interval: timedelta = field(default=PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL)
     _stop: bool = field(default=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Clamp a non-positive ``interval`` to ``PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL``.
+
+        The same guard ``HeartbeatScheduler`` applies, and needed more here: the
+        process window is a hardcoded server-side 30s rather than a policy field,
+        so this scheduler has no ``for_policy`` equivalent and hand construction
+        is the *only* way to build one. Nothing else stood between a zero
+        ``interval`` and a ``run_forever`` that pings as fast as the loop turns.
+
+        Falls back rather than raising, for the reason given on
+        ``HeartbeatScheduler.__post_init__``.
+        """
+        if self.interval <= timedelta(0):
+            self.interval = PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL
 
     def stop(self) -> None:
         """Signal ``run_forever`` to return after its current sleep completes.
