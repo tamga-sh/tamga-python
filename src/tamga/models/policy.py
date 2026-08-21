@@ -257,6 +257,15 @@ class PolicyResource:
             back to 600 rather than being propagated. The column is a signed
             integer with no positivity constraint, and a zero or negative window
             would otherwise turn a derived ping interval into a busy loop.
+
+            That is no longer the only thing standing between such a policy and
+            a spin — both schedulers hold ``tamga.client.MIN_HEARTBEAT_INTERVAL``
+            themselves — but it does mean this SDK never derives an interval
+            from a zero window at all. Worth knowing when comparing against the
+            server, whose ``COALESCE(p.heartbeat_duration, 600)`` substitutes
+            only for ``NULL``: a stored ``0`` really is a zero-second window
+            server-side, and no ping rate at or above the floor can hold it.
+            See the table in ``tests/test_policy_read.py``.
         """
         if self.heartbeat_duration is None or self.heartbeat_duration <= 0:
             return DEFAULT_HEARTBEAT_DURATION_SECONDS

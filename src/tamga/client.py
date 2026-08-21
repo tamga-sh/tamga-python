@@ -99,7 +99,58 @@ MAX_CHECKOUT_TTL_SECONDS: int = 31536000
 #: Three, so two consecutive pings can be lost — to a `429`, a network blip, a
 #: paused process — before the machine falls outside the window. One ping per
 #: window would make every single failure terminal.
+#:
+#: ⚠️ **That promise does not survive `MIN_HEARTBEAT_INTERVAL` on a window
+#: shorter than three seconds.** Below that the floor binds and the tolerance
+#: degrades: `heartbeat_duration` 3 is where the two constants agree exactly
+#: (3s / 3 = 1s), 2 keeps one spare ping, 1 keeps none. Steady state still holds
+#: the window in all three, because the server judges liveness on *truncated
+#: whole seconds* — see `MIN_HEARTBEAT_INTERVAL`. These two constants interact
+#: and neither is reachable from the other, so the whole table is pinned by
+#: value in `tests/test_policy_read.py`.
 HEARTBEAT_PINGS_PER_WINDOW: int = 3
+
+#: The shortest interval either heartbeat scheduler will actually ping at.
+#:
+#: A ping loop is throttled by nothing but its own `time.sleep`, and `sleep`
+#: honours a sub-second request — which is what makes a sub-second interval
+#: dangerous rather than merely odd. Measured on CPython 3.13, a loop doing
+#: nothing but sleeping turns at ~1,368,000/sec for `sleep(0)`, ~163,000/sec for
+#: `sleep(0.000001)` and ~696/sec for `sleep(0.001)`; the last of those is
+#: `sleep` doing as it was asked, to within 1.4x. So a guard aimed only at the
+#: values the runtime refuses to honour would catch `timedelta(0)` and pass
+#: `timedelta(microseconds=1)` — a *positive* interval issuing 163,000
+#: `ping-heartbeat` requests a second, every one individually valid and
+#: correctly authenticated, so neither end sees anything obviously wrong. Such a
+#: rule describes where a number came from, not what it does. Only a floor
+#: bounds the rate.
+#:
+#: The range is reachable by ordinary mistake rather than only by malice: the
+#: schedulers take a `timedelta` while `policy.heartbeat_duration` is a count of
+#: **seconds**, so converting by hand in the wrong direction lands squarely in
+#: it.
+#:
+#: One second costs nothing a policy can ask for. `heartbeat_duration` is an
+#: integer-**seconds** column, so the shortest window the server can express is
+#: 1s, and a once-a-second ping is inside every policy that exists.
+#:
+#: ⚠️ **It is safe on a 1s window only because the server truncates.**
+#: `Machine::heartbeat_status_within` computes
+#: `(Utc::now() - hb_ts).num_seconds() <= window_secs`, and chrono's
+#: `num_seconds()` returns *whole* seconds, truncating —
+#: `Duration::milliseconds(1999).num_seconds() == 1`. A machine therefore first
+#: reads `DEAD` at an age of `window_secs + 1` seconds, so every window carries
+#: one free second and a 1s window has two seconds of slack at a 1s ping, not
+#: zero. Do not restate the rule as "DEAD once the age passes the window": that
+#: pessimistic reading makes this floor look broken on short windows when it is
+#: not, and it is what a window-aware floor was once proposed to fix. What the
+#: floor genuinely costs is `HEARTBEAT_PINGS_PER_WINDOW`'s tolerance, above. The
+#: one window the floor cannot hold is `0`, whose entire grace *is* that free
+#: second — and this SDK deliberately does not chase it, since the ~333ms ping
+#: that would hold it ties the request rate to a truncation artifact rather than
+#: a protocol guarantee, for one nonsensical policy value. A negative window is
+#: unserveable at any rate.
+MIN_HEARTBEAT_INTERVAL: timedelta = timedelta(seconds=1)
 
 #: Hard ceiling on how many pages ``MachinesClient.find_by_fingerprint`` will
 #: walk before giving up.
@@ -435,12 +486,17 @@ def heartbeat_interval_for_policy(policy: PolicyResource) -> timedelta:
         policy: The policy governing the machine's license.
 
     Returns:
-        The ping interval, floor-divided and clamped to at least one second so
-        that an absurdly short policy window cannot turn the scheduler into a
-        busy loop.
+        The ping interval, floor-divided and held at ``MIN_HEARTBEAT_INTERVAL``
+        so that an absurdly short policy window cannot turn the scheduler into
+        a busy loop. Both schedulers now hold that same floor themselves, so
+        this is no longer the only thing standing between a short window and a
+        spin — the guarantee holds however the interval was arrived at. See
+        ``HEARTBEAT_PINGS_PER_WINDOW`` for what the floor costs once it binds,
+        which is loss tolerance rather than liveness, and only below a
+        three-second window.
     """
     seconds = policy.effective_heartbeat_window_seconds // HEARTBEAT_PINGS_PER_WINDOW
-    return timedelta(seconds=max(1, seconds))
+    return max(MIN_HEARTBEAT_INTERVAL, timedelta(seconds=seconds))
 
 
 def _send_request(
@@ -2143,6 +2199,51 @@ class ReleasesClient:
         return _parse_release_resource(data)
 
 
+def _clamped_heartbeat_interval(interval: timedelta, default: timedelta) -> timedelta:
+    """The interval a heartbeat scheduler will actually run at, given a requested one.
+
+    Both schedulers accept an ``interval`` by hand, and neither can let it
+    reach ``time.sleep`` unexamined — see ``MIN_HEARTBEAT_INTERVAL`` for the
+    measurements, and why bounding the *rate* is the only guard that works.
+
+    Two different substitutions, because the two inputs carry different
+    intent:
+
+    - **Non-positive** ``interval`` is replaced by ``default`` — the
+      scheduler's own recommended interval. Zero or negative expresses no
+      wish about rate at all; it is an unset value or a units error, and the
+      recommended interval is the safest reading of nothing. It also keeps
+      hand construction agreeing with ``HeartbeatScheduler.for_policy``,
+      which lands on that same default for a policy whose
+      ``heartbeat_duration`` is zero or negative (that column is read as
+      unset by ``PolicyResource.effective_heartbeat_window_seconds``). A
+      constructor that answered differently would make the two paths
+      disagree about one policy.
+    - **Positive but under a second** is raised to ``MIN_HEARTBEAT_INTERVAL``
+      instead. That caller does have a wish — ping fast — and one second is
+      the fastest this SDK will honour, so the floor is the smallest
+      correction that respects it. Substituting the recommended interval
+      here would overrule a deliberate 500ms by 400x on the machine
+      scheduler and 20x on the process one.
+
+    Both substitutions land on a bounded rate, which is the property that
+    matters; that they land on *different* bounded values is about intent,
+    not safety.
+
+    Args:
+        interval: The interval as requested by the caller.
+        default: The scheduler's recommended interval, used for a
+            non-positive request.
+
+    Returns:
+        ``default`` when ``interval`` is non-positive, otherwise ``interval``
+        raised to at least ``MIN_HEARTBEAT_INTERVAL``.
+    """
+    if interval <= timedelta(0):
+        return default
+    return max(interval, MIN_HEARTBEAT_INTERVAL)
+
+
 @dataclass
 class HeartbeatScheduler:
     """Background-safe machine heartbeat ping loop.
@@ -2173,8 +2274,10 @@ class HeartbeatScheduler:
         interval: Ping interval; defaults to
             ``MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL``. Size it against the
             policy's ``heartbeat_duration`` when that is known — see
-            ``for_policy``. A non-positive value is replaced by that same
-            default rather than honoured — see ``__post_init__``.
+            ``for_policy``. Not honoured verbatim below one second: a
+            non-positive value is replaced by that same default and a
+            positive sub-second one is raised to ``MIN_HEARTBEAT_INTERVAL``
+            — see ``__post_init__``.
     """
 
     machines: MachinesClient
@@ -2183,40 +2286,47 @@ class HeartbeatScheduler:
     _stop: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        """Clamp a non-positive ``interval`` to ``MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL``.
+        """Hold ``interval`` at or above ``MIN_HEARTBEAT_INTERVAL``.
 
-        ``for_policy`` cannot hand back a non-positive interval. A policy whose
-        ``heartbeat_duration`` is zero or negative — which the column permits,
-        having no positivity constraint, and which the server returns verbatim —
-        is read as unset by ``PolicyResource.effective_heartbeat_window_seconds``
-        and falls back to 600s, and ``heartbeat_interval_for_policy`` floors what
-        is left at one second. Constructing this dataclass directly is an equally
-        supported path and had no guard at all, so the non-positive case is
-        caught here too.
+        ``for_policy`` cannot hand back an interval this guard would touch. A
+        policy whose ``heartbeat_duration`` is zero or negative — which the
+        column permits, having no positivity constraint, and which the server
+        returns verbatim — is read as unset by
+        ``PolicyResource.effective_heartbeat_window_seconds`` and falls back to
+        600s, and ``heartbeat_interval_for_policy`` floors what is left at one
+        second. Constructing this dataclass directly is an equally supported
+        path and had no guard at all, so the same guarantee is applied here.
 
-        **Non-positive only.** A positive interval is honoured verbatim however
-        short, so the one-second floor above stays specific to the
-        policy-derived path: ``interval=timedelta(microseconds=1)`` still spins.
-        That gap is deliberate here rather than overlooked — tamga-go's
-        ``NewHeartbeatScheduler`` and tamga-java's ``Builder.interval`` clamp
-        exactly the same non-positive case and no more, so flooring sub-second
-        intervals is a fleet-wide decision rather than one this SDK takes alone.
+        **A sub-second interval is raised, not honoured.**
+        ``interval=timedelta(milliseconds=500)`` becomes one second. That is a
+        real behaviour change for a caller who asked for 500ms and meant it,
+        and it is deliberate: what ``run_forever`` does with a sub-second
+        interval is not a fast heartbeat but an unthrottled one. ``time.sleep``
+        *honours* a sub-second request, so the harm scales smoothly rather than
+        starting at zero — measured on CPython 3.13, a bare sleep loop turns at
+        ~163,000/sec for ``timedelta(microseconds=1)`` and ~696/sec for one
+        millisecond, each turn a ``ping-heartbeat`` that is individually valid
+        and correctly authenticated, so neither end sees anything obviously
+        wrong while the licensing server absorbs the traffic.
 
-        A zero interval is the case worth preventing. It does not make
-        ``run_forever`` a fast heartbeat, it makes it an unthrottled one: the
-        loop issues ``ping-heartbeat`` as fast as it can turn, from every machine
-        running that code, with every request individually valid and correctly
-        authenticated — so neither end sees anything obviously wrong while the
-        licensing server absorbs the traffic. A negative interval is caught by
-        the same branch; left alone it raises ``ValueError`` out of
-        ``time.sleep``, but only after the first ping has already gone out.
+        An earlier version of this guard caught the non-positive case only, on
+        the reasoning that a positive interval is what the caller asked for and
+        that flooring it in Python alone would put this SDK out of step with the
+        fleet. The first half does not survive the measurement above — a rule
+        keyed to what the runtime refuses to honour separates
+        ``timedelta(microseconds=1)`` from ``timedelta(0)``, which is a fact
+        about where a number came from rather than about what it does. The
+        second half no longer holds either: the floor is now the fleet-wide
+        rule, landed first in tamga-js.
 
-        Falls back rather than raising, matching ``for_policy``. A constructor
-        that rejected what the policy path silently defaults would make the two
-        paths disagree about the same policy.
+        The two substitutions and why they differ are on
+        ``_clamped_heartbeat_interval``. Neither raises, matching
+        ``for_policy``: a constructor that rejected what the policy path
+        silently defaults would make the two paths disagree about one policy.
         """
-        if self.interval <= timedelta(0):
-            self.interval = MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL
+        self.interval = _clamped_heartbeat_interval(
+            self.interval, MACHINE_HEARTBEAT_RECOMMENDED_INTERVAL
+        )
 
     @classmethod
     def for_policy(
@@ -2312,9 +2422,10 @@ class ProcessHeartbeatScheduler:
     Attributes:
         process_id: The process to ping.
         interval: Ping interval; defaults to
-            ``PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL``. A non-positive value is
-            replaced by that same default rather than honoured — see
-            ``__post_init__``.
+            ``PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL``. Not honoured verbatim
+            below one second: a non-positive value is replaced by that same
+            default and a positive sub-second one is raised to
+            ``MIN_HEARTBEAT_INTERVAL`` — see ``__post_init__``.
     """
 
     processes: ProcessesClient
@@ -2323,22 +2434,27 @@ class ProcessHeartbeatScheduler:
     _stop: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        """Clamp a non-positive ``interval`` to ``PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL``.
+        """Hold ``interval`` at or above ``MIN_HEARTBEAT_INTERVAL``.
 
         The same guard ``HeartbeatScheduler`` applies, and needed more here: the
         process window is a hardcoded server-side 30s rather than a policy field,
         so this scheduler has no ``for_policy`` equivalent and hand construction
-        is the *only* way to build one. Nothing else stood between a zero
-        ``interval`` and a ``run_forever`` that pings as fast as the loop turns.
+        is the *only* way to build one. Nothing else stood between a sub-second
+        ``interval`` and a ``run_forever`` that pings roughly as fast as the loop
+        turns.
 
-        Guards the non-positive case only, for the reason given on
-        ``HeartbeatScheduler.__post_init__``.
+        The floor is comfortable against that window: one second is thirty pings
+        inside 30s, against a ping rate the scheduler's own 10s default sets at
+        three. Sub-second buys nothing here at all.
 
-        Falls back rather than raising, for the reason given on
-        ``HeartbeatScheduler.__post_init__``.
+        Lifts a sub-second interval to that floor rather than honouring it, and
+        substitutes the default for a non-positive one, both for the reasons on
+        ``HeartbeatScheduler.__post_init__`` and
+        ``_clamped_heartbeat_interval``.
         """
-        if self.interval <= timedelta(0):
-            self.interval = PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL
+        self.interval = _clamped_heartbeat_interval(
+            self.interval, PROCESS_HEARTBEAT_RECOMMENDED_INTERVAL
+        )
 
     def stop(self) -> None:
         """Signal ``run_forever`` to return after its current sleep completes.

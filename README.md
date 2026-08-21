@@ -136,6 +136,18 @@ Read the policy through `licenses.get_policy(license_id)`, not `policies.get(pol
 former is gated on `license.read`, which a license key holds; the latter on `policy.read`, which
 it does not, so it answers `403` under license-key auth.
 
+Both schedulers also accept an `interval` directly, and **that value is not honoured verbatim
+below one second**: a non-positive one becomes the scheduler's recommended default (200s machine,
+10s process) and a positive sub-second one is raised to `MIN_HEARTBEAT_INTERVAL`, so
+`timedelta(milliseconds=500)` pings once a second. Nothing raises. That is a busy-loop guard
+rather than a rounding convenience — `time.sleep` *honours* a sub-second request, so an
+unguarded `timedelta(microseconds=1)` is not a fast heartbeat but roughly 163,000
+`ping-heartbeat` requests a second, each individually valid and correctly authenticated. The
+floor costs nothing a policy can ask for, since `heartbeat_duration` is an integer-**seconds**
+column and the server judges liveness on truncated whole seconds — a machine first reads `DEAD`
+at `window_secs + 1`, so even a 1s window has two seconds of slack at a 1s ping. What it does
+cost is loss tolerance on windows under 3s; the full table is in `tests/test_policy_read.py`.
+
 `machines.get(machine_id)` is the read path where `heartbeat_status` is a genuine staleness
 verdict — the ping/reset/create routes each derive the status from a timestamp they just wrote, so
 they can never report `DEAD`. `DEAD` still never means the row was culled; only a `404` from the

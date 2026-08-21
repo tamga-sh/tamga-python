@@ -196,6 +196,68 @@ def test_process_heartbeat_scheduler_does_not_busy_loop_on_a_zero_interval(
     assert slept == [10.0, 10.0], "a hand-built zero interval must not become sleep(0)"
 
 
+def test_process_heartbeat_scheduler_raises_a_500ms_interval_to_one_second(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    # NOT verbatim -- see the machine-side test of the same name for the
+    # measurement that settles it. Sub-second buys nothing against this window
+    # in particular: it is a hardcoded 30s, so the one-second floor still fits
+    # thirty pings inside it against the three the 10s default plans for.
+    client = make_client(lambda r: httpx.Response(200, json={"data": _process_data()}))
+    scheduler = ProcessHeartbeatScheduler(
+        processes=client.processes, process_id=PROCESS_ID, interval=timedelta(milliseconds=500)
+    )
+    assert scheduler.interval == timedelta(seconds=1)
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (timedelta(microseconds=1), timedelta(seconds=1)),
+        (timedelta(milliseconds=500), timedelta(seconds=1)),
+        (timedelta(milliseconds=999), timedelta(seconds=1)),
+        (timedelta(seconds=1), timedelta(seconds=1)),
+        (timedelta(milliseconds=1001), timedelta(milliseconds=1001)),
+        (timedelta(seconds=10), timedelta(seconds=10)),
+    ],
+)
+def test_process_heartbeat_scheduler_floors_every_positive_sub_second_interval(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    requested: timedelta,
+    expected: timedelta,
+) -> None:
+    client = make_client(lambda r: httpx.Response(200, json={"data": _process_data()}))
+    scheduler = ProcessHeartbeatScheduler(
+        processes=client.processes, process_id=PROCESS_ID, interval=requested
+    )
+    assert scheduler.interval == expected
+
+
+def test_process_heartbeat_scheduler_does_not_spin_on_a_sub_second_interval(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+    ping_count = {"n": 0}
+    scheduler_box: dict[str, ProcessHeartbeatScheduler] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ping_count["n"] += 1
+        if ping_count["n"] >= 2:
+            scheduler_box["scheduler"].stop()
+        return httpx.Response(200, json={"data": _process_data()})
+
+    client = make_client(handler)
+    scheduler = ProcessHeartbeatScheduler(
+        processes=client.processes, process_id=PROCESS_ID, interval=timedelta(milliseconds=500)
+    )
+    scheduler_box["scheduler"] = scheduler
+    monkeypatch.setattr("tamga.client.time.sleep", lambda seconds: slept.append(seconds))
+    scheduler.run_forever()
+
+    assert slept == [1.0, 1.0], "a hand-built 500ms interval must not become sleep(0.5)"
+
+
 def test_process_heartbeat_scheduler_stops_when_signalled(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
     monkeypatch: pytest.MonkeyPatch,

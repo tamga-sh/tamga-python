@@ -432,22 +432,93 @@ def test_heartbeat_scheduler_does_not_busy_loop_on_a_zero_interval(
     assert slept == [200.0, 200.0], "a hand-built zero interval must not become sleep(0)"
 
 
-def test_heartbeat_scheduler_honours_a_positive_sub_second_interval_verbatim(
+def test_heartbeat_scheduler_raises_a_500ms_interval_to_one_second(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
 ) -> None:
-    # Pins the boundary of the clamp so it stays deliberate. The guard catches
-    # non-positive only; the one-second floor in `heartbeat_interval_for_policy`
-    # is specific to the policy-derived path, so a sub-second interval passed by
-    # hand still spins. That is not an oversight to quietly widen here:
-    # tamga-go's `NewHeartbeatScheduler` and tamga-java's `Builder.interval`
-    # clamp exactly the same non-positive case and no more, and flooring
-    # sub-second intervals in one SDK alone would make the fleet disagree about
-    # the same input.
+    # NOT verbatim. A caller who writes `timedelta(milliseconds=500)` and means
+    # it gets one second, and this test exists to be tripped over rather than
+    # discovered in production. An earlier revision of this suite asserted the
+    # opposite -- that a positive interval is honoured however short -- on the
+    # reasoning that flooring it in Python alone would put this SDK out of step
+    # with a fleet that clamped only the non-positive case. The floor is now the
+    # fleet-wide rule, landed first in tamga-js.
+    #
+    # What settles it is that `time.sleep` *honours* a sub-second request, so
+    # there is no runtime threshold to key a narrower rule to. Measured on
+    # CPython 3.13, a bare sleep loop turns ~1,368,000/sec at `sleep(0)`,
+    # ~163,000/sec at `sleep(0.000001)` and ~696/sec at `sleep(0.001)` -- the
+    # last honoured to within 1.4x of what was asked. A guard aimed only at what
+    # the runtime refuses to honour would catch `timedelta(0)` and pass
+    # `timedelta(microseconds=1)`, a positive interval issuing 163,000 pings a
+    # second. That is a rule about where a number came from, not what it does.
+    #
+    # The range is reachable by ordinary mistake: `interval` is a `timedelta`
+    # while `policy.heartbeat_duration` counts *seconds*, so converting by hand
+    # in the wrong direction lands in it.
     client = make_client(lambda r: httpx.Response(200, json={"data": _machine_data()}))
     scheduler = HeartbeatScheduler(
-        machines=client.machines, machine_id=MACHINE_ID, interval=timedelta(microseconds=1)
+        machines=client.machines, machine_id=MACHINE_ID, interval=timedelta(milliseconds=500)
     )
-    assert scheduler.interval == timedelta(microseconds=1)
+    assert scheduler.interval == timedelta(seconds=1)
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (timedelta(microseconds=1), timedelta(seconds=1)),
+        (timedelta(milliseconds=500), timedelta(seconds=1)),
+        (timedelta(milliseconds=999), timedelta(seconds=1)),
+        # The floor itself, and everything above it, is honoured verbatim.
+        (timedelta(seconds=1), timedelta(seconds=1)),
+        (timedelta(milliseconds=1001), timedelta(milliseconds=1001)),
+        (timedelta(seconds=40), timedelta(seconds=40)),
+    ],
+)
+def test_heartbeat_scheduler_floors_every_positive_sub_second_interval(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    requested: timedelta,
+    expected: timedelta,
+) -> None:
+    # Pins both edges of the floor, so "sub-second is raised" cannot quietly
+    # become "everything short is rewritten". Note the two substitutions differ
+    # and that is deliberate: non-positive lands on the 200s default (above),
+    # positive-but-short lands on one second. Zero expresses no wish about rate
+    # -- it is an unset value or a units error -- while 500ms expresses one, and
+    # the floor is the smallest correction that respects it.
+    client = make_client(lambda r: httpx.Response(200, json={"data": _machine_data()}))
+    scheduler = HeartbeatScheduler(
+        machines=client.machines, machine_id=MACHINE_ID, interval=requested
+    )
+    assert scheduler.interval == expected
+
+
+def test_heartbeat_scheduler_does_not_spin_on_a_sub_second_interval(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The attribute tests above pin the value; this pins the consequence that
+    # actually matters -- what `run_forever` waits between pings. Unlike the
+    # zero case, `time.sleep(0.0005)` would have been honoured, which is exactly
+    # why the value never reaches it.
+    slept: list[float] = []
+    ping_count = {"n": 0}
+    scheduler_box: dict[str, HeartbeatScheduler] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ping_count["n"] += 1
+        if ping_count["n"] >= 2:
+            scheduler_box["scheduler"].stop()
+        return httpx.Response(200, json={"data": _machine_data()})
+
+    client = make_client(handler)
+    scheduler = HeartbeatScheduler(
+        machines=client.machines, machine_id=MACHINE_ID, interval=timedelta(milliseconds=500)
+    )
+    scheduler_box["scheduler"] = scheduler
+    monkeypatch.setattr("tamga.client.time.sleep", lambda seconds: slept.append(seconds))
+    scheduler.run_forever()
+
+    assert slept == [1.0, 1.0], "a hand-built 500ms interval must not become sleep(0.5)"
 
 
 def test_heartbeat_scheduler_keeps_pinging_after_a_dead_observation(
