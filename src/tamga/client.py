@@ -2,8 +2,15 @@
 
 ``TamgaClient`` wraps an ``httpx.Client`` and exposes namespaced sub-clients
 (``.licenses``, ``.machines``, ``.components``, ``.processes``,
-``.entitlements``, ``.policies``, ``.releases``, ``.accounts``) rather than one
-flat method namespace, mirroring the server's own resource grouping.
+``.entitlements``, ``.policies``, ``.releases``, ``.artifacts``,
+``.accounts``) rather than one flat method namespace, mirroring the server's
+own resource grouping.
+
+Redirects: the underlying ``httpx.Client`` is left at httpx's default of
+``follow_redirects=False``, and that is load-bearing rather than incidental.
+The artifact download route answers ``303`` to a presigned URL on a
+third-party storage host, and a followed redirect would carry the request's
+``Authorization`` header there. See ``ArtifactsClient.get_download_url``.
 
 Auth note: auth **is** enforced server-side. For the license-key transport
 (``Authorization: License <key>``) the license's policy must set
@@ -36,6 +43,7 @@ import httpx
 
 from tamga.checkout.key_set import SigningKeySet
 from tamga.errors import (
+    ArtifactDownloadError,
     FingerprintTakenError,
     MachineOverLimitError,
     NotFoundError,
@@ -43,6 +51,7 @@ from tamga.errors import (
     TtlInvalidError,
     parse_error_envelope,
 )
+from tamga.models.artifact import ArtifactResource
 from tamga.models.health import HealthStatus
 from tamga.models.license import LicenseFileResource, LicenseResource, LicenseScope
 from tamga.models.machine import (
@@ -95,6 +104,21 @@ MAX_PAGE_SIZE: int = 100
 #: Server-side bounds on machine/process checkout `ttl` (seconds): must be
 #: `> 0` and `<= 31536000` (365 days), else `422 TTL_INVALID`.
 MAX_CHECKOUT_TTL_SECONDS: int = 31536000
+
+#: Server-side bounds on the artifact-download presign `ttl` (seconds):
+#: `[60, 604800]`, i.e. one minute to one week, else `422 PRESIGN_TTL_INVALID`
+#: (`artifacts/service.rs:14-38`).
+#:
+#: A **different** range from `MAX_CHECKOUT_TTL_SECONDS`, under a different
+#: error code — a presigned storage URL and a signed offline licence file are
+#: not the same kind of artefact and do not get the same lifetime. Do not
+#: collapse the two.
+#:
+#: Omitting `ttl` does not mean "no expiry": the server defaults to 300s
+#: (`PRESIGN_GET_TTL`), well under this minimum, so a URL presigned in advance
+#: is likely dead by the time it is used.
+MIN_PRESIGN_TTL_SECONDS: int = 60
+MAX_PRESIGN_TTL_SECONDS: int = 604800
 
 #: How many pings the SDK aims to fit inside one heartbeat window.
 #:
@@ -316,6 +340,62 @@ def _parse_release_resource(data: dict[str, Any]) -> ReleaseResource:
         name=attrs.get("name"),
         # Absent rather than null when unset — the server skips serializing it.
         tag=attrs.get("tag"),
+        metadata=attrs.get("metadata") or {},
+        # Explicit `#[serde(rename)]`, so NOT `createdAt`/`updatedAt`.
+        created=_parse_datetime(attrs.get("created")),
+        updated=_parse_datetime(attrs.get("updated")),
+    )
+
+
+def _parse_artifact_resource(data: dict[str, Any]) -> ArtifactResource:
+    """Parse a JSON:API ``artifacts`` resource.
+
+    ``ArtifactAttributes`` (``artifacts/serializer.rs:19-38``) carries
+    ``rename_all = "camelCase"``, so the presigned URL arrives as
+    ``redirectUrl``. Every other multi-word field on the struct is renamed
+    explicitly, which is the trap:
+
+    **``created`` and ``updated`` are NOT ``createdAt``/``updatedAt``.** Their
+    struct fields are ``created_at``/``updated_at``, so ``rename_all`` alone
+    would camelCase them — but each carries an explicit
+    ``#[serde(rename = "created")]`` / ``#[serde(rename = "updated")]``
+    (``serializer.rs:34-37``), and an explicit rename wins over ``rename_all``.
+    An implementation that applies camelCase uniformly here gets two silently
+    null timestamps rather than an error, which is why the fixture this is
+    tested against was derived from the Rust struct rather than from these
+    field names. Exactly the same exception-inside-the-exception as
+    ``_parse_release_resource``.
+
+    ``redirectUrl`` is **absent, not null**, on list and show responses
+    (``skip_serializing_if = "Option::is_none"``), so absence is normal and
+    must not be treated as a malformed resource.
+
+    Raises:
+        ValueError: If ``data`` is not a resource object, or carries no ``id``.
+            Guarded rather than subscripted bare: a ``303`` (or any empty-bodied
+            2xx) parses to ``None``, and letting that reach ``data["id"]`` or
+            ``data.get`` raises ``TypeError``/``AttributeError`` straight past
+            this SDK's documented exception contract — the same escape that was
+            a HIGH finding on the two ``verify()`` paths.
+    """
+    if not isinstance(data, dict) or "id" not in data:
+        raise ValueError(f"expected a JSON:API artifacts resource object, got {data!r}")
+    attrs = data.get("attributes")
+    if not isinstance(attrs, dict):
+        attrs = {}
+    return ArtifactResource(
+        id=UUID(str(data["id"])),
+        filename=attrs.get("filename", ""),
+        status=attrs.get("status", ""),
+        filetype=attrs.get("filetype"),
+        filesize=attrs.get("filesize"),
+        checksum=attrs.get("checksum"),
+        platform=attrs.get("platform"),
+        arch=attrs.get("arch"),
+        signature=attrs.get("signature"),
+        # camelCase: `redirect_url` on the struct, `redirectUrl` on the wire.
+        # Absent (not null) unless this came from the download action.
+        redirect_url=attrs.get("redirectUrl"),
         metadata=attrs.get("metadata") or {},
         # Explicit `#[serde(rename)]`, so NOT `createdAt`/`updatedAt`.
         created=_parse_datetime(attrs.get("created")),
@@ -2325,6 +2405,251 @@ class ReleasesClient:
         return _parse_release_resource(data)
 
 
+@dataclass
+class ArtifactsClient:
+    """Namespaced client for ``/artifacts`` endpoints. Access via ``TamgaClient.artifacts``.
+
+    **Read and download only.** ``Role::LicenseToken``'s fixed permission set
+    carries ``artifact.read`` and ``artifact.download``
+    (``shared/authz/mod.rs:262-265``) and nothing else for this resource, so
+    create, update, delete and upload are out of reach of a licence key and are
+    not modelled. ``artifact.download`` was added to that role only recently;
+    before it, every route here answered ``403`` to a licence key, which is why
+    this SDK shipped without them.
+
+    **A ``403`` here is not necessarily an auth misconfiguration.** The
+    download action enforces the *owning release's* read gate on top of the
+    permission — ``enforce_release_access`` checks distribution strategy,
+    suspension, expiry and entitlement — so a licence key holding
+    ``artifact.download`` is still refused the binary of a release it may not
+    read. That gate exists precisely because granting the permission alone let
+    a licence key pull a ``CLOSED`` release's bytes by asking for the payload
+    instead of the release.
+
+    Note the asymmetry: ``list`` and ``get`` check the permission only, so an
+    artifact's *metadata* is readable for a release whose *bytes* are not.
+    """
+
+    _http: httpx.Client
+    _config: TamgaConfig
+
+    def list(
+        self, release_id: UUID, limit: int | None = None, after: str | None = None
+    ) -> Page[ArtifactResource]:
+        """``GET /releases/{release_id}/artifacts``, keyset-paginated (``limit``/``page[after]``).
+
+        Keyset paging genuinely works here — the cursor reaches the query,
+        which orders by ``(created_at, id)`` ascending and seeks past the named
+        row (``artifacts/queries.rs:31-60``). Unlike the entitlements listing,
+        a caller can page this to completion.
+
+        When ``limit`` is omitted the SDK sends the server maximum (100)
+        explicitly rather than letting the server apply its own default of 25.
+        Without a known page size there is no way to tell a full page from the
+        last one.
+
+        ``redirect_url`` is absent on every item; use ``get_download_url`` for
+        the one artifact the caller actually wants.
+
+        Args:
+            release_id: The owning release.
+            limit: Page size. Server clamps to ``[1, 100]``.
+            after: Opaque cursor — the ``id`` of the last artifact seen.
+
+        Returns:
+            One page of artifacts plus the cursor for the next, if any.
+
+        Raises:
+            tamga.errors.ForbiddenError: If the caller lacks ``artifact.read``.
+        """
+        effective_limit = limit if limit is not None else MAX_PAGE_SIZE
+        params: dict[str, Any] = {"limit": effective_limit}
+        if after is not None:
+            params["page[after]"] = after
+        response = _send_request_raw(
+            self._http,
+            self._config,
+            "GET",
+            f"/releases/{release_id}/artifacts",
+            params=params,
+        )
+        items = [_parse_artifact_resource(d) for d in (response.data or [])]
+        return Page(items=items, next_after=_next_after_cursor(items, effective_limit))
+
+    def get(self, artifact_id: UUID) -> ArtifactResource:
+        """``GET /artifacts/{artifact_id}`` — one artifact's metadata.
+
+        ``redirect_url`` is **absent** on this response; only the download
+        action populates it. Reading metadata needs ``artifact.read`` alone and
+        does not go through the owning release's read gate, so this can succeed
+        for an artifact whose bytes ``get_download_url`` would refuse.
+
+        Args:
+            artifact_id: The artifact to read.
+
+        Returns:
+            The artifact, with ``redirect_url`` unset.
+
+        Raises:
+            tamga.errors.NotFoundError: If no such artifact exists in the account.
+            tamga.errors.ForbiddenError: If the caller lacks ``artifact.read``.
+        """
+        data = _send_request(self._http, self._config, "GET", f"/artifacts/{artifact_id}")
+        return _parse_artifact_resource(data)
+
+    def get_download_url(self, artifact_id: UUID, *, ttl: int | None = None) -> ArtifactResource:
+        """``GET /artifacts/{artifact_id}/actions/download?redirect=false`` — presign, don't follow.
+
+        **``redirect=false`` is not optional here, and it is a security
+        control rather than a convenience.** Left at its default the route
+        answers ``303 See Other`` pointing at a short-lived presigned storage
+        URL on a *different host*. An HTTP client that follows that redirect
+        with the request's ``Authorization`` header still attached hands the
+        licence key to the storage provider. This SDK avoids that two ways, and
+        both must stay:
+
+        1. It always sends ``redirect=false``, so the server returns the
+           artifact resource with ``redirect_url`` populated and answers ``200``
+           — there is no redirect to mishandle.
+        2. The underlying ``httpx.Client`` is left at ``follow_redirects=False``
+           (httpx's default, which ``TamgaClient`` does not override). Do not
+           turn it on for this client. It is the backstop for (1), and
+           ``test_artifacts.py`` pins both independently.
+
+        Treat the returned ``redirect_url`` as a bearer credential with an
+        expiry: anyone holding it can fetch the bytes until it lapses. Do not
+        log it.
+
+        Args:
+            artifact_id: The artifact to presign.
+            ttl: Lifetime of the presigned URL in **seconds**, within
+                ``[60, 604800]`` (1 minute to 1 week). Omitted means the
+                server's own default of 300s — which is short, so presign
+                near the point of use rather than in advance.
+
+        Returns:
+            The artifact with ``redirect_url`` populated.
+
+        Raises:
+            ValueError: If ``ttl`` is outside ``[60, 604800]``. Checked
+                client-side to save a round trip; the server answers
+                ``422 PRESIGN_TTL_INVALID`` for the same range.
+            tamga.errors.ForbiddenError: If the caller lacks
+                ``artifact.download`` — **or** if the owning release's read
+                gate refuses it (distribution strategy, suspension, expiry,
+                entitlement). The two are indistinguishable from the response,
+                so do not report this to a user as a permissions problem.
+            tamga.errors.NotFoundError: If the artifact, or the release owning
+                it, does not exist in the account.
+            tamga.errors.StorageUnavailableError: If the server has no
+                object-storage backend configured.
+        """
+        if ttl is not None and not (MIN_PRESIGN_TTL_SECONDS <= ttl <= MAX_PRESIGN_TTL_SECONDS):
+            raise ValueError(
+                f"ttl must be between {MIN_PRESIGN_TTL_SECONDS} and "
+                f"{MAX_PRESIGN_TTL_SECONDS} seconds, got {ttl}"
+            )
+        params: dict[str, Any] = {"redirect": "false"}
+        if ttl is not None:
+            params["ttl"] = ttl
+        response = _send_raw_response(
+            self._http,
+            self._config,
+            "GET",
+            f"/artifacts/{artifact_id}/actions/download",
+            params=params,
+        )
+        if 300 <= response.status_code < 400:
+            # The server ignored `redirect=false` and answered the `303` anyway.
+            # Nothing follows it — see this method's docstring — but the caller
+            # gets a named condition rather than a parse failure on an empty
+            # body. `Location` is deliberately not echoed into the message: it
+            # is a presigned URL, and error text ends up in logs.
+            raise ArtifactDownloadError(
+                status=response.status_code,
+                code="ARTIFACT_DOWNLOAD_FAILED",
+                detail=(
+                    f"The download route answered {response.status_code} despite "
+                    "redirect=false. The redirect was NOT followed, because doing so "
+                    "would send the caller's credential to the storage host."
+                ),
+                pointer=None,
+            )
+        return _parse_artifact_resource(parse_response(response).data)
+
+    def download(self, artifact_id: UUID, *, ttl: int | None = None) -> bytes:
+        """Presign, then fetch the bytes from storage **with no credentials attached**.
+
+        Two requests: ``get_download_url`` against the Tamga API (authenticated),
+        then a plain ``GET`` of the presigned URL. The second deliberately does
+        **not** go through ``_send_raw_response``, which would apply
+        ``config.default_auth`` — the presigned URL already carries its own
+        signature in the query string, and adding a licence key to a request
+        bound for a third-party storage host is exactly the leak the
+        ``redirect=false`` handling exists to prevent. It reuses the same
+        ``httpx.Client`` only for its connection pool and injected transport;
+        the client itself holds no default headers, so "send no auth" is
+        achieved by not adding any, not by stripping one.
+
+        Redirects are not followed here either. A storage host answering ``3xx``
+        surfaces as ``ArtifactDownloadError`` rather than being chased, because
+        a chased redirect is the mechanism by which a credential would escape.
+
+        Buffers the whole artifact in memory. For anything large, call
+        ``get_download_url`` and stream the URL yourself — and verify the
+        artifact's ``checksum``, which this method does not.
+
+        Note:
+            The read timeout is ``TamgaConfig.timeout_seconds`` (45s by
+            default), which is sized for API calls, not for pulling an
+            installer over a slow link.
+
+        Args:
+            artifact_id: The artifact to download.
+            ttl: Presigned-URL lifetime in seconds, ``[60, 604800]``.
+
+        Returns:
+            The artifact's raw bytes.
+
+        Raises:
+            ValueError: If ``ttl`` is out of range.
+            tamga.errors.ArtifactDownloadError: If the artifact has no
+                ``redirect_url`` (it was never uploaded, so the server had
+                nothing to presign), or the storage host answered anything
+                other than ``2xx``.
+            tamga.errors.TamgaError: Any error from the presign call itself;
+                see ``get_download_url``.
+        """
+        artifact = self.get_download_url(artifact_id, ttl=ttl)
+        url = artifact.redirect_url
+        if not url:
+            raise ArtifactDownloadError(
+                status=0,
+                code="ARTIFACT_DOWNLOAD_FAILED",
+                detail=(
+                    "The download action returned no redirectUrl for artifact "
+                    f"{artifact_id}; its status is {artifact.status!r} "
+                    "(bytes exist only once it reads 'UPLOADED')."
+                ),
+                pointer=None,
+            )
+        # No `headers=` and no `apply_auth`: nothing bound for the storage host
+        # may carry the caller's credential.
+        response = self._http.request("GET", url)
+        if response.status_code < 200 or response.status_code >= 300:
+            raise ArtifactDownloadError(
+                status=response.status_code,
+                code="ARTIFACT_DOWNLOAD_FAILED",
+                detail=(
+                    f"Storage host answered {response.status_code} for the presigned "
+                    "URL. A presigned URL is short-lived; presign again rather than "
+                    "retrying the same URL."
+                ),
+                pointer=None,
+            )
+        return response.content
+
+
 def _clamped_heartbeat_interval(interval: timedelta, default: timedelta) -> timedelta:
     """The interval a heartbeat scheduler will actually run at, given a requested one.
 
@@ -2642,7 +2967,7 @@ class TamgaClient:
 
     Exposes namespaced sub-clients: ``.licenses``, ``.machines``,
     ``.components``, ``.processes``, ``.entitlements``, ``.policies``,
-    ``.releases``, ``.accounts``.
+    ``.releases``, ``.artifacts``, ``.accounts``.
 
     Synchronous only — this wraps ``httpx.Client``, not ``httpx.AsyncClient``.
     Usable as a context manager, which closes the underlying HTTP client on
@@ -2667,6 +2992,7 @@ class TamgaClient:
     """
 
     accounts: AccountsClient
+    artifacts: ArtifactsClient
     licenses: LicensesClient
     machines: MachinesClient
     components: ComponentsClient
@@ -2703,6 +3029,7 @@ class TamgaClient:
         self.processes = ProcessesClient(_http=self._http, _config=config)
         self.policies = PoliciesClient(_http=self._http, _config=config)
         self.releases = ReleasesClient(_http=self._http, _config=config)
+        self.artifacts = ArtifactsClient(_http=self._http, _config=config)
         self.accounts = AccountsClient(_http=self._http, _config=config)
 
     def health(self) -> HealthStatus:

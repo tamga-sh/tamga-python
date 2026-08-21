@@ -32,8 +32,8 @@ src/tamga/
 ├── __init__.py         # public re-exports: TamgaClient, TamgaConfig, errors, __version__
 ├── py.typed             # PEP 561 marker
 ├── client.py             # TamgaClient façade + namespaced sub-clients (licenses/machines/
-│                         #   components/processes/entitlements/policies/releases) + all
-│                         #   endpoint methods + the two heartbeat schedulers
+│                         #   components/processes/entitlements/policies/releases/
+│                         #   artifacts) + all endpoint methods + the two heartbeat schedulers
 ├── transport.py          # httpx wiring, 5 auth transports, header handling, URL builders
 ├── proof.py               # offline proof payload build + verify
 ├── errors.py               # TamgaError hierarchy, JSON:API error envelope parsing
@@ -43,6 +43,7 @@ src/tamga/
 │   ├── machine.py        # MachineResource, ComponentResource, ProcessResource, HeartbeatStatus
 │   ├── policy.py         # PolicyResource + policy-derived enums, Entitlement
 │   ├── release.py        # ReleaseResource (auto-update check)
+│   ├── artifact.py       # ArtifactResource — a release's downloadable payload
 │   ├── signing_key.py    # SigningKey — one published Ed25519 key, current or retired
 │   └── health.py         # HealthStatus — NOT a JSON:API resource, see below
 ├── crypto/
@@ -58,7 +59,8 @@ src/tamga/
 ```
 
 **Vertical-ish grouping, not one flat client.** `TamgaClient` exposes `.licenses`, `.machines`,
-`.components`, `.processes`, `.entitlements`, `.policies`, `.releases`, `.accounts` sub-clients
+`.components`, `.processes`, `.entitlements`, `.policies`, `.releases`, `.artifacts`, `.accounts`
+sub-clients
 instead of one giant method namespace —
 mirrors the resource grouping in the Tamga API protocol specification, keep new endpoint methods on
 the matching sub-client rather than bolting everything onto `TamgaClient` directly.
@@ -515,9 +517,51 @@ wrong — these replace it.
   release exists but you can't have it". `releases.check_for_upgrade` returns `None` for both and
   documents it as *no update is available to you*, never "you are up to date" — there is no
   client-side way to separate them and there should not be. A **suspended** license is a distinct
-  `403` (`:77-81`), not an ambiguous `204`. The artifact download route exists too, though it is
-  currently walled off by a permission gap. An older note here claimed the endpoint 500s and
+  `403` (`:77-81`), not an ambiguous `204`. An older note here claimed the endpoint 500s and
   forbade building against it — that was wrong. RFC 9421 response signing genuinely is dead code.
+  **The artifact routes are no longer walled off** — see the next bullet; the note that said they
+  were is stale as of `tamga-api@e6d317b`.
+- **Artifacts are readable and downloadable with a licence key — as of `tamga-api@e6d317b`.**
+  `artifact.download` previously appeared in *no* role's default list, and `effective_permissions`
+  intersects the bearer and token sets with the bearer side coming solely from
+  `role.default_permissions()`, so the grant was not recoverable by configuring the token either.
+  That commit added it to `Role::LicenseToken` (`shared/authz/mod.rs:262-265`, alongside the
+  `artifact.read` that was already there) and routed a real handler. `artifact.create`/`update`/
+  `delete` are still absent from that role, so create/update/delete/upload stay out of scope and
+  `ArtifactsClient` deliberately models only the read half.
+  **Three traps on this surface, all measured:**
+  - **The download answers `303 See Other`** to a short-lived presigned URL on a *third-party
+    storage host*. An SDK that lets its HTTP client follow that redirect with the request's
+    `Authorization` header still attached hands the licence key to the storage provider. This SDK
+    is protected twice over and both halves must stay: it always sends `?redirect=false` (which
+    returns the artifact resource with `redirectUrl` populated and a `200`), **and** the
+    `httpx.Client` is left at httpx's default `follow_redirects=False`, which `TamgaClient` does
+    not override. `ArtifactsClient.download` then fetches that URL through the same client with
+    **no auth applied at all** — not stripped, simply never added, since the client holds no
+    default headers. Do not "tidy" that second request onto `_send_raw_response`; that function's
+    whole job is to apply `config.default_auth`. `tests/test_artifacts.py` pins the two protections
+    independently, so losing either one alone still fails.
+  - **`ArtifactAttributes` is `rename_all = "camelCase"` AND carries explicit
+    `#[serde(rename = "created")]`/`#[serde(rename = "updated")]`** (`artifacts/serializer.rs:20`,
+    `:34-37`). So the wire names are `redirectUrl` but `created`/`updated` — **not**
+    `createdAt`/`updatedAt`. Applying camelCase uniformly yields two silently-null timestamps
+    rather than an error. Identical exception-inside-the-exception to `ReleaseAttributes`, and this
+    repo has already shipped the mirror-image bug once, on `productId`. The fixtures in
+    `tests/fixtures/artifacts/` have their keys derived mechanically from the Rust struct, with the
+    derivation recorded in each file's `_provenance` block.
+  - **The download handler enforces the owning release's read gate as well as the permission.**
+    `enforce_release_access` (distribution strategy, suspension, expiry, entitlement) runs on the
+    release that owns the bytes, so a CLOSED release's binary is refused even to a caller holding
+    `artifact.download`. **A `403` here is therefore not diagnosable as an auth
+    misconfiguration.** Note the asymmetry: `list` and `get` check the permission *only*, so an
+    artifact's metadata is readable for a release whose bytes are not.
+
+  `redirectUrl` is **absent, not null**, on list and show (`skip_serializing_if`), and
+  `ArtifactAttributes` carries no `release_id` and no `relationships`, so an artifact cannot be
+  attributed back to its release from a show response — same shape as `MachineResource` carrying
+  no `license_id`. The presign `ttl` is `[60s, 1 week]` under `PRESIGN_TTL_INVALID`, a **different**
+  range and a different code from checkout's `TTL_INVALID` (`(0, 31536000]`); do not collapse them.
+  Omitting `ttl` means the server's own 300s default, not "no expiry".
 - **Attribute CASING is per-resource, and `releases` is the one that bites.** Most attribute
   structs are snake_case; exactly 10 of the server's 67 carry `rename_all = "camelCase"`. Three are
   SDK-relevant:

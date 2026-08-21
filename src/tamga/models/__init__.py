@@ -6,6 +6,7 @@ API protocol specification for the wire-level protocol these models mirror.
 
 from __future__ import annotations
 
+from tamga.models.artifact import ArtifactResource
 from tamga.models.health import HealthStatus
 from tamga.models.license import LicenseFileResource, LicenseResource, LicenseScope
 from tamga.models.machine import (
@@ -43,6 +44,7 @@ __all__ = [
     "ED25519_PUBLIC_KEY_LENGTH",
     "MACHINE_UNIQUENESS_STRATEGIES",
     "RETIRED_STATUS",
+    "ArtifactResource",
     "CheckInInterval",
     "ComponentResource",
     "Entitlement",

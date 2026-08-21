@@ -1,0 +1,41 @@
+{
+  "_provenance": {
+    "source": "tamga-api/src/features/artifacts/serializer.rs, struct ArtifactAttributes (lines 19-38)",
+    "derivation": "Wire keys were extracted mechanically from the Rust struct, applying serde's own precedence (an explicit #[serde(rename)] on a field beats the struct-level rename_all). They were NOT transcribed from this SDK's ArtifactResource dataclass — a fixture built from the Python field names would encode the same assumption the parser makes and could not disprove it. Same rule, and same reason, as tests/fixtures/releases/upgrade_response.json.",
+    "rename_all": "camelCase (serializer.rs:20)",
+    "key_map": {
+      "filename": "filename",
+      "filetype": "filetype",
+      "filesize": "filesize",
+      "checksum": "checksum",
+      "platform": "platform",
+      "arch": "arch",
+      "signature": "signature",
+      "status": "status",
+      "redirect_url": "redirectUrl (camelCase applies — the one multi-word field without an explicit rename)",
+      "metadata": "metadata",
+      "created_at": "created (EXPLICIT RENAME at serializer.rs:34-35 — camelCase does not apply)",
+      "updated_at": "updated (EXPLICIT RENAME at serializer.rs:36-37 — camelCase does not apply)"
+    },
+    "shape": "This is the ?redirect=false response from GET /artifacts/{id}/actions/download — the only response on which redirectUrl is populated. The 303 default emits no body at all.",
+    "no_release_id": "ArtifactAttributes carries no release_id and the resource carries no relationships object, so an artifact cannot be attributed to its release from this response alone. Absence here is faithful to the server, not an omission in the fixture."
+  },
+  "data": {
+    "id": "018f2f3a-0000-7000-8000-0000000000a1",
+    "type": "artifacts",
+    "attributes": {
+      "filename": "tamga-app-1.4.0-darwin-arm64.dmg",
+      "filetype": "dmg",
+      "filesize": 48210944,
+      "checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "platform": "darwin-arm64",
+      "arch": "arm64",
+      "signature": "MEUCIQDf1nQ0Zk8x8mZ7wq3mB2Vd8s9Zt0oQKk1nQ0Zk8x8mZwIgHn",
+      "status": "UPLOADED",
+      "redirectUrl": "https://storage.example.com/accounts/018f2f3a/artifacts/a1?X-Amz-Signature=deadbeef&X-Amz-Expires=300",
+      "metadata": {"notarized": true},
+      "created": "2026-01-02T03:04:05Z",
+      "updated": "2026-01-02T04:05:06Z"
+    }
+  }
+}

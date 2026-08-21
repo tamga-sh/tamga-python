@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from tamga.client import TamgaClient, TamgaConfig
 from tamga.errors import (
+    ArtifactDownloadError,
     CheckInNotRequiredError,
     CoreLimitExceededError,
     DatasetInvalidError,
@@ -38,7 +39,9 @@ from tamga.errors import (
     MemoryLimitExceededError,
     NotFoundError,
     PidTakenError,
+    PresignTtlInvalidError,
     SchemeNotSupportedError,
+    StorageUnavailableError,
     TamgaError,
     TooManyProcessesError,
     TtlInvalidError,
@@ -52,6 +55,7 @@ from tamga.errors import (
 __version__ = "1.1.0"  # x-release-please-version
 
 __all__ = [
+    "ArtifactDownloadError",
     "CheckInNotRequiredError",
     "CoreLimitExceededError",
     "DatasetInvalidError",
@@ -70,7 +74,9 @@ __all__ = [
     "MemoryLimitExceededError",
     "NotFoundError",
     "PidTakenError",
+    "PresignTtlInvalidError",
     "SchemeNotSupportedError",
+    "StorageUnavailableError",
     "TamgaClient",
     "TamgaConfig",
     "TamgaError",

@@ -186,6 +186,51 @@ else:
     print("Update available:", release.version)
 ```
 
+## Downloading a release's artifacts
+
+Once `check_for_upgrade` names a release, `client.artifacts` fetches what it ships.
+
+```python
+with TamgaClient(config) as client:
+    page = client.artifacts.list(release.id)
+    for artifact in page.items:
+        print(artifact.filename, artifact.filesize, artifact.status)
+
+    # Presign, then fetch the bytes yourself — best for anything large.
+    presigned = client.artifacts.get_download_url(artifact.id, ttl=900)
+    print(presigned.redirect_url)
+
+    # Or let the SDK do both steps and hand you the bytes.
+    blob = client.artifacts.download(artifact.id)
+```
+
+Only artifacts whose `status` reads `"UPLOADED"` have bytes behind them; `checksum` is a
+lowercase-hex SHA-256 the server computes at upload time, and verifying the download against it is
+the caller's job.
+
+**Why `download` makes two requests, and why that matters.** The server's download route answers
+`303 See Other` pointing at a short-lived presigned URL on a *different host*. An HTTP client that
+follows that redirect with the request's `Authorization` header still attached would hand your
+licence key to the storage provider. This SDK never lets that happen: it asks for
+`?redirect=false` so the server returns the URL in the body instead of redirecting, and its
+underlying `httpx.Client` does not follow redirects at all. The storage fetch is then made with no
+credential attached — the presigned URL carries its own signature in the query string and needs
+nothing else.
+
+Treat a `redirect_url` as a credential with an expiry. Anyone holding it can fetch the bytes until
+it lapses, so do not log it or persist it. `ttl` is in seconds and must fall within
+`[60, 604800]` (one minute to one week); omitting it gives the server's own default of **300
+seconds**, which is short enough that presigning far in advance is usually a mistake.
+
+**A `403` here is not necessarily a permissions problem.** The download action enforces the owning
+release's read gate — distribution strategy, suspension, expiry, entitlement — on top of the
+`artifact.download` permission, so a closed release's binary is refused even to a caller that
+holds it. Note the asymmetry: `list` and `get` check the permission only, so an artifact's
+*metadata* stays readable for a release whose *bytes* are not.
+
+Creating, updating, deleting and uploading artifacts are absent by design — those permissions are
+not in a licence key's role, so they are console/CI operations needing a privileged token.
+
 ## Diagnosing a misconfigured deployment
 
 ```python

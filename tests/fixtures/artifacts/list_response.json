@@ -1,0 +1,45 @@
+{
+  "_provenance": {
+    "source": "tamga-api/src/features/artifacts/serializer.rs, struct ArtifactAttributes (lines 19-38) + artifacts_response (lines 70-79)",
+    "derivation": "Wire keys extracted mechanically from the Rust struct, as in download_response.json. Not transcribed from this SDK's dataclass.",
+    "shape": "GET /v1/accounts/{account_id}/releases/{release_id}/artifacts. A bare JsonApiDocument with `data` only — this route emits no `meta` and no `links`, which is why the SDK derives the keyset cursor from the page size it sent rather than reading one off the response.",
+    "no_redirect_url": "redirectUrl is ABSENT — not null — on every item. ArtifactAttributes.redirect_url carries skip_serializing_if = \"Option::is_none\" (serializer.rs:30-31), and only the download action ever populates the underlying field. A parser that treats absence as malformed breaks the list route.",
+    "second_item": "status WAITING with null filesize/checksum is the real pre-upload state: confirm_upload (artifacts/queries.rs:188-210) is the only writer of those three columns, so they move together."
+  },
+  "data": [
+    {
+      "id": "018f2f3a-0000-7000-8000-0000000000a1",
+      "type": "artifacts",
+      "attributes": {
+        "filename": "tamga-app-1.4.0-darwin-arm64.dmg",
+        "filetype": "dmg",
+        "filesize": 48210944,
+        "checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "platform": "darwin-arm64",
+        "arch": "arm64",
+        "signature": null,
+        "status": "UPLOADED",
+        "metadata": {},
+        "created": "2026-01-02T03:04:05Z",
+        "updated": "2026-01-02T04:05:06Z"
+      }
+    },
+    {
+      "id": "018f2f3a-0000-7000-8000-0000000000a2",
+      "type": "artifacts",
+      "attributes": {
+        "filename": "tamga-app-1.4.0-linux-x86_64.AppImage",
+        "filetype": "AppImage",
+        "filesize": null,
+        "checksum": null,
+        "platform": "linux-x86_64",
+        "arch": "x86_64",
+        "signature": null,
+        "status": "WAITING",
+        "metadata": {},
+        "created": "2026-01-02T03:04:06Z",
+        "updated": "2026-01-02T03:04:06Z"
+      }
+    }
+  ]
+}
