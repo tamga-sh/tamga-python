@@ -163,6 +163,26 @@ individually; see `.github/workflows/ci.yml` for the exact order
   string is a valid member of `OverageStrategy`/`HeartbeatResurrectionStrategy`. Both silently
   behave as `NO_OVERAGE`/`NO_REVIVE` server-side — `PolicyResource` parsing must apply that
   fallback, not trust the field name's implication that access is denied by default.
+- **`max_memory` / `max_disk` are write-only server-side, and are no longer `PolicyResource`
+  fields.** The columns exist (`policies/model.rs:187-188`, `Option<i64>`) and validation enforces
+  them (`allows_memory`/`allows_disk`), and `POST`/`PATCH /policies` accept them in the request
+  body — but **no serializer emits them**. `PolicyAttributes` (`policies/serializer.rs:22-53`) is
+  the only response shape for the resource and it carries `max_machines`/`max_cores` and stops.
+  Grep confirms it: every other hit is a query, a request body, or a test. So a read-only client
+  can never populate them, which is why the two fields carried "always `None`" docstrings for as
+  long as they existed. Removed from the dataclass in 1.1.0.
+  **Two things not to undo.** (1) `PolicyResource.__getattr__` is a deliberate deprecation shim:
+  it returns `None` for exactly those two names with a `DeprecationWarning` and re-raises
+  `AttributeError` for everything else, so a `^1.0` consumer that auto-upgrades into 1.1.0 and
+  reads `policy.max_memory` gets the same `None` it always got instead of a crash. Delete it in
+  2.0.0 — not before, and not as tidying. (2) It is defined under `if not TYPE_CHECKING:` on
+  purpose. A type-checker-visible `__getattr__` makes mypy accept *any* attribute name on the
+  class, which would erase this dataclass's whole reason to exist and would give a caller no
+  signal at all until the shim vanished under them. Hidden, mypy reports
+  `"PolicyResource" has no attribute "max_memory"` at the caller's own line today while the
+  runtime keeps working — verified, along with the fact that typos like `max_machiens` are still
+  caught. Do not "fix" the conditional into an unconditional definition, and do not add a
+  `# type: ignore` to make it visible.
 
 ### Server behaviour this SDK has to match
 

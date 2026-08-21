@@ -69,10 +69,17 @@ class ValidationCode(str, Enum):
     """Core count over ``policy.max_cores``. Reachable: ✅"""
 
     TOO_MUCH_MEMORY = "TOO_MUCH_MEMORY"
-    """Memory over ``policy.max_memory``. Reachable: ✅"""
+    """Memory over the policy's server-side memory limit. Reachable: ✅
+
+    That limit is not readable: no policy response carries it, so this code is
+    the only way to observe it. See ``PolicyResource``.
+    """
 
     TOO_MUCH_DISK = "TOO_MUCH_DISK"
-    """Disk over ``policy.max_disk``. Reachable: ✅"""
+    """Disk over the policy's server-side disk limit. Reachable: ✅
+
+    Unreadable for the same reason as ``TOO_MUCH_MEMORY``.
+    """
 
     TOO_MANY_PROCESSES = "TOO_MANY_PROCESSES"
     """Process count over ``policy.max_processes``. Reachable: ✅"""

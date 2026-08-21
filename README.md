@@ -404,9 +404,14 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
   bearer, and nothing further — so any license key that authenticates can read every license in
   the same account, `attributes.key` included, in plain text. Server-side behaviour this SDK
   cannot fix and does not work around; reported upstream.
-- **`policy.max_memory` and `policy.max_disk` are always `None`.** The server omits both from the
-  policy response even though it enforces them, so the only way to observe either limit is a
-  `TOO_MUCH_MEMORY` / `TOO_MUCH_DISK` validation code.
+- **`PolicyResource` does not model `max_memory` / `max_disk`.** The server enforces both during
+  validation but no policy serializer emits either — the one response shape for the resource
+  carries `max_machines` and `max_cores` and stops there. They are writable through the
+  create/update request bodies and readable nowhere, so the only way to observe either limit is a
+  `TOO_MUCH_MEMORY` / `TOO_MUCH_DISK` validation code. Both fields were dropped from the dataclass
+  in 1.1.0; reading `policy.max_memory` still returns the `None` it always returned, now with a
+  `DeprecationWarning`, until 2.0.0 removes it. A type checker flags it today. Passing either name
+  to `PolicyResource(...)` raises `TypeError` as of 1.1.0.
 - **`machines.update` cannot clear a field.** Every column is applied through
   `COALESCE(new, existing)` server-side, so an omitted or `None` field means "leave alone", never
   "set to null". Its response also judges `heartbeat_status`/`next_heartbeat_at` against the 600s

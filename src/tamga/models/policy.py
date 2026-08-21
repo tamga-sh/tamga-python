@@ -6,10 +6,11 @@ just the validation code — see the Tamga API protocol specification section 10
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 
@@ -133,6 +134,15 @@ MACHINE_UNIQUENESS_STRATEGIES: frozenset[str] = frozenset(
 DEFAULT_HEARTBEAT_DURATION_SECONDS: int = 600
 
 
+#: Attribute names removed from :class:`PolicyResource` in 1.1.0, still served
+#: at runtime by its ``__getattr__`` shim so a ``^1.0`` consumer that reads one
+#: keeps working. Scheduled for deletion in 2.0.0.
+_REMOVED_PHANTOM_LIMITS: frozenset[str] = frozenset({"max_memory", "max_disk"})
+
+#: Version that deletes the ``__getattr__`` shim above.
+_PHANTOM_LIMIT_REMOVAL_VERSION: str = "2.0.0"
+
+
 class CheckInInterval(str, Enum):
     """Lowercase — inconsistent with the ``SCREAMING_SNAKE_CASE`` convention above."""
 
@@ -156,10 +166,6 @@ class PolicyResource:
     - ``heartbeat_resurrection_strategy`` may similarly be
       ``"NO_RESURRECTION"`` — not a real variant, falls back to
       ``NO_REVIVE`` semantics.
-    - The ``GET`` response for a policy **omits ``max_memory`` and
-      ``max_disk``** even though both are enforced during validation. This
-      SDK cannot introspect those two limits client-side; it can only
-      observe ``TOO_MUCH_MEMORY``/``TOO_MUCH_DISK`` if validation fails.
 
     Free-text fields with no backing enum (branched by literal string match
     server-side; treat any value outside the documented list as
@@ -188,20 +194,6 @@ class PolicyResource:
         max_cores: Core limit, subject to ``overage_strategy``.
         max_processes: Process limit, subject to ``overage_strategy``.
         max_uses: Use limit — always strict, ``overage_strategy`` does not apply.
-        max_memory: Memory limit, subject to ``overage_strategy``. **Always
-            ``None`` in practice** — the server's ``GET`` response for a
-            policy omits this field even though it's enforced during
-            validation (see the Tamga API protocol specification section 10
-            and "Known Server-Side Gaps" item 9's neighboring note). Modeled
-            here anyway so parsing doesn't break if/when the server starts
-            including it, and so callers have a typed field to check rather
-            than reaching into raw attributes. Do not rely on this being
-            populated — the only
-            way to observe this limit today is a ``TOO_MUCH_MEMORY``
-            validation code.
-        max_disk: Disk limit, subject to ``overage_strategy``. Same
-            "always ``None`` in practice" caveat as ``max_memory`` — only
-            observable via a ``TOO_MUCH_DISK`` validation code.
         heartbeat_duration: The policy's machine-heartbeat window, in seconds,
             or ``None`` when the column is unset. **This is the field that
             decides how often a machine has to ping**; the SDK's 600s default is
@@ -221,6 +213,28 @@ class PolicyResource:
             scope means for ``409 FINGERPRINT_TAKEN``. Defaults to
             ``"UNIQUE_PER_LICENSE"``, which is also what the server treats any
             unrecognized value as.
+
+    Note:
+        **``max_memory`` and ``max_disk`` are not modeled.** Both exist as
+        columns and both are enforced during validation, but no policy
+        serializer ever emits them: the single response shape for this
+        resource (``policies/serializer.rs``'s ``PolicyAttributes``) carries
+        ``max_machines`` and ``max_cores`` and stops there. They are writable
+        through the create/update request bodies and readable nowhere, so a
+        read-only client like this one could never populate them — which is
+        why the fields this SDK used to carry were documented as "always
+        ``None``" for as long as they existed.
+
+        They were dropped from the dataclass in 1.1.0. Reading
+        ``policy.max_memory`` or ``policy.max_disk`` still returns ``None`` at
+        runtime, with a ``DeprecationWarning``, until they are deleted
+        outright in 2.0.0; a type checker reports the attribute as gone today.
+        Passing either name to ``PolicyResource(...)`` is a ``TypeError`` as
+        of 1.1.0 — a dataclass field cannot be removed from the typed surface
+        and kept in the constructor.
+
+        Observing either limit still means watching for a
+        ``ValidationCode.TOO_MUCH_MEMORY`` / ``TOO_MUCH_DISK`` result.
     """
 
     id: UUID
@@ -237,11 +251,50 @@ class PolicyResource:
     max_cores: int | None = None
     max_processes: int | None = None
     max_uses: int | None = None
-    max_memory: int | None = None
-    max_disk: int | None = None
     heartbeat_duration: int | None = None
     require_heartbeat: bool = False
     machine_uniqueness_strategy: str = "UNIQUE_PER_LICENSE"
+
+    # Deliberately invisible to type checkers. `__getattr__` on a class makes
+    # mypy accept *any* attribute name on it, which would erase the very
+    # typing this dataclass exists to provide — and would hand a caller still
+    # reading `policy.max_memory` no signal at all until 2.0.0 deletes the
+    # shim under them. Hiding it inverts that: static analysis reports the
+    # attribute as gone now (the actionable, non-fatal warning Python
+    # otherwise cannot give on a minor), while the runtime keeps serving the
+    # same `None` the field always held.
+    if not TYPE_CHECKING:
+
+        def __getattr__(self, name: str) -> None:
+            """Serve a removed phantom limit, with a deprecation warning.
+
+            Only reached for names normal attribute lookup did not find, so it
+            costs nothing on any real field. Whether a caller sees the warning
+            more than once is the interpreter's default dedup-per-location
+            filtering, not anything this does.
+
+            Args:
+                name: The attribute that was not found on the instance.
+
+            Returns:
+                ``None`` for ``max_memory``/``max_disk`` — the value those
+                fields carried for their whole existence.
+
+            Raises:
+                AttributeError: For every other name, exactly as before.
+            """
+            if name in _REMOVED_PHANTOM_LIMITS:
+                warnings.warn(
+                    f"PolicyResource.{name} is deprecated and will be removed in "
+                    f"tamga-sdk {_PHANTOM_LIMIT_REMOVAL_VERSION}. No policy "
+                    "serializer emits this field, so it was always None and can "
+                    "never be anything else; watch for a TOO_MUCH_MEMORY / "
+                    "TOO_MUCH_DISK validation code instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                return None
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     @property
     def effective_heartbeat_window_seconds(self) -> int:
@@ -334,8 +387,6 @@ class PolicyResource:
             max_cores=attributes.get("max_cores"),
             max_processes=attributes.get("max_processes"),
             max_uses=attributes.get("max_uses"),
-            max_memory=attributes.get("max_memory"),
-            max_disk=attributes.get("max_disk"),
             heartbeat_duration=attributes.get("heartbeat_duration"),
             require_heartbeat=bool(attributes.get("require_heartbeat", False)),
             machine_uniqueness_strategy=attributes.get(
