@@ -824,12 +824,19 @@ class MachinesClient:
     def ping_heartbeat(self, machine_id: UUID) -> MachineResource:
         """``POST /machines/{id}/actions/ping-heartbeat``, no body. Sets ``last_heartbeat_at``.
 
-        A bare, unconditional ``UPDATE`` server-side: it revives a machine
-        currently reporting ``DEAD`` just as readily as it refreshes a live
-        one, and it is safe to repeat (it is retried after a ``429``; see
-        ``_is_retryable``). The only response that means the row is really
-        gone is ``404`` — ``tamga.errors.NotFoundError`` — which is the signal
-        to re-activate.
+        A bare, unconditional ``UPDATE`` server-side, with no liveness
+        precondition: it revives a machine whose window had long since lapsed
+        just as readily as it refreshes a live one, and it is safe to repeat
+        (it is retried after a ``429``; see ``_is_retryable``). The only
+        response that means the row is really gone is ``404`` —
+        ``tamga.errors.NotFoundError`` — which is the signal to re-activate.
+
+        Warning:
+            **Do not branch on the returned ``heartbeat_status``.** The server
+            derives it from the very ``last_heartbeat_at`` this call just set
+            to ``NOW()``, so the computed age is ~0 and the answer is always
+            ``ALIVE`` or ``RESURRECTED``. A ping can never report ``DEAD``,
+            and no route this SDK exposes can — see ``HeartbeatStatus``.
 
         Note:
             The ``next_heartbeat_at`` on this response is computed without
@@ -1208,11 +1215,14 @@ class HeartbeatScheduler:
     against a policy with a shorter window the interval must be passed
     explicitly — a fixed 200s ping is not safe under, say, a 120s window.
 
-    ``DEAD`` does not stop the loop. It means only "the last ping is older than
-    the window": it does not imply the machine row is gone, and under the
-    default policy (``require_heartbeat`` defaults to ``false``) the culling
-    worker returns immediately and nothing is ever deleted. Pinging a ``DEAD``
-    machine succeeds and revives it.
+    **No heartbeat status ends this loop.** The loop pings until ``stop()`` is
+    called, the caller's runtime cancels it, or the ping returns ``404`` — that
+    last one being the only signal that the machine row is really gone.
+    Nothing is read off the response to decide whether to continue, and nothing
+    should be: the ping's own write makes its ``heartbeat_status`` always
+    ``ALIVE`` or ``RESURRECTED`` (see ``MachinesClient.ping_heartbeat``), so a
+    status check here can only ever be dead code or, worse, a stop condition
+    that fires on a value the route cannot produce.
 
     Attributes:
         machine_id: The machine to ping.
@@ -1233,20 +1243,25 @@ class HeartbeatScheduler:
     def run_forever(self) -> None:
         """Ping on ``self.interval`` until stopped, cancelled, or the machine is gone.
 
-        Keeps pinging through a ``DEAD`` status. This loop used to ``break`` on
-        the first ``DEAD`` reading, which was unrecoverable: nothing restarted
-        it, so a machine that merely missed one window — the common case, since
-        ``require_heartbeat`` defaults to ``false`` and the culling worker then
-        deletes nothing — stopped heartbeating permanently and drifted into
-        looking abandoned. The ping is an unconditional
-        ``last_heartbeat_at = NOW()`` write with no liveness precondition, so
-        the very next one revives the machine.
+        The loop stops for exactly three reasons: ``stop()`` was called, the
+        caller's runtime cancelled it, or the ping raised. It never inspects
+        the returned status.
 
-        The one status that does end the loop is the row actually being gone,
-        and the server reports that as ``404`` on the ping itself: the
-        resulting ``tamga.errors.NotFoundError`` propagates to the caller, who
-        should re-activate via ``MachinesClient.activate_machine``. Nothing
-        else is treated as fatal here.
+        It used to ``break`` when the response reported ``DEAD``, which was
+        wrong twice over. Wrong in effect: the break was permanent, nothing
+        restarted the loop, so one bad reading ended heartbeating for the life
+        of the process even though the ping is an unconditional
+        ``last_heartbeat_at = NOW()`` write that would have revived the machine
+        on the very next attempt. And wrong in premise: a ping response cannot
+        say ``DEAD`` at all, because the status is computed from the timestamp
+        the same call just wrote. The condition was unreachable *and*
+        catastrophic if reached — so the rule is the general one, not a
+        narrower "don't stop on ``DEAD``": **do not stop on any status.**
+
+        The row actually being gone is reported as ``404`` on the ping, not as
+        a status: the resulting ``tamga.errors.NotFoundError`` propagates to
+        the caller, who should re-activate via
+        ``MachinesClient.activate_machine``. That is the only terminal signal.
         """
         while not self._stop:
             self.machines.ping_heartbeat(self.machine_id)

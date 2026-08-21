@@ -223,6 +223,13 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
   `get_license`, or `get_license_policy`, so a client cannot read the policy-correct heartbeat
   window, and `activate_machine` cannot recover from `409 FINGERPRINT_TAKEN` by looking up the
   existing machine — activation is not idempotent.
+- **`heartbeat_status` never reads `DEAD` through this SDK.** It is a real server state, but the
+  three routes that return a machine here all preclude it: a heartbeat ping reports the timestamp
+  it just wrote (always `ALIVE` or `RESURRECTED`), a reset nulls it (`NOT_STARTED`), and a create
+  never sets it (`NOT_STARTED`). `DEAD` is only visible from a machine read, which this SDK does
+  not offer — so do not write code that waits for it. `HeartbeatScheduler` correspondingly stops
+  for no status at all: only `stop()`, cancellation, or a `404` from the ping (the row is gone —
+  re-activate) ends the loop.
 - **No process delete.** Nothing reaps process rows server-side, so a crashed process holds its
   slot against `policy.max_processes` until the row is deleted, and this SDK exposes no way to
   delete it.

@@ -20,14 +20,31 @@ class HeartbeatStatus(str, Enum):
     600 seconds only when that column is unset — it is not a fixed constant, so
     a ping interval sized against 600s is unsafe under a shorter policy.
 
-    ``DEAD`` means exactly one thing: the last ping is older than the window.
-    It does **not** mean the machine row was deleted. The culling worker skips
-    any policy with ``require_heartbeat: false`` — the default — so under a
-    default policy nothing is ever culled and a ``DEAD`` machine keeps its row
-    and its seat indefinitely. Keep pinging: the ping is an unconditional
-    ``last_heartbeat_at`` write and revives the machine. A ``404`` on the ping
-    is the only signal that the row is genuinely gone. Cull/resurrection
-    behavior, where enabled, is described by ``HeartbeatCullStrategy`` and
+    **``DEAD`` cannot be observed through any call this SDK makes.** It is a
+    real server-side state, but every route this SDK exposes returns a machine
+    that is definitionally not in it:
+
+    - ``ping_heartbeat`` sets ``last_heartbeat_at = NOW()`` and then derives
+      the status from that same timestamp, so the age is ~0 → ``ALIVE`` or
+      ``RESURRECTED``.
+    - ``reset_heartbeat`` nulls the timestamp → ``NOT_STARTED``.
+    - ``machines.create`` never sets it → ``NOT_STARTED``.
+    - License validation never emits ``ValidationCode.HEARTBEAT_DEAD``.
+
+    ``DEAD`` becomes visible only from a machine *read* (``GET /machines/{id}``
+    or the machine list), which this SDK version does not offer. So do not
+    write code that waits for ``DEAD``, and above all do not treat it as a stop
+    condition — see ``tamga.client.HeartbeatScheduler``, where exactly that
+    branch was both unreachable and, had it fired, unrecoverable.
+
+    When ``DEAD`` does become readable, it will still mean only "the last ping
+    is older than the window" — never "the row was deleted". The culling worker
+    skips any policy with ``require_heartbeat: false``, which is the default,
+    so under a default policy nothing is culled and a machine past its window
+    keeps its row and its seat indefinitely; the ping is an unconditional
+    ``last_heartbeat_at`` write that revives it. A ``404`` on the ping is the
+    only signal that the row is genuinely gone. Cull/resurrection behavior,
+    where enabled, is described by ``HeartbeatCullStrategy`` and
     ``HeartbeatResurrectionStrategy`` in ``tamga.models.policy``.
     """
 

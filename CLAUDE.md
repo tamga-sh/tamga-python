@@ -191,13 +191,24 @@ wrong — these replace it.
   explicit interval. Do not schedule off the ping response's `next_heartbeat_at`: that code path
   does not join the policy. Reading the policy-correct value needs `GET /machines/{id}` or
   `GET /licenses/{id}/policy`, neither of which this SDK exposes yet.
-- **`DEAD` never stops the heartbeat loop.** `DEAD` means only "the last ping is older than the
-  window". It does not imply the row was deleted, and `require_heartbeat` defaults to `false`, so
-  under a default policy the culling worker returns immediately and nothing is ever culled. The
-  ping is an unconditional `last_heartbeat_at = NOW()` write with no liveness precondition, so it
-  revives a `DEAD` machine. `HeartbeatScheduler.run_forever` used to `break` on the first `DEAD`
-  reading — permanently, with nothing to restart it. The only signal that the row is really gone
-  is a `404` from the ping itself; that propagates to the caller, who re-activates.
+- **The heartbeat loop must not stop on any status — and `DEAD` is not even observable.** State the
+  rule as the general one: `HeartbeatScheduler.run_forever` pings until `stop()`, until the
+  runtime cancels it, or until the ping raises. It reads nothing off the response to decide
+  whether to continue. `DEAD` is a real server-side state but no route this SDK calls can return
+  it: `ping-heartbeat` writes `last_heartbeat_at = NOW()` and then derives the status from that
+  same timestamp (age ~0 → always `ALIVE` or `RESURRECTED`), `reset-heartbeat` nulls it
+  (`NOT_STARTED`), `POST /machines` never sets it (`NOT_STARTED`), and validation never emits
+  `HEARTBEAT_DEAD`. It becomes readable only from `GET /machines/{id}` or the machine list, which
+  this SDK does not expose yet (M11/M36). `run_forever` used to `break` on a `DEAD` response —
+  a condition the route cannot produce, and one that would have been catastrophic if it ever did,
+  since the break was permanent with nothing to restart the loop. Do not reintroduce a
+  status-based stop condition in any form, do not delete the `DEAD` enum member or the
+  `heartbeat_status` field (both are part of the wire model and go live with a machine read), and
+  do not write `if status == DEAD` branches in examples. The only terminal signal is a `404` from
+  the ping, which propagates to the caller for re-activation. When `DEAD` does become readable it
+  will still mean only "last ping older than the window", never "row deleted" —
+  `require_heartbeat` defaults to `false`, so a default policy culls nothing and the ping revives
+  the machine anyway.
 - **`reset_heartbeat` and `generate_offline_proof` always 403 under license-key auth.** Both are
   gated on the caller's *role* (admin / developer / product token / environment token), not just a
   permission, and a `LicenseToken` holds none of them — even though it does hold

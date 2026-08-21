@@ -3,11 +3,11 @@
 Machines and processes have very different heartbeat windows:
 - Machines: the window is the license policy's `heartbeat_duration`, defaulting
   to 600s (10 min) when unset; ping every ~1/3 of it (~200s against the
-  default). A DEAD status means only that the last ping is older than the
-  window — the row is still there, and the next ping revives it, so keep
-  pinging. The one signal that the machine is really gone is a 404 from the
-  ping itself, which propagates out of `run_forever` for the caller to
-  re-activate on.
+  default). Never stop the loop on a heartbeat status — a ping response reports
+  the timestamp it just wrote, so it is always ALIVE or RESURRECTED, and DEAD
+  is not reachable from any call this SDK makes. The one signal that the
+  machine is really gone is a 404 from the ping itself, which propagates out of
+  `run_forever` for the caller to re-activate on.
 - Processes: 30s window with NO resurrection grace period, ping every ~10s.
   Nothing reaps process rows server-side, so stopping the loop does not free
   the process slot.

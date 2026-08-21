@@ -305,12 +305,14 @@ def test_heartbeat_scheduler_keeps_pinging_after_a_dead_observation(
     make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # DEAD means "the last ping is older than the window" — not "the row is
-    # gone". `require_heartbeat` defaults to false, so under a default policy
-    # nothing is ever culled, and the ping is an unconditional
-    # `last_heartbeat_at = NOW()` write that revives the machine. Breaking out
-    # of the loop here used to be permanent: nothing restarted it, so one
-    # missed window silently ended heartbeating for the life of the process.
+    # A defensive test, deliberately mocking a response the real server cannot
+    # send. A ping writes `last_heartbeat_at = NOW()` and derives the status
+    # from that same timestamp, so it always answers ALIVE or RESURRECTED —
+    # DEAD is only reachable from a machine read this SDK does not expose. The
+    # loop used to `break` on DEAD anyway: unreachable in practice, and
+    # permanent if it ever fired, since nothing restarted it. So the rule under
+    # test is the general one — no status ends the loop — and feeding it the
+    # one status that used to be fatal is the sharpest way to hold that.
     ping_count = {"n": 0}
     scheduler_box: dict[str, HeartbeatScheduler] = {}
 
@@ -318,7 +320,7 @@ def test_heartbeat_scheduler_keeps_pinging_after_a_dead_observation(
         ping_count["n"] += 1
         if ping_count["n"] >= 3:
             scheduler_box["scheduler"].stop()
-        # Every ping reports DEAD; the loop must not care.
+        # Every ping reports DEAD; the loop must not read the status at all.
         return httpx.Response(200, json={"data": _machine_data("DEAD")})
 
     client = make_client(handler)
@@ -329,7 +331,7 @@ def test_heartbeat_scheduler_keeps_pinging_after_a_dead_observation(
     monkeypatch.setattr("tamga.client.time.sleep", lambda _seconds: None)
     scheduler.run_forever()
 
-    assert ping_count["n"] == 3, "a DEAD status must not end the heartbeat loop"
+    assert ping_count["n"] == 3, "no heartbeat status may end the loop"
 
 
 def test_heartbeat_scheduler_surfaces_a_404_from_the_ping(
