@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file. This file i
 [Conventional Commits](https://www.conventionalcommits.org/) history — do not hand-edit entries
 below the `[Unreleased]` header.
 
+## [1.1.0](https://github.com/tamga-sh/tamga-python/compare/v1.0.4...v1.1.0) (2026-08-21)
+
+
+### Features
+
+* correct two Policy typed-surface defects (M38, M9) ([d2ecc1c](https://github.com/tamga-sh/tamga-python/commit/d2ecc1c6bbfc123fbe5d2c2e35ab08da0272c1d3))
+* drop the two policy limits no serializer emits ([fefbac0](https://github.com/tamga-sh/tamga-python/commit/fefbac07e54587bc151961e91629931f16857c19))
+* read the check-in cadences the server can actually store ([eb11d3e](https://github.com/tamga-sh/tamga-python/commit/eb11d3ea0dac13016bc1599f068f5fbfefab6506))
+
+
+### Bug Fixes
+
+* keep release-please looking for the tags this repo actually has ([#32](https://github.com/tamga-sh/tamga-python/issues/32)) ([8481316](https://github.com/tamga-sh/tamga-python/commit/8481316ef63f8d4e1f74cf44787bd4c354fbe2e0))
+* let release-please see its own config, so __version__ tracks releases ([#30](https://github.com/tamga-sh/tamga-python/issues/30)) ([5b32697](https://github.com/tamga-sh/tamga-python/commit/5b326971f76b7736b1b684ee63f38ab4055061a4))
+
+
+### Documentation
+
+* stop implying the cadence enum is the whole check-in schedule ([310a263](https://github.com/tamga-sh/tamga-python/commit/310a263e8f8a96de5fb7a3c9abc17491c01aa07a))
+
 ## [1.0.4](https://github.com/tamga-sh/tamga-python/compare/v1.0.3...v1.0.4) (2026-08-21)
 
 
