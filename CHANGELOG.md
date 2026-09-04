@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file. This file i
 [Conventional Commits](https://www.conventionalcommits.org/) history — do not hand-edit entries
 below the `[Unreleased]` header.
 
+## [1.1.2](https://github.com/tamga-sh/tamga-python/compare/v1.1.1...v1.1.2) (2026-09-04)
+
+
+### Bug Fixes
+
+* **deps:** require Python 3.9.2 so the lockfile can drop cryptography 47 ([#35](https://github.com/tamga-sh/tamga-python/issues/35)) ([77da7bb](https://github.com/tamga-sh/tamga-python/commit/77da7bb2ec1ff0e2a5af7c7abe31ac955e1dcabe))
+
 ## [1.1.1](https://github.com/tamga-sh/tamga-python/compare/v1.1.0...v1.1.1) (2026-08-21)
 
 
