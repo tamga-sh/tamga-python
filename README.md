@@ -19,7 +19,7 @@ RSA-PKCS1/PSS, ECDSA-P256, AES-256-GCM, HKDF-SHA256) comes from the
 pip install tamga-sdk
 ```
 
-Requires Python 3.9+. The distribution is named `tamga-sdk` (the bare `tamga` name on PyPI
+Requires Python 3.9.2+ (3.9.0 and 3.9.1 are excluded by `cryptography` 48+). The distribution is named `tamga-sdk` (the bare `tamga` name on PyPI
 belongs to an unrelated logging library); the **importable package is `tamga`**:
 
 ```python
