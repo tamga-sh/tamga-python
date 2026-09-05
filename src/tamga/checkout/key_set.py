@@ -172,10 +172,14 @@ class SigningKeyNotPublishedError(UnknownSigningKeyError):
     ``key_id(account.ed25519_public_key.as_deref().unwrap_or_default())``.
 
     So: the client's key set is not stale, and no key it could obtain would
-    verify this file. Somebody has to rotate the account's signing key
-    server-side (which backfills the column on its way through). Subclasses
-    :class:`UnknownSigningKeyError` so a caller that only wants "not verifiable
-    with the keys I have" still catches it with one ``except``.
+    verify this file — it is a **pre-patch** artifact, issued before the account
+    ever published a key. A fresh checkout is the fix: the patched server
+    publishes every account's key from creation, backfills existing accounts at
+    startup, and refuses check-out outright with ``422 SIGNING_KEY_MISSING``
+    (:class:`tamga.errors.SigningKeyMissingError`) rather than signing with
+    nothing. Subclasses :class:`UnknownSigningKeyError` so a caller that only
+    wants "not verifiable with the keys I have" still catches it with one
+    ``except``.
     """
 
     def __init__(self, kid: str, available: Iterable[str]) -> None:
@@ -185,9 +189,9 @@ class SigningKeyNotPublishedError(UnknownSigningKeyError):
             available,
             message=(
                 f"the file names key {kid!r}, which is the id of the EMPTY key — the "
-                "signing account has no published Ed25519 public key, so no key set "
-                "can verify this file. The account's signing key must be rotated "
-                "server-side (which backfills it). Refetching the key set will not help."
+                "signing account had no published Ed25519 public key when this file was "
+                "issued, so no key set can verify it. This predates the API patch; "
+                "refetching the key set will not help, but a fresh checkout will."
             ),
         )
 

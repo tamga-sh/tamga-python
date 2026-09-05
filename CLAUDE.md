@@ -520,7 +520,9 @@ wrong — these replace it.
   response the server built off a write it just performed cannot: `ping-heartbeat` writes
   `last_heartbeat_at = NOW()` and derives the status from that same timestamp (age ~0 → always
   `ALIVE` or `RESURRECTED`), `reset-heartbeat` nulls it (`NOT_STARTED`), `POST /machines` never
-  sets it (`NOT_STARTED`), and validation never emits `HEARTBEAT_DEAD`. **Machine checkout is a
+  sets it (`NOT_STARTED`); validation's own `HEARTBEAT_DEAD` is a separate `meta.code`, not this
+  field — since the API patch it comes from the fingerprint scope under `policy.require_heartbeat`
+  (see the reachability bullet above), not from a write here. **Machine checkout is a
   read** — it resolves the row by id, with the policy joined and nothing just written — so the
   status inside the signed machine-file payload is a genuine staleness verdict and can be `DEAD`.
   This repo surfaces it: `checkout/machine_file.py` parses `heartbeat_status` (leniently, with a

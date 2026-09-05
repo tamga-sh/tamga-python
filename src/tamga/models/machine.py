@@ -32,7 +32,10 @@ class HeartbeatStatus(str, Enum):
       ``RESURRECTED``.
     - ``machines.reset_heartbeat`` nulls the timestamp → ``NOT_STARTED``.
     - ``machines.create`` never sets it → ``NOT_STARTED``.
-    - License validation never emits ``ValidationCode.HEARTBEAT_DEAD``.
+    - License validation is a separate resource with its own ``ValidationCode.HEARTBEAT_DEAD``
+      member — since the API patch it *is* emitted, by the fingerprint scope under
+      ``policy.require_heartbeat``, but that is a validation result's ``meta.code``, not this
+      field on a machine resource.
 
     **Genuinely, from machine checkout.** ``machines.check_out`` resolves the
     machine by id — a read of a row nobody just touched, with the policy joined
