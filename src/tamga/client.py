@@ -1496,6 +1496,7 @@ class MachinesClient:
                 validation_code=equivalent,
                 rolled_back=False,
                 pointer=exc.pointer,
+                meta=exc.meta,
             ) from exc
 
         licenses = LicensesClient(_http=self._http, _config=self._config)
@@ -1708,20 +1709,27 @@ class MachinesClient:
         Fast path first: a same-license conflict names the machine in
         ``meta.machineId`` (``FingerprintTakenError.existing_machine_id``), so
         one ``get`` replaces the paginated search. The search is the fallback
-        for a pre-patch server, for a conflict that carried no ``meta``, and
-        for the race where the named row was deleted between the two calls —
-        the ``get`` answers 404, the search finds nothing, and the caller
-        re-raises the conflict, never the 404. Any other failure of the ``get``
-        propagates. Only a same-license conflict carries ``meta``, so an
-        adopted machine is always this license's own seat; the search keeps
-        the ``license_id`` scoping for the same reason.
+        for a pre-patch server, for a conflict that carried no ``meta``, for
+        the race where the named row was deleted between the two calls (the
+        ``get`` answers 404), and for the fast path naming a machine whose
+        fingerprint does not actually match — ``MachinesClient.get`` is
+        account-scoped, not license-scoped, so ``meta.machineId`` is only the
+        server's say-so until checked against ``fingerprint`` here. In every
+        one of those cases the search finds nothing and the caller re-raises
+        the conflict, never a 404 or a wrongly-adopted machine. Any other
+        failure of the ``get`` propagates. Only a same-license conflict
+        carries ``meta``, so a fingerprint-matched adoption is always this
+        license's own seat; the search keeps the ``license_id`` scoping for
+        the same reason.
         """
         machine_id = conflict.existing_machine_id
         if machine_id is not None:
             try:
-                return self.get(machine_id)
+                existing = self.get(machine_id)
             except NotFoundError:
-                pass
+                existing = None
+            if existing is not None and existing.fingerprint == fingerprint:
+                return existing
         return self.find_by_fingerprint(fingerprint, license_id=license_id)
 
     def ping_heartbeat(self, machine_id: UUID) -> MachineResource:
