@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file. This file i
 [Conventional Commits](https://www.conventionalcommits.org/) history — do not hand-edit entries
 below the `[Unreleased]` header.
 
+## [1.1.3](https://github.com/tamga-sh/tamga-python/compare/v1.1.2...v1.1.3) (2026-09-05)
+
+
+### Bug Fixes
+
+* carry the error meta, type the two key-material 422s, and adopt the machine a 409 names ([3c1a623](https://github.com/tamga-sh/tamga-python/commit/3c1a6234a900e910dbdfbc319d4332d19a19af46))
+* **checkout:** reject a fast-path machine whose fingerprint doesn't match ([8e33802](https://github.com/tamga-sh/tamga-python/commit/8e33802f6c3bbab766da0a584fe985fed3e3538b))
+* error meta, key-material 422s, meta.machineId fast path (1.1.3) ([a7f9c54](https://github.com/tamga-sh/tamga-python/commit/a7f9c5406e2db0a78586ace927b7525f4ef5db72))
+
+
+### Documentation
+
+* fix three remaining doc contradictions with the pre-patch/API-patch reframing ([05498a9](https://github.com/tamga-sh/tamga-python/commit/05498a990d4710d24a46e91a65066b8f2e337cf5))
+* reword the two remaining stale empty-key-set claims to the pre-patch framing ([9b46745](https://github.com/tamga-sh/tamga-python/commit/9b46745c3cec33beaf4355c35a062439fb42eabf))
+
 ## [1.1.2](https://github.com/tamga-sh/tamga-python/compare/v1.1.1...v1.1.2) (2026-09-04)
 
 
