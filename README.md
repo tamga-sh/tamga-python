@@ -439,8 +439,10 @@ Three things worth knowing about `client.accounts.list_signing_keys()` / `signin
   credential does not hold, and there is no license-scoped alternative route. An embedded client
   doing offline verification is precisely the one that cannot call it — pin the keys instead. An
   offline verifier that only works while it has a network is not offline.
-- **An empty result is normal, not an error.** The key-history table is only written by a
-  rotation, so an account that has never rotated has no rows and the endpoint returns `[]`.
+- **An empty result marks a pre-patch server.** Since the API patch every account publishes its
+  active key from creation and existing accounts were backfilled at startup; before it, the key
+  table was written only by a rotation. Files stamped with `key_id("")` come from that era and are
+  cured by a fresh checkout, not by refetching the key set.
 - **Retired keys are included on purpose.** That is the whole feature: a client holding a file
   signed months ago needs the key that signed it.
 
@@ -622,11 +624,12 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
   rate-limit signal this SDK reads (`src/tamga/transport.py::parse_retry_after`), and only its
   delta-seconds form is honored — the HTTP-date form is ignored rather than risking a date being
   misread as a duration.
-- **8 of the 24 `ValidationCode` members are declared but never emitted today** (`BANNED`,
-  `TOO_MANY_USERS`, `HEARTBEAT_DEAD`, `HEARTBEAT_NOT_STARTED`, `COMPONENTS_SCOPE_MISMATCH`,
-  `NOT_FOUND` — which comes back as a raw HTTP 404 — and the `CHECKSUM`/`VERSION` scope
-  mismatches, whose scope keys are rejected outright rather than evaluated). Per-member
-  reachability is documented in `src/tamga/models/validation.py`.
+- **5 of the 24 `ValidationCode` members are declared but never emitted** (`BANNED`,
+  `COMPONENTS_SCOPE_MISMATCH`, `NOT_FOUND` — which comes back as a raw HTTP 404 — and the
+  `CHECKSUM`/`VERSION` scope mismatches, whose scope keys are rejected outright rather than
+  evaluated). `HEARTBEAT_NOT_STARTED` / `HEARTBEAT_DEAD` (fingerprint scope under
+  `require_heartbeat`) and `TOO_MANY_USERS` are reachable since the API patch; none is an
+  over-limit code. Per-member reachability is documented in `src/tamga/models/validation.py`.
 - **Six `LicenseScope` fields are enforced** — `product`, `policy`, `user`, `environment`,
   `entitlements`, and `fingerprint`. `version` and `checksum` are **not** ignored: sending either
   makes the server reject the entire validate call with `422 SCOPE_NOT_SUPPORTED`, so this SDK

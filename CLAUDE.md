@@ -241,6 +241,10 @@ individually; see `.github/workflows/ci.yml` for the exact order
   `UnknownSigningKeyError`, because the remedy differs: refetching the key set cannot help and
   somebody has to rotate the account's key server-side (which backfills the column). Do not fold
   it back into the generic unknown-key error.
+  That rotation was the pre-patch remedy: a patched server publishes from creation, backfills at
+  startup and answers `422 SIGNING_KEY_MISSING` (`SigningKeyMissingError`) instead of signing with
+  nothing, so the id now dates a file — a fresh checkout cures it — rather than diagnosing a live
+  account.
 - **Key-set selection verifies first and reads the `kid` last — do not invert it.** The claim
   lives *inside* the signed (and possibly encrypted) payload, so resolving by `kid` first would
   mean parsing attacker-supplied bytes before anything vouched for them, breaking the ordering
@@ -312,12 +316,14 @@ wrong — these replace it.
   retryable auth failure. Likewise `expiration_strategy: REVOKE_ACCESS` stops an expired license
   from authenticating at all (`401 LICENSE_EXPIRED`); the other three strategies still
   authenticate it and report expiry via the validation `meta.code`.
-- **16 of 24 `ValidationCode` values are reachable.** Model all 24 with the lenient
-  unknown-value fallback. `ENTITLEMENTS_MISSING` and `FINGERPRINT_SCOPE_MISMATCH` are now
+- **19 of 24 `ValidationCode` values are reachable.** Model all 24 with the lenient
+  unknown-value fallback. `ENTITLEMENTS_MISSING` and `FINGERPRINT_SCOPE_MISMATCH` are
   genuinely emitted — `scope.entitlements` and `scope.fingerprint` are enforced (codes compared
   case-insensitively and de-duplicated, satisfied by policy-inherited entitlements too; the
-  fingerprint matches any machine on the license regardless of heartbeat status). Still
-  unreachable: `BANNED`, `TOO_MANY_USERS`, `HEARTBEAT_DEAD`, `HEARTBEAT_NOT_STARTED`,
+  fingerprint matches any machine on the license regardless of heartbeat status). Since the API
+  patch `HEARTBEAT_NOT_STARTED`/`HEARTBEAT_DEAD` come from the fingerprint scope under
+  `policy.require_heartbeat` and `TOO_MANY_USERS` from all three validate routes; none of the
+  three joins `activate_machine`'s over-limit set. Still unreachable: `BANNED`,
   `COMPONENTS_SCOPE_MISMATCH`, `NOT_FOUND` (raw HTTP 404 instead), and
   `CHECKSUM_SCOPE_MISMATCH`/`VERSION_SCOPE_MISMATCH` — the latter two because those scope keys are
   *rejected* rather than evaluated (see below).
@@ -441,16 +447,17 @@ wrong — these replace it.
   `UPDATE`s, so repeating them is safe. Creates stay excluded — retrying `POST /machines` risks
   burning a second seat. When the retry budget is spent the caller gets `errors.RateLimitedError`
   carrying `retry_after`.
-- **`GET /signing-keys` is unreachable with a license key, and an empty result is normal.**
+- **`GET /signing-keys` is unreachable with a license key, and an empty result marks a pre-patch server.**
   `accounts/policy.rs:16-18` gates it on `account.read`, which `Role::LicenseToken`'s fixed
   permission set does not contain (`shared/authz/mod.rs:241-267`) — and unlike `policies.get` /
   `licenses.get_policy` there is no second route serving the same resource under a permission it
   does hold. The embedded client doing offline verification is exactly the one that gets `403`, so
   `SigningKeySet.from_public_keys` (pin keys at build time) is the documented answer, not a
-  fallback. Separately, `account_signing_keys` is written **only** by `rotate_ed25519`, which
-  backfills the account's current key on its way through, so an account that has never rotated has
-  no rows and the endpoint answers `{"data": []}` — a healthy account, not a failure. Retired keys
-  **are** returned, newest first; that is the whole point of the route.
+  fallback.
+  Separately, an empty `{"data": []}` marks a **pre-patch** server: before the API patch
+  `account_signing_keys` was written only by `rotate_ed25519`, while the patched API publishes
+  every account's key from creation and backfills existing accounts at startup.
+  Retired keys **are** returned, newest first; that is the whole point of the route.
 - **The signing-key resource `id` IS the `kid`, and `publicKey` is its one camelCase attribute.**
   `accounts/serializer.rs:119-123` sets `id: k.kid` with a comment saying exactly that, which is
   why a fetched key needs no local hashing — `key_id` is for the pinned/offline case and

@@ -21,13 +21,14 @@ verification. :meth:`SigningKeySet.from_public_keys` therefore takes public keys
 directly, so a set can be pinned into a binary, shipped in a config file, or
 handed over by a build step that used a privileged token.
 
-**An empty set is the ordinary state of a healthy account, not an error.**
-``account_signing_keys`` is written only by ``rotate_ed25519``, which backfills
-the account's current key on its way through (``signing_keys.rs``), so an
-account that has never rotated has no rows at all and the endpoint answers
-``{"data": []}``. Pin the account's published key with
-``SigningKey.ed25519(...)`` and verification works before the first rotation as
-well as after it.
+**An empty set marks a pre-patch server, not a healthy steady state.** Before
+the API patch ``account_signing_keys`` was written only by ``rotate_ed25519``,
+so an account that had never rotated had no rows and the endpoint answered
+``{"data": []}``; the patched server publishes every account's key from
+creation and backfills existing accounts at startup. Pin the account's
+published key with ``SigningKey.ed25519(...)`` when the endpoint is not
+reachable under your credential (see ``TamgaClient.accounts``), and
+verification works before and after any rotation.
 
 **Order of operations, and why it is this way round.** The obvious
 implementation reads the file's ``kid`` first and uses it to look a key up. That
@@ -92,9 +93,9 @@ class NoUsableSigningKeyError(SigningKeyError):
     as base64 of a 32-byte Ed25519 key. Raised **before** any signature check,
     so it says nothing about the file — only about the set.
 
-    An empty set is the normal state of an account that has never rotated; see
-    the module docstring. Pin the account's published key rather than treating
-    it as a failure.
+    An empty set marks a pre-patch server — an account that had never rotated
+    before the patch; see the module docstring. Pin the account's published
+    key rather than treating it as a failure.
 
     Attributes:
         available: The ``kid`` of every key that was present but unusable, in

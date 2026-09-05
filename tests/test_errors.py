@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from uuid import UUID
 
 import pytest
 
@@ -26,6 +27,9 @@ from tamga.errors import (
     PidTakenError,
     RateLimitedError,
     SchemeNotSupportedError,
+    SecretKeyMissingError,
+    SigningKeyMissingError,
+    TamgaError,
     TooManyProcessesError,
     TtlInvalidError,
     UnauthorizedError,
@@ -69,6 +73,10 @@ def test_parses_json_api_error_envelope(json_api_error_body: dict) -> None:
         ("LICENSE_SUSPENDED", 401, LicenseSuspendedError),
         ("LICENSE_EXPIRED", 401, LicenseExpiredError),
         ("LICENSE_NOT_ALLOWED", 401, LicenseNotAllowedError),
+        # Key-material codes from the API patch: the server now refuses to
+        # sign or mint with nothing instead of stamping key_id("").
+        ("SIGNING_KEY_MISSING", 422, SigningKeyMissingError),
+        ("SECRET_KEY_MISSING", 422, SecretKeyMissingError),
     ],
 )
 def test_each_typed_exception_raised_for_its_matching_code(
@@ -178,3 +186,53 @@ def test_license_not_allowed_is_a_configuration_error_not_a_bad_key() -> None:
     assert not isinstance(error, UnknownTamgaError)
     assert error.status == 401
     assert error.code == "LICENSE_NOT_ALLOWED"
+
+
+def test_meta_is_carried_and_fingerprint_taken_exposes_the_existing_machine() -> None:
+    # Exact wire shape from the API plan: a same-license FINGERPRINT_TAKEN
+    # names the machine already holding the fingerprint in meta.machineId.
+    body = json.dumps(
+        {
+            "errors": [
+                {
+                    "id": "e1",
+                    "status": "409",
+                    "code": "FINGERPRINT_TAKEN",
+                    "title": "Conflict",
+                    "detail": "already activated",
+                    "meta": {"machineId": "018f2f3a-0000-7000-8000-000000000051"},
+                }
+            ]
+        }
+    ).encode("utf-8")
+    error = parse_error_envelope(409, body)
+    assert isinstance(error, FingerprintTakenError)
+    assert error.meta == {"machineId": "018f2f3a-0000-7000-8000-000000000051"}
+    assert error.existing_machine_id == UUID("018f2f3a-0000-7000-8000-000000000051")
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [None, {}, {"machineId": None}, {"machineId": 42}, {"machineId": "not-a-uuid"}, "junk"],
+)
+def test_existing_machine_id_is_none_unless_a_uuid_string_was_sent(meta: object) -> None:
+    # A cross-license conflict carries no meta; a pre-patch server never sends
+    # one; anything malformed reads as absent rather than raising.
+    entry: dict = {"status": "409", "code": "FINGERPRINT_TAKEN", "detail": "taken"}
+    if meta is not None:
+        entry["meta"] = meta
+    error = parse_error_envelope(409, json.dumps({"errors": [entry]}).encode("utf-8"))
+    assert isinstance(error, FingerprintTakenError)
+    assert error.existing_machine_id is None
+
+
+def test_a_non_object_meta_is_dropped_not_kept() -> None:
+    body = json.dumps(
+        {"errors": [{"status": "409", "code": "FINGERPRINT_TAKEN", "detail": "t", "meta": "junk"}]}
+    ).encode("utf-8")
+    assert parse_error_envelope(409, body).meta is None
+
+
+def test_meta_defaults_to_none_on_a_directly_constructed_error() -> None:
+    # The new kwarg defaults to None, so every existing construction site keeps working.
+    assert TamgaError(status=500, code="X", detail="d").meta is None
