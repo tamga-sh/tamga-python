@@ -2274,10 +2274,11 @@ class AccountsClient:
             offline.
 
         Note:
-            **An empty list is normal, not an error.** ``account_signing_keys``
-            is written only by ``rotate_ed25519``, which backfills the account's
-            current key on its way through, so an account that has never rotated
-            has no rows and this returns ``[]``.
+            **An empty list marks a pre-patch server.** Before the API patch
+            ``account_signing_keys`` was written only by ``rotate_ed25519``, so an
+            account that had never rotated had no rows and this returned ``[]``;
+            the patched server publishes every account's key from creation and
+            backfills existing accounts at startup.
 
         Returns:
             The published keys. ``algorithm`` is ``"ed25519"`` on every row

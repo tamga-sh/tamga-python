@@ -308,8 +308,8 @@ class LicenseFile:
 
         Raises:
             tamga.checkout.key_set.NoUsableSigningKeyError: If the set holds no
-                usable Ed25519 key. An empty set is the normal state of an
-                account that has never rotated.
+                usable Ed25519 key. An empty set marks a pre-patch server — an
+                account that had never rotated before the patch.
             tamga.checkout.key_set.SigningKeyNotPublishedError: If the file names
                 the empty key — the signing account published none at all, and
                 refetching will not help.
