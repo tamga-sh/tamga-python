@@ -472,3 +472,129 @@ def test_idempotent_activation_lets_a_limit_rejection_through_untouched(
 
     assert excinfo.value.validation_code is ValidationCode.TOO_MANY_MACHINES
     assert excinfo.value.rolled_back is False
+
+
+def test_idempotent_activation_adopts_the_machine_the_conflict_names(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """A same-license conflict names the machine; one GET by id replaces the search."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.method == "POST":
+            # Exact wire shape from the API plan: meta.machineId is present
+            # only when the existing machine is on the requested license.
+            return httpx.Response(
+                409,
+                json={
+                    "errors": [
+                        {
+                            "id": "e1",
+                            "status": "409",
+                            "code": "FINGERPRINT_TAKEN",
+                            "title": "Conflict",
+                            "detail": "already activated",
+                            "meta": {"machineId": str(MACHINE_ID)},
+                        }
+                    ]
+                },
+            )
+        if request.url.path == f"{ACCOUNT_PATH}/machines/{MACHINE_ID}":
+            return httpx.Response(200, json={"data": _machine_data()})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    client = make_client(handler)
+    machine = client.machines.activate_machine_idempotent(LICENSE_ID, FINGERPRINT)
+
+    assert machine.id == MACHINE_ID
+    assert seen == [
+        f"POST {ACCOUNT_PATH}/machines",
+        f"GET {ACCOUNT_PATH}/machines/{MACHINE_ID}",
+    ]
+
+
+def test_idempotent_activation_falls_back_to_the_search_when_the_named_machine_mismatches(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """`meta.machineId`'s fingerprint disagrees with ours: don't adopt it, search instead.
+
+    `MachinesClient.get` is account-scoped, not license-scoped, so a fast-path
+    `get` succeeding is not proof the server named *our* machine. If its
+    fingerprint doesn't match, this must fall through to the license-scoped
+    search exactly as if `meta` had been absent — never return the mismatched
+    machine.
+    """
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.method == "POST":
+            return httpx.Response(
+                409,
+                json={
+                    "errors": [
+                        {
+                            "code": "FINGERPRINT_TAKEN",
+                            "detail": "taken",
+                            "meta": {"machineId": str(OTHER_MACHINE_ID)},
+                        }
+                    ]
+                },
+            )
+        if request.url.path == f"{ACCOUNT_PATH}/machines/{OTHER_MACHINE_ID}":
+            # Named by the server, but its fingerprint does not match ours.
+            return httpx.Response(
+                200, json={"data": _machine_data(machine_id=OTHER_MACHINE_ID, fingerprint="fp-xyz")}
+            )
+        assert request.url.params["filter[license]"] == str(LICENSE_ID)
+        return httpx.Response(200, json={"data": [_machine_data()], "meta": _page_meta(1, 1)})
+
+    client = make_client(handler)
+    machine = client.machines.activate_machine_idempotent(LICENSE_ID, FINGERPRINT)
+
+    assert machine.id == MACHINE_ID
+    assert seen == [
+        f"POST {ACCOUNT_PATH}/machines",
+        f"GET {ACCOUNT_PATH}/machines/{OTHER_MACHINE_ID}",
+        f"GET {ACCOUNT_PATH}/machines",
+    ]
+
+
+def test_idempotent_activation_falls_back_to_the_search_when_the_named_machine_is_gone(
+    make_client: Callable[[Callable[[httpx.Request], httpx.Response]], TamgaClient],
+) -> None:
+    """The named row was deleted in between: search, find nothing, re-raise the 409."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.method == "POST":
+            return httpx.Response(
+                409,
+                json={
+                    "errors": [
+                        {
+                            "code": "FINGERPRINT_TAKEN",
+                            "detail": "taken",
+                            "meta": {"machineId": str(MACHINE_ID)},
+                        }
+                    ]
+                },
+            )
+        if request.url.path == f"{ACCOUNT_PATH}/machines/{MACHINE_ID}":
+            return httpx.Response(404, json={"errors": [{"code": "NOT_FOUND", "detail": "gone"}]})
+        assert request.url.params["filter[license]"] == str(LICENSE_ID)
+        return httpx.Response(200, json={"data": [], "meta": _page_meta(1, 0)})
+
+    client = make_client(handler)
+    with pytest.raises(FingerprintTakenError) as excinfo:
+        client.machines.activate_machine_idempotent(LICENSE_ID, FINGERPRINT)
+
+    assert excinfo.value.code == "FINGERPRINT_TAKEN"
+    assert isinstance(excinfo.value.__cause__, FingerprintTakenError)
+    assert seen == [
+        f"POST {ACCOUNT_PATH}/machines",
+        f"GET {ACCOUNT_PATH}/machines/{MACHINE_ID}",
+        f"GET {ACCOUNT_PATH}/machines",
+    ]

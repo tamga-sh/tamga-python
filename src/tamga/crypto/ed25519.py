@@ -58,12 +58,16 @@ Both checkout handlers build the claim as
 which is this constant, SHA-256's well-known digest of nothing, truncated to
 eight bytes.
 
-Worth recognizing rather than reporting as just another unknown ``kid``. It is
-not a stale key set on the client's side and refetching will not help: the
-server published no key at all, so there is nothing a client could ever hold
-that would verify the file. That is an operator action (rotate the account's
-signing key, which backfills on its way through — ``signing_keys.rs``), and the
-message a support desk needs is a different one.
+Worth recognizing rather than reporting as just another unknown ``kid``, and
+worth dating: it is a **pre-patch** artifact. Before the API patch
+``account_signing_keys`` was written only by a rotation, so an account that had
+never rotated signed with this id; the patched server publishes every account's
+key from creation, backfills existing accounts at startup, repairs the Ed25519
+public half so new files carry a real ``kid``, and refuses check-out with
+``422 SIGNING_KEY_MISSING`` (``tamga.errors.SigningKeyMissingError``) rather
+than signing with nothing. A file stamped with this id therefore predates the
+patch: refetching the key set will not help, and a fresh checkout will — which
+is why it is its own error, ``SigningKeyNotPublishedError``.
 
 A published key can never carry this id: ``backfill_active_key`` returns early
 when the column is ``NULL``, so no row is written for a key that does not exist.

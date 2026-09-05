@@ -223,7 +223,7 @@ class TestLicenseFileKeySetVerification:
         # Still catchable as the broader condition, so a caller that only wants
         # "not verifiable with the keys I have" needs one `except`.
         assert isinstance(caught.value, UnknownSigningKeyError)
-        assert "rotated" in str(caught.value)
+        assert "fresh checkout" in str(caught.value)
         assert "not in the key set" not in str(caught.value)
 
     def test_an_empty_key_set_says_so_before_looking_at_the_file(

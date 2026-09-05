@@ -43,7 +43,8 @@ validation ``meta.code`` instead.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 if TYPE_CHECKING:
     from tamga.models.validation import ValidationCode
@@ -59,6 +60,11 @@ class TamgaError(Exception):
             never match on this field.
         pointer: JSON:API ``source.pointer`` value, if the server supplied
             one (points at the offending request field).
+        meta: The error object's ``meta`` member as the server sent it, or
+            ``None`` when absent or not a JSON object. Per-code: today only
+            ``FINGERPRINT_TAKEN`` populates it (``machineId``); read that
+            through ``FingerprintTakenError.existing_machine_id`` rather than
+            by key.
     """
 
     def __init__(
@@ -68,12 +74,14 @@ class TamgaError(Exception):
         code: str,
         detail: str,
         pointer: str | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> None:
         """Build a ``TamgaError``; see the class docstring for the attribute meanings."""
         self.status = status
         self.code = code
         self.detail = detail
         self.pointer = pointer
+        self.meta = meta
         super().__init__(f"{code} ({status}): {detail}")
 
 
@@ -122,7 +130,31 @@ class FingerprintTakenError(TamgaError):
     Raised for a duplicate ``(account_id, license_id, fingerprint)`` on
     machine creation, or ``(account_id, machine_id, fingerprint)`` on
     component creation.
+
+    On machine creation the server names the machine already holding the
+    fingerprint in ``meta.machineId`` — **only when that machine is on the
+    license the create was addressed to**. A conflict from another license
+    under ``UNIQUE_PER_POLICY``/``UNIQUE_PER_ACCOUNT`` carries no ``meta``,
+    because that machine is not the caller's to adopt.
+    ``MachinesClient.activate_machine_idempotent`` reads it to skip the
+    paginated search.
     """
+
+    @property
+    def existing_machine_id(self) -> UUID | None:
+        """The same-license machine already holding the fingerprint, if the server named it.
+
+        Parsed leniently: ``None`` when no ``meta`` was sent (a cross-license
+        conflict, or a pre-patch server), when ``machineId`` is absent, or
+        when it is not a UUID string.
+        """
+        raw = (self.meta or {}).get("machineId")
+        if not isinstance(raw, str):
+            return None
+        try:
+            return UUID(raw)
+        except ValueError:
+            return None
 
 
 class PidTakenError(TamgaError):
@@ -191,6 +223,26 @@ class LicenseKeyMissingError(TamgaError):
 
 class SchemeNotSupportedError(TamgaError):
     """422 ``SCHEME_NOT_SUPPORTED`` — e.g. ``RSA_2048_JWT_RS256`` rejected for machine checkout."""
+
+
+class SigningKeyMissingError(TamgaError):
+    """422 ``SIGNING_KEY_MISSING`` — the account holds no signing key for this operation.
+
+    Raised by license and machine check-out and by offline-proof generation
+    when the account has no key of the algorithm the operation needs. The
+    server refuses rather than signing with nothing; pre-patch servers issued
+    such files anyway with ``kid = key_id("")`` — see
+    ``tamga.crypto.ed25519.UNBACKFILLED_ACCOUNT_KEY_ID``. A server-side
+    condition: retrying cannot help, an operator has to rotate a key in.
+    """
+
+
+class SecretKeyMissingError(TamgaError):
+    """422 ``SECRET_KEY_MISSING`` — token minting refused: the account has no secret key.
+
+    Same remedy class as ``SigningKeyMissingError``: server-side configuration,
+    never retryable from the client.
+    """
 
 
 class DatasetInvalidError(TamgaError):
@@ -329,9 +381,10 @@ class MachineOverLimitError(TamgaError, ValueError):
         validation_code: ValidationCode,
         rolled_back: bool,
         pointer: str | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> None:
         """Build a ``MachineOverLimitError``; see the class docstring for attribute meanings."""
-        super().__init__(status=status, code=code, detail=detail, pointer=pointer)
+        super().__init__(status=status, code=code, detail=detail, pointer=pointer, meta=meta)
         self.validation_code = validation_code
         self.rolled_back = rolled_back
 
@@ -359,6 +412,8 @@ _CODE_TO_EXCEPTION: dict[str, type[TamgaError]] = {
     "LICENSE_NOT_ENCRYPTED": LicenseNotEncryptedError,
     "LICENSE_KEY_MISSING": LicenseKeyMissingError,
     "SCHEME_NOT_SUPPORTED": SchemeNotSupportedError,
+    "SIGNING_KEY_MISSING": SigningKeyMissingError,
+    "SECRET_KEY_MISSING": SecretKeyMissingError,
     "DATASET_INVALID": DatasetInvalidError,
     "MACHINE_LIMIT_EXCEEDED": MachineLimitExceededError,
     "CORE_LIMIT_EXCEEDED": CoreLimitExceededError,
@@ -395,11 +450,13 @@ def parse_error_envelope(status: int, body: bytes, retry_after: int | None = Non
     detail = first.get("detail", "")
     source = first.get("source") or {}
     pointer = source.get("pointer")
+    raw_meta = first.get("meta")
+    meta = raw_meta if isinstance(raw_meta, dict) else None
 
     if status == 429:
-        err = RateLimitedError(status=status, code=code, detail=detail, pointer=pointer)
+        err = RateLimitedError(status=status, code=code, detail=detail, pointer=pointer, meta=meta)
         err.retry_after = retry_after
         return err
 
     exc_cls = _CODE_TO_EXCEPTION.get(code, UnknownTamgaError)
-    return exc_cls(status=status, code=code, detail=detail, pointer=pointer)
+    return exc_cls(status=status, code=code, detail=detail, pointer=pointer, meta=meta)

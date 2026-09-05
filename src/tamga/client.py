@@ -1496,6 +1496,7 @@ class MachinesClient:
                 validation_code=equivalent,
                 rolled_back=False,
                 pointer=exc.pointer,
+                meta=exc.meta,
             ) from exc
 
         licenses = LicensesClient(_http=self._http, _config=self._config)
@@ -1618,8 +1619,10 @@ class MachinesClient:
            over-limit verdict. Anything it returns or raises other than
            ``FingerprintTakenError`` passes straight through, including
            ``MachineOverLimitError``.
-        2. On ``FingerprintTakenError``, look the machine up by exact
-           fingerprint **within this license** and return it.
+        2. On ``FingerprintTakenError``, adopt the machine ``meta.machineId``
+           names with one ``get`` — the server sends it only for a conflict on
+           this license — and otherwise look the machine up by exact
+           fingerprint **within this license**.
         3. If the lookup finds nothing, re-raise the conflict — with the
            original chained onto it — because there is nothing truthful to
            return.
@@ -1680,21 +1683,54 @@ class MachinesClient:
         try:
             return self.activate_machine(license_id, fingerprint, **attrs)
         except FingerprintTakenError as conflict:
-            existing = self.find_by_fingerprint(fingerprint, license_id=license_id)
+            existing = self._resolve_taken_fingerprint(conflict, license_id, fingerprint)
             if existing is not None:
                 return existing
             raise FingerprintTakenError(
                 status=conflict.status,
                 code=conflict.code,
                 detail=(
-                    f"{conflict.detail} — and no machine with this fingerprint is "
-                    f"registered to this license, so the conflict came from another "
-                    f"license under a wider machine-uniqueness scope. That machine is "
-                    f"deliberately not returned: this license does not own it, and "
-                    f"using it would consume a seat the license never paid for"
+                    f"{conflict.detail} — and no machine with this fingerprint could be "
+                    f"resolved on this license: the conflict came from another license "
+                    f"under a wider machine-uniqueness scope, or the row was removed "
+                    f"between the two calls. Another license's machine is deliberately "
+                    f"not returned — this license does not own it, and using it would "
+                    f"consume a seat the license never paid for"
                 ),
                 pointer=conflict.pointer,
+                meta=conflict.meta,
             ) from conflict
+
+    def _resolve_taken_fingerprint(
+        self, conflict: FingerprintTakenError, license_id: UUID, fingerprint: str
+    ) -> MachineResource | None:
+        """Find the machine a ``FINGERPRINT_TAKEN`` refused to duplicate.
+
+        Fast path first: a same-license conflict names the machine in
+        ``meta.machineId`` (``FingerprintTakenError.existing_machine_id``), so
+        one ``get`` replaces the paginated search. The search is the fallback
+        for a pre-patch server, for a conflict that carried no ``meta``, for
+        the race where the named row was deleted between the two calls (the
+        ``get`` answers 404), and for the fast path naming a machine whose
+        fingerprint does not actually match — ``MachinesClient.get`` is
+        account-scoped, not license-scoped, so ``meta.machineId`` is only the
+        server's say-so until checked against ``fingerprint`` here. In every
+        one of those cases the search finds nothing and the caller re-raises
+        the conflict, never a 404 or a wrongly-adopted machine. Any other
+        failure of the ``get`` propagates. Only a same-license conflict
+        carries ``meta``, so a fingerprint-matched adoption is always this
+        license's own seat; the search keeps the ``license_id`` scoping for
+        the same reason.
+        """
+        machine_id = conflict.existing_machine_id
+        if machine_id is not None:
+            try:
+                existing = self.get(machine_id)
+            except NotFoundError:
+                existing = None
+            if existing is not None and existing.fingerprint == fingerprint:
+                return existing
+        return self.find_by_fingerprint(fingerprint, license_id=license_id)
 
     def ping_heartbeat(self, machine_id: UUID) -> MachineResource:
         """``POST /machines/{id}/actions/ping-heartbeat``, no body. Sets ``last_heartbeat_at``.
@@ -2246,10 +2282,11 @@ class AccountsClient:
             offline.
 
         Note:
-            **An empty list is normal, not an error.** ``account_signing_keys``
-            is written only by ``rotate_ed25519``, which backfills the account's
-            current key on its way through, so an account that has never rotated
-            has no rows and this returns ``[]``.
+            **An empty list marks a pre-patch server.** Before the API patch
+            ``account_signing_keys`` was written only by ``rotate_ed25519``, so an
+            account that had never rotated had no rows and this returned ``[]``;
+            the patched server publishes every account's key from creation and
+            backfills existing accounts at startup.
 
         Returns:
             The published keys. ``algorithm`` is ``"ed25519"`` on every row

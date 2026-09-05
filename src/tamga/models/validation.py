@@ -22,13 +22,16 @@ class ValidationCode(str, Enum):
     subset is actually reachable against the current server — see the
     per-member docstrings.
 
-    Reachable today (✅), in the exact priority order the server evaluates
-    them for the validate-by-ID endpoint: VALID, SUSPENDED, EXPIRED,
-    OVERDUE, PRODUCT_SCOPE_MISMATCH, POLICY_SCOPE_MISMATCH,
-    USER_SCOPE_MISMATCH, ENVIRONMENT_SCOPE_MISMATCH,
-    FINGERPRINT_SCOPE_MISMATCH, ENTITLEMENTS_MISSING, TOO_MANY_MACHINES,
-    TOO_MANY_CORES, TOO_MUCH_MEMORY, TOO_MUCH_DISK, TOO_MANY_PROCESSES,
-    TOO_MANY_USES.
+    Reachable against the patched server (✅), in the server's evaluation
+    order for the validate-by-ID endpoint (first failing check wins):
+    SUSPENDED, EXPIRED, OVERDUE, FINGERPRINT_SCOPE_MISMATCH,
+    HEARTBEAT_NOT_STARTED, HEARTBEAT_DEAD, ENTITLEMENTS_MISSING,
+    PRODUCT_SCOPE_MISMATCH, POLICY_SCOPE_MISMATCH, USER_SCOPE_MISMATCH,
+    ENVIRONMENT_SCOPE_MISMATCH, TOO_MANY_MACHINES, TOO_MANY_CORES,
+    TOO_MUCH_MEMORY, TOO_MUCH_DISK, TOO_MANY_PROCESSES, TOO_MANY_USERS,
+    TOO_MANY_USES, then VALID — 19 of the 24. The two heartbeat verdicts come
+    from the fingerprint scope under ``policy.require_heartbeat``; none of the
+    three newly reachable codes is an over-limit code.
 
     The four over-limit codes have create-time twins on ``POST /machines``,
     which enforces the same limits and reports them as ``422``
@@ -107,20 +110,27 @@ class ValidationCode(str, Enum):
     """
 
     TOO_MANY_USERS = "TOO_MANY_USERS"
-    """Reachable: ⛔ — declared, never emitted."""
+    """Users over ``policy.max_users``, on all three validate endpoints. Reachable: ✅
+
+    Since the API patch. Not an over-limit code: ``activate_machine`` does
+    not roll back on it.
+    """
 
     HEARTBEAT_DEAD = "HEARTBEAT_DEAD"
-    """Reachable: ⛔ — declared, never emitted.
+    """``scope.fingerprint`` matched a machine whose last ping is outside the window. Reachable: ✅
 
-    Validation does not look at heartbeat state at all, so an over-window
-    machine never shows up here. The machine-side ``DEAD`` status is a real,
-    readable state — a checked-out machine file reports it — it simply never
-    reaches the caller through a *validation* code. See
-    ``tamga.models.machine.HeartbeatStatus``.
+    Since the API patch, and only under ``policy.require_heartbeat``. Emitted
+    by the fingerprint scope, never by a ping: ``ping_heartbeat`` derives its
+    own status from the timestamp it just wrote, so the machine-side ``DEAD``
+    is read off ``machines.get``, check-out and the like — see
+    ``tamga.models.machine.HeartbeatStatus``. Not an over-limit code.
     """
 
     HEARTBEAT_NOT_STARTED = "HEARTBEAT_NOT_STARTED"
-    """Reachable: ⛔ — declared, never emitted."""
+    """``scope.fingerprint`` matched a machine that has never pinged. Reachable: ✅
+
+    Since the API patch, and only under ``policy.require_heartbeat``.
+    """
 
     FINGERPRINT_SCOPE_MISMATCH = "FINGERPRINT_SCOPE_MISMATCH"
     """``scope.fingerprint`` set and matching no machine on the license. Reachable: ✅
