@@ -210,6 +210,55 @@ Invalid components raise `FingerprintComponentError` (a `ValueError`) rather tha
 a repeated label, an empty label, a non-ASCII label, or a control character in a value. Repairing
 any of those would map two genuinely different inputs onto one seat.
 
+## Entitlements and metered usage
+
+Any entitlement is either a `"flag"` (a boolean grant — the only kind that existed before this)
+or a `"meter"` — a named, per-license counter with its own cap. Multiple meters can coexist on one
+license (e.g. `"requests"` and `"exports"` tracked independently).
+
+```python
+with TamgaClient(config) as client:
+    entitlement = client.entitlements.get(license_id, entitlement_id)
+    print(entitlement.kind)  # "flag" or "meter"
+    print(entitlement.max_value)  # effective cap, or None = unlimited (meaningless for "flag")
+    print(entitlement.current_value)  # running count, meaningless for "flag"
+```
+
+`current_value` being `0` does not necessarily mean "never used" — it also means "only inherited
+through the license's policy, never directly attached", since only a direct attachment carries a
+counter row. Check `inherited` to tell the two apart.
+
+Incrementing, decrementing, and resetting a meter mirror the machine heartbeat actions — one call,
+no manual re-fetch to see the fresh value:
+
+```python
+with TamgaClient(config) as client:
+    entitlement = client.entitlements.increment_entitlement_usage(license_id, entitlement_id)
+    print(entitlement.current_value)
+
+    # Optional explicit amount; omitted defaults to 1 server-side.
+    client.entitlements.increment_entitlement_usage(license_id, entitlement_id, increment=5)
+    client.entitlements.decrement_entitlement_usage(license_id, entitlement_id, decrement=2)
+    client.entitlements.reset_entitlement_usage(license_id, entitlement_id)
+```
+
+All three require the entitlement to be **directly** attached to this license — one only inherited
+via the policy has no counter row to update and raises `tamga.errors.NotFoundError`. Incrementing
+past `max_value` raises `tamga.errors.MeterLimitExceededError` (`422 METER_LIMIT_EXCEEDED`), which
+carries the offending `entitlement_id`:
+
+```python
+from tamga.errors import MeterLimitExceededError
+
+try:
+    client.entitlements.increment_entitlement_usage(license_id, entitlement_id, increment=1000)
+except MeterLimitExceededError as exc:
+    print(f"entitlement {exc.entitlement_id} is at its cap")
+```
+
+This replaces the retired global `uses`/`max_uses` counter and its `TOO_MANY_USES` validation
+code — metering is now per-entitlement rather than one license-wide count.
+
 ## Checking for updates
 
 ```python
@@ -624,7 +673,7 @@ Report suspected vulnerabilities privately to **security@tamga.sh** — see
   rate-limit signal this SDK reads (`src/tamga/transport.py::parse_retry_after`), and only its
   delta-seconds form is honored — the HTTP-date form is ignored rather than risking a date being
   misread as a duration.
-- **5 of the 24 `ValidationCode` members are declared but never emitted** (`BANNED`,
+- **5 of the 23 `ValidationCode` members are declared but never emitted** (`BANNED`,
   `COMPONENTS_SCOPE_MISMATCH`, `NOT_FOUND` — which comes back as a raw HTTP 404 — and the
   `CHECKSUM`/`VERSION` scope mismatches, whose scope keys are rejected outright rather than
   evaluated). `HEARTBEAT_NOT_STARTED` / `HEARTBEAT_DEAD` (fingerprint scope under

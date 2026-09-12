@@ -17,8 +17,7 @@ from uuid import UUID
 class OverageStrategy(str, Enum):
     """Multiplies the relevant ``max_*`` limit before comparing usage against it.
 
-    Applies to machines/cores/memory/disk/processes. Does **not** apply to
-    ``uses`` — that field is always strict ``>=`` regardless of strategy.
+    Applies to machines/cores/memory/disk/processes.
     """
 
     NO_OVERAGE = "NO_OVERAGE"
@@ -292,7 +291,6 @@ class PolicyResource:
         max_machines: Machine limit, subject to ``overage_strategy``.
         max_cores: Core limit, subject to ``overage_strategy``.
         max_processes: Process limit, subject to ``overage_strategy``.
-        max_uses: Use limit — always strict, ``overage_strategy`` does not apply.
         heartbeat_duration: The policy's machine-heartbeat window, in seconds,
             or ``None`` when the column is unset. **This is the field that
             decides how often a machine has to ping**; the SDK's 600s default is
@@ -349,7 +347,6 @@ class PolicyResource:
     max_machines: int | None = None
     max_cores: int | None = None
     max_processes: int | None = None
-    max_uses: int | None = None
     heartbeat_duration: int | None = None
     require_heartbeat: bool = False
     machine_uniqueness_strategy: str = "UNIQUE_PER_LICENSE"
@@ -488,13 +485,33 @@ class PolicyResource:
             max_machines=attributes.get("max_machines"),
             max_cores=attributes.get("max_cores"),
             max_processes=attributes.get("max_processes"),
-            max_uses=attributes.get("max_uses"),
             heartbeat_duration=attributes.get("heartbeat_duration"),
             require_heartbeat=bool(attributes.get("require_heartbeat", False)),
             machine_uniqueness_strategy=attributes.get(
                 "machine_uniqueness_strategy", "UNIQUE_PER_LICENSE"
             ),
         )
+
+
+#: The two legal ``entitlement.kind`` values on the wire.
+#:
+#: Modeled as a plain string plus these named constants — mirroring
+#: ``EXPIRATION_STRATEGIES``/``AUTHENTICATION_STRATEGIES`` above — rather than
+#: a closed enum, so a caller reading a future third kind from a newer server
+#: still gets the raw string back instead of a raised/coerced error.
+ENTITLEMENT_KIND_FLAG: str = "flag"
+"""A boolean grant — the only kind that existed before named meters."""
+
+ENTITLEMENT_KIND_METER: str = "meter"
+"""A named, per-license counter with its own cap.
+
+See ``Entitlement.max_value``/``Entitlement.current_value``.
+"""
+
+#: Every legal ``entitlement.kind`` value. For validation/readability only —
+#: the field itself stays a plain ``str``, so an unrecognized value from a
+#: newer server still round-trips rather than raising.
+ENTITLEMENT_KINDS: frozenset[str] = frozenset({ENTITLEMENT_KIND_FLAG, ENTITLEMENT_KIND_METER})
 
 
 @dataclass(frozen=True)
@@ -509,6 +526,11 @@ class Entitlement:
         id: Resource UUID.
         name: Display label. Not stable — never match on this.
         code: Stable, developer-facing identifier. Always match on this.
+        kind: ``ENTITLEMENT_KIND_FLAG`` (``"flag"``, a boolean grant) or
+            ``ENTITLEMENT_KIND_METER`` (``"meter"``, a named per-license
+            counter). Always present — never omitted by the server, so this
+            is a required field, not an optional one. Fixed at creation;
+            there is no way to turn a flag into a meter (or back) later.
         metadata: Arbitrary metadata.
         created: Creation timestamp.
         updated: Last-update timestamp.
@@ -517,17 +539,38 @@ class Entitlement:
             server did not send the flag — it appears only on the
             license-scoped listing, not on account-, policy-, or
             release-scoped responses. An inherited entitlement cannot be
-            detached from the license (``403 POLICY_ENTITLEMENT``), cannot be
-            attached again (``422 ENTITLEMENT_ALREADY_INHERITED``), and is
+            detached from the license (``403 POLICY_ENTITLEMENT``), and is
             **not** resolvable through
             ``TamgaClient.entitlements.get`` — that route reads only direct
-            attachments and answers ``404`` for it.
+            attachments and answers ``404`` for it. For ``kind: "meter"``,
+            an inherited entitlement *can* still be attached directly — that
+            is what starts its per-license counter — so only a ``kind:
+            "flag"`` attach is refused with ``422
+            ENTITLEMENT_ALREADY_INHERITED``.
+        max_value: The effective cap on a meter's ``current_value`` — the
+            license's own override if it has one, else the policy's default,
+            else ``None`` (unlimited), the same "nullable = unlimited"
+            convention every other ``max_*`` field on this SDK uses.
+            **Meaningless for ``kind: "flag"``** — present but not enforced.
+            Only ever populated on the license-scoped listing this SDK reads
+            (``entitlements.list``/``.get``); ``None`` elsewhere.
+        current_value: The meter's running count. Always an integer (``0``
+            if never incremented) on the routes that carry it at all.
+            **``0`` does not necessarily mean "never used"** — it also means
+            "only inherited via the policy, never directly attached", since
+            only a direct attachment carries a counter row. Check
+            ``inherited`` to tell the two apart. ``None`` when the route
+            doesn't carry it (e.g. a policy-scoped listing, which this SDK
+            does not currently expose).
     """
 
     id: UUID
     name: str
     code: str
+    kind: str
     metadata: dict[str, Any] = field(default_factory=dict)
     created: datetime | None = None
     updated: datetime | None = None
     inherited: bool | None = None
+    max_value: int | None = None
+    current_value: int | None = None

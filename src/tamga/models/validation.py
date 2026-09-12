@@ -16,7 +16,7 @@ from typing import Any
 class ValidationCode(str, Enum):
     """The ``meta.code`` value returned by license validation endpoints.
 
-    Modeled with all 24 server-declared values so deserialization never
+    Modeled with all 23 server-declared values so deserialization never
     crashes on a value this SDK version doesn't yet recognize (see
     ``_missing_`` below for the lenient-unknown-value fallback). Only a
     subset is actually reachable against the current server — see the
@@ -29,7 +29,7 @@ class ValidationCode(str, Enum):
     PRODUCT_SCOPE_MISMATCH, POLICY_SCOPE_MISMATCH, USER_SCOPE_MISMATCH,
     ENVIRONMENT_SCOPE_MISMATCH, TOO_MANY_MACHINES, TOO_MANY_CORES,
     TOO_MUCH_MEMORY, TOO_MUCH_DISK, TOO_MANY_PROCESSES, TOO_MANY_USERS,
-    TOO_MANY_USES, then VALID — 19 of the 24. The two heartbeat verdicts come
+    then VALID — 18 of the 23. The two heartbeat verdicts come
     from the fingerprint scope under ``policy.require_heartbeat``; none of the
     three newly reachable codes is an over-limit code.
 
@@ -86,9 +86,6 @@ class ValidationCode(str, Enum):
 
     TOO_MANY_PROCESSES = "TOO_MANY_PROCESSES"
     """Process count over ``policy.max_processes``. Reachable: ✅"""
-
-    TOO_MANY_USES = "TOO_MANY_USES"
-    """``uses >= max_uses``. Reachable: ✅"""
 
     NOT_FOUND = "NOT_FOUND"
     """No license for key/id.
