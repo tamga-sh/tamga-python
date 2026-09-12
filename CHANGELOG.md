@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file. This file i
 [Conventional Commits](https://www.conventionalcommits.org/) history — do not hand-edit entries
 below the `[Unreleased]` header.
 
+## [2.0.0](https://github.com/tamga-sh/tamga-python/compare/v1.1.3...v2.0.0) (2026-09-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* footer) even though this is a semantically breaking wire contract change, so release-please does not compute a major/minor bump.
+
+### Bug Fixes
+
+* migrate to per-entitlement metering, drop retired uses/max_uses counter ([#42](https://github.com/tamga-sh/tamga-python/issues/42)) ([42b3249](https://github.com/tamga-sh/tamga-python/commit/42b3249b5fe7b6eea14ff27295cc428520942e64))
+
 ## [1.1.3](https://github.com/tamga-sh/tamga-python/compare/v1.1.2...v1.1.3) (2026-09-05)
 
 
