@@ -23,6 +23,7 @@ from tamga.errors import (
     LicenseSuspendedError,
     MachineLimitExceededError,
     MemoryLimitExceededError,
+    MeterLimitExceededError,
     NotFoundError,
     PidTakenError,
     RateLimitedError,
@@ -69,6 +70,9 @@ def test_parses_json_api_error_envelope(json_api_error_body: dict) -> None:
         ("MEMORY_LIMIT_EXCEEDED", 422, MemoryLimitExceededError),
         ("DISK_LIMIT_EXCEEDED", 422, DiskLimitExceededError),
         ("TOO_MANY_PROCESSES", 422, TooManyProcessesError),
+        # Replaces the retired global TOO_MANY_USES; metering is now
+        # per-entitlement rather than one license-wide counter.
+        ("METER_LIMIT_EXCEEDED", 422, MeterLimitExceededError),
         # Auth-gate codes: these fail before any endpoint logic runs.
         ("LICENSE_SUSPENDED", 401, LicenseSuspendedError),
         ("LICENSE_EXPIRED", 401, LicenseExpiredError),
@@ -209,6 +213,42 @@ def test_meta_is_carried_and_fingerprint_taken_exposes_the_existing_machine() ->
     assert isinstance(error, FingerprintTakenError)
     assert error.meta == {"machineId": "018f2f3a-0000-7000-8000-000000000051"}
     assert error.existing_machine_id == UUID("018f2f3a-0000-7000-8000-000000000051")
+
+
+def test_meter_limit_exceeded_exposes_the_entitlement_id() -> None:
+    # Exact wire shape from the migration spec: 422 METER_LIMIT_EXCEEDED
+    # carries meta.entitlement_id so a caller juggling several meters on one
+    # license can tell which one hit its cap.
+    body = json.dumps(
+        {
+            "errors": [
+                {
+                    "id": "e1",
+                    "status": "422",
+                    "code": "METER_LIMIT_EXCEEDED",
+                    "title": "Unprocessable Entity",
+                    "detail": "current_value + increment would exceed max_value",
+                    "meta": {"entitlement_id": "018f2f3a-0000-7000-8000-000000000081"},
+                }
+            ]
+        }
+    ).encode("utf-8")
+    error = parse_error_envelope(422, body)
+    assert isinstance(error, MeterLimitExceededError)
+    assert error.entitlement_id == UUID("018f2f3a-0000-7000-8000-000000000081")
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [None, {}, {"entitlement_id": None}, {"entitlement_id": 42}, {"entitlement_id": "not-a-uuid"}],
+)
+def test_meter_limit_entitlement_id_is_none_unless_a_uuid_string_was_sent(meta: object) -> None:
+    entry: dict = {"status": "422", "code": "METER_LIMIT_EXCEEDED", "detail": "over limit"}
+    if meta is not None:
+        entry["meta"] = meta
+    error = parse_error_envelope(422, json.dumps({"errors": [entry]}).encode("utf-8"))
+    assert isinstance(error, MeterLimitExceededError)
+    assert error.entitlement_id is None
 
 
 @pytest.mark.parametrize(

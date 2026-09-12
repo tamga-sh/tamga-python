@@ -285,10 +285,16 @@ def _parse_entitlement(data: dict[str, Any]) -> Entitlement:
         id=UUID(str(data["id"])),
         name=attrs.get("name", ""),
         code=attrs.get("code", ""),
+        # The server always sends `kind`; the default here is defensive
+        # (matching `name`/`code` above) rather than a documented fallback —
+        # see `Entitlement.kind`.
+        kind=attrs.get("kind", "flag"),
         metadata=attrs.get("metadata") or {},
         created=_parse_datetime(attrs.get("created")),
         updated=_parse_datetime(attrs.get("updated")),
         inherited=attrs.get("inherited"),
+        max_value=attrs.get("max_value"),
+        current_value=attrs.get("current_value"),
     )
 
 
@@ -2221,6 +2227,102 @@ class EntitlementsClient:
             as a type" instead of the builtin generic.
         """
         return self.list(license_id, limit=MAX_PAGE_SIZE).items
+
+    def increment_entitlement_usage(
+        self, license_id: UUID, entitlement_id: UUID, increment: int | None = None
+    ) -> Entitlement:
+        """``POST /licenses/{license_id}/entitlements/{entitlement_id}/actions/increment``.
+
+        Advances a ``kind: "meter"`` entitlement's ``current_value`` by
+        ``increment``. Mirrors ``MachinesClient.ping_heartbeat``'s shape:
+        returns the full, fresh ``Entitlement`` so the caller sees the
+        updated ``current_value``/``max_value`` without a second round trip.
+
+        Args:
+            license_id: The license the entitlement is attached to.
+            entitlement_id: The entitlement (meter) to increment.
+            increment: Amount to add. Omitted/``None`` sends no body, which
+                the server defaults to ``1``; a ``0`` or negative value is
+                raised to ``1`` server-side rather than rejected.
+
+        Returns:
+            The entitlement with its updated ``current_value``.
+
+        Raises:
+            tamga.errors.NotFoundError: The entitlement is only inherited via
+                the license's policy (no direct attachment to increment), or
+                doesn't exist.
+            tamga.errors.MeterLimitExceededError: ``422
+                METER_LIMIT_EXCEEDED`` — ``current_value + increment`` would
+                exceed ``max_value``. Carries ``meta.entitlement_id``.
+        """
+        body: dict[str, Any] | None = {"increment": increment} if increment is not None else None
+        data = _send_request(
+            self._http,
+            self._config,
+            "POST",
+            f"/licenses/{license_id}/entitlements/{entitlement_id}/actions/increment",
+            json_body=body,
+        )
+        return _parse_entitlement(data)
+
+    def decrement_entitlement_usage(
+        self, license_id: UUID, entitlement_id: UUID, decrement: int | None = None
+    ) -> Entitlement:
+        """``POST /licenses/{license_id}/entitlements/{entitlement_id}/actions/decrement``.
+
+        Same shape as :meth:`increment_entitlement_usage`, in reverse.
+        ``current_value`` floors at ``0`` — it never goes negative.
+
+        Args:
+            license_id: The license the entitlement is attached to.
+            entitlement_id: The entitlement (meter) to decrement.
+            decrement: Amount to subtract. Omitted/``None`` sends no body,
+                which the server defaults to ``1``; a ``0`` or negative value
+                is raised to ``1`` server-side rather than rejected.
+
+        Returns:
+            The entitlement with its updated ``current_value``.
+
+        Raises:
+            tamga.errors.NotFoundError: The entitlement is only inherited via
+                the license's policy (no direct attachment to decrement), or
+                doesn't exist.
+        """
+        body: dict[str, Any] | None = {"decrement": decrement} if decrement is not None else None
+        data = _send_request(
+            self._http,
+            self._config,
+            "POST",
+            f"/licenses/{license_id}/entitlements/{entitlement_id}/actions/decrement",
+            json_body=body,
+        )
+        return _parse_entitlement(data)
+
+    def reset_entitlement_usage(self, license_id: UUID, entitlement_id: UUID) -> Entitlement:
+        """``POST /licenses/{license_id}/entitlements/{entitlement_id}/actions/reset``, no body.
+
+        Resets a ``kind: "meter"`` entitlement's ``current_value`` to ``0``.
+
+        Args:
+            license_id: The license the entitlement is attached to.
+            entitlement_id: The entitlement (meter) to reset.
+
+        Returns:
+            The entitlement with ``current_value`` reset to ``0``.
+
+        Raises:
+            tamga.errors.NotFoundError: The entitlement is only inherited via
+                the license's policy (no direct attachment to reset), or
+                doesn't exist.
+        """
+        data = _send_request(
+            self._http,
+            self._config,
+            "POST",
+            f"/licenses/{license_id}/entitlements/{entitlement_id}/actions/reset",
+        )
+        return _parse_entitlement(data)
 
 
 def _next_after_cursor(items: list[Any], limit: int | None) -> str | None:

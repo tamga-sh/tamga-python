@@ -182,7 +182,6 @@ def test_quick_validate_parses_flat_json_no_data_envelope(
         "TOO_MUCH_MEMORY",
         "TOO_MUCH_DISK",
         "TOO_MANY_PROCESSES",
-        "TOO_MANY_USES",
         "NOT_FOUND",
         "BANNED",
         "ENTITLEMENTS_MISSING",

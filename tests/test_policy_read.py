@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from dataclasses import fields
 from datetime import timedelta
 from uuid import UUID
 
@@ -393,6 +394,50 @@ def test_every_storable_check_in_cadence_survives_the_read(
     # The rest of the resource has to come back too — the old failure was not
     # a lost cadence, it was a lost policy.
     assert policy.heartbeat_duration == 120
+
+
+def test_max_uses_is_not_a_dataclass_field() -> None:
+    # The global uses/max_uses counter was retired server-side in favor of
+    # per-entitlement meters (Entitlement.kind/max_value/current_value) — this
+    # is a pure deletion, not an optional/nullable half-measure.
+    names = {f.name for f in fields(PolicyResource)}
+    assert "max_uses" not in names
+    assert "max_machines" in names
+
+
+def test_constructing_a_policy_with_max_uses_is_rejected() -> None:
+    # Loud at the one call site that could still hold a value: construction.
+    with pytest.raises(TypeError, match="max_uses"):
+        PolicyResource(  # type: ignore[call-arg]
+            id=POLICY_ID,
+            overage_strategy=OverageStrategy.NO_OVERAGE,
+            heartbeat_cull_strategy=HeartbeatCullStrategy.DEACTIVATE_DEAD,
+            heartbeat_resurrection_strategy=HeartbeatResurrectionStrategy.NO_REVIVE,
+            check_in_interval=None,
+            require_check_in=False,
+            scheme=None,
+            expiration_strategy="RESTRICT_ACCESS",
+            renewal_basis="FROM_EXPIRY",
+            authentication_strategy="TOKEN",
+            max_uses=100,
+        )
+
+
+def test_a_server_still_sending_max_uses_is_ignored_not_fatal() -> None:
+    # Unlike max_memory/max_disk, max_uses carries no deprecation shim: it was
+    # never readable server-side going forward, so a stray value from a stale
+    # cassette or a pre-migration proxy is simply not read, and the resource
+    # carries no trace of it at all — not even via __getattr__.
+    policy = PolicyResource.from_api(
+        {
+            "id": str(POLICY_ID),
+            "require_check_in": False,
+            "max_uses": 250,
+        }
+    )
+    assert not hasattr(policy, "max_uses")
+    with pytest.raises(AttributeError):
+        _ = policy.max_uses  # type: ignore[attr-defined]
 
 
 def test_a_legacy_noun_cadence_on_the_wire_still_reads(

@@ -296,6 +296,33 @@ class TooManyProcessesError(TamgaError):
     """
 
 
+class MeterLimitExceededError(TamgaError):
+    """422 ``METER_LIMIT_EXCEEDED`` — a meter's increment would exceed its ``max_value``.
+
+    Raised by ``EntitlementsClient.increment_entitlement_usage`` when
+    ``current_value + increment > max_value``. Replaces the retired global
+    ``TOO_MANY_USES`` validation code, which the server no longer emits —
+    metering is now per-entitlement rather than a single license-wide
+    counter, so the error names *which* entitlement hit its cap.
+
+    Attributes:
+        entitlement_id: The entitlement whose ``max_value`` was hit, parsed
+            from ``meta.entitlement_id``. ``None`` if the server omitted
+            ``meta`` or the field, or it wasn't a UUID string.
+    """
+
+    @property
+    def entitlement_id(self) -> UUID | None:
+        """The entitlement named by ``meta.entitlement_id``, if present and valid."""
+        raw = (self.meta or {}).get("entitlement_id")
+        if not isinstance(raw, str):
+            return None
+        try:
+            return UUID(raw)
+        except ValueError:
+            return None
+
+
 class LicenseSuspendedError(TamgaError):
     """401 ``LICENSE_SUSPENDED`` — the license is suspended, so the credential is refused.
 
@@ -420,6 +447,7 @@ _CODE_TO_EXCEPTION: dict[str, type[TamgaError]] = {
     "MEMORY_LIMIT_EXCEEDED": MemoryLimitExceededError,
     "DISK_LIMIT_EXCEEDED": DiskLimitExceededError,
     "TOO_MANY_PROCESSES": TooManyProcessesError,
+    "METER_LIMIT_EXCEEDED": MeterLimitExceededError,
     "LICENSE_SUSPENDED": LicenseSuspendedError,
     "LICENSE_EXPIRED": LicenseExpiredError,
     "LICENSE_NOT_ALLOWED": LicenseNotAllowedError,
